@@ -56,6 +56,13 @@ export default function App() {
   const [paperPositions, setPaperPositions] = useState([]);
   const [paperOrders, setPaperOrders] = useState([]);
   const [paperMsg, setPaperMsg] = useState('');
+  const [autoScan, setAutoScan] = useState(false);
+  const [autoExecute, setAutoExecute] = useState(false);
+  const [scanInterval, setScanInterval] = useState(60);
+  const [scanLog, setScanLog] = useState([]);
+  const autoScanRef = useRef(null);
+  const paperKeyRef = useRef(paperKey);
+  const paperSecretRef = useRef(paperSecret);
 
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
@@ -135,12 +142,50 @@ export default function App() {
       const ordJson = await ordRes.json(); setPaperOrders(ordJson.orders || []);
     } catch(e) { console.error(e); }
   };
-  const scanSignal = async () => {
+  const scanSignal = async (isAuto = false) => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/paper/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({api_key:paperKey, api_secret:paperSecret, config}) });
-      setPaperSignal(await res.json());
+      const key = paperKeyRef.current;
+      const secret = paperSecretRef.current;
+      const res = await fetch('http://127.0.0.1:8000/api/paper/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({api_key:key, api_secret:secret, config}) });
+      const data = await res.json();
+      setPaperSignal(data);
+      const now = new Date().toLocaleTimeString();
+      setScanLog(prev => [{ time: now, signal: data.signal, price: data.price, rsi: data.rsi }, ...prev].slice(0, 20));
+
+      // Auto-execute when signal fires
+      if (isAuto && data.signal && autoExecute) {
+        const side = config.strategy_type === 'bear_put' ? 'sell' : 'buy';
+        const execRes = await fetch('http://127.0.0.1:8000/api/paper/execute', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({api_key:key, api_secret:secret, symbol:config.ticker, qty:config.contracts_per_trade * 100, side}) });
+        const execJson = await execRes.json();
+        if (execJson.success) {
+          setPaperMsg(`🤖 AUTO-EXECUTED: ${execJson.side} ${execJson.qty} ${execJson.symbol}`);
+          loadPaperData();
+          // Play notification sound
+          try { new Audio('data:audio/wav;base64,UklGRl9vT19teleWave').play(); } catch {}
+        } else {
+          setPaperMsg(`Auto-exec failed: ${execJson.error}`);
+        }
+      } else if (isAuto && data.signal) {
+        setPaperMsg(`🟢 Signal detected at ${now}! Enable Auto-Execute to trade automatically.`);
+      }
     } catch(e) { console.error(e); }
   };
+
+  // Keep refs in sync for the interval callback
+  useEffect(() => { paperKeyRef.current = paperKey; }, [paperKey]);
+  useEffect(() => { paperSecretRef.current = paperSecret; }, [paperSecret]);
+
+  // Auto-scan interval
+  useEffect(() => {
+    if (autoScan && paperAccount) {
+      scanSignal(true); // immediate first scan
+      autoScanRef.current = setInterval(() => scanSignal(true), scanInterval * 1000);
+      return () => clearInterval(autoScanRef.current);
+    } else {
+      if (autoScanRef.current) clearInterval(autoScanRef.current);
+    }
+  }, [autoScan, scanInterval, paperAccount, autoExecute, config]);
+
   const executeTrade = async (side) => {
     setPaperMsg('');
     try {
@@ -295,7 +340,24 @@ export default function App() {
                 style={{ padding:'8px',borderRadius:8,border:'none',background:paperAccount?'rgba(72,187,120,0.2)':'var(--accent)',color:paperAccount?'#48bb78':'#fff',fontWeight:600,cursor:'pointer',fontSize:'0.8rem' }}>
                 {paperConnecting ? 'Connecting…' : paperAccount ? '✓ Connected' : 'Connect'}
               </button>
-              {paperAccount && <div style={{ fontSize:'0.72rem',color:'#48bb78',padding:'4px 0' }}>Equity: ${parseFloat(paperAccount.equity).toLocaleString()} | BP: ${parseFloat(paperAccount.buying_power).toLocaleString()}</div>}
+              {paperAccount && (
+                <>
+                  <div style={{ fontSize:'0.72rem',color:'#48bb78',padding:'4px 0' }}>Equity: ${parseFloat(paperAccount.equity).toLocaleString()}</div>
+                  <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'8px 10px', background: autoScan ? 'rgba(72,187,120,0.08)' : 'var(--bg-card)', border: `1px solid ${autoScan ? 'rgba(72,187,120,0.2)' : 'var(--border)'}`, borderRadius: 8 }}>
+                    <span style={{ fontSize:'0.78rem', color: autoScan ? '#48bb78' : '#8b8b9d', fontWeight: 600 }}>{autoScan ? '● Scanning' : 'Auto-Scan'}</span>
+                    <label className="switch"><input type="checkbox" checked={autoScan} onChange={e => setAutoScan(e.target.checked)} /><span className="slider" /></label>
+                  </div>
+                  {autoScan && (
+                    <Field label={`Scan every ${scanInterval}s`} style={{ marginTop: 2 }}>
+                      <input type="number" value={scanInterval} min={10} max={3600} onChange={e => setScanInterval(Number(e.target.value))} />
+                    </Field>
+                  )}
+                  <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'8px 10px', background: autoExecute ? 'rgba(245,101,101,0.08)' : 'var(--bg-card)', border: `1px solid ${autoExecute ? 'rgba(245,101,101,0.2)' : 'var(--border)'}`, borderRadius: 8 }}>
+                    <span style={{ fontSize:'0.78rem', color: autoExecute ? '#f56565' : '#8b8b9d', fontWeight: 600 }}>⚡ Auto-Execute</span>
+                    <label className="switch"><input type="checkbox" checked={autoExecute} onChange={e => { if (!e.target.checked || window.confirm('Enable auto-execution? Orders will be placed automatically when signals fire on your PAPER account.')) setAutoExecute(e.target.checked); }} /><span className="slider" /></label>
+                  </div>
+                </>
+              )}
               {paperMsg && <div style={{ fontSize:'0.72rem',color:'#ecc94b',padding:'4px 0' }}>{paperMsg}</div>}
             </div>
           )}
@@ -581,6 +643,28 @@ export default function App() {
               </div>
             )}
             {paperMsg && <div style={{ marginTop: 8, fontSize: '0.78rem', color: '#ecc94b', padding: '8px 12px', background: 'rgba(236,201,75,0.08)', borderRadius: 6 }}>{paperMsg}</div>}
+
+            {/* Auto-scan status + log */}
+            {autoScan && (
+              <div style={{ marginTop: 12, padding: 12, borderRadius: 10, background: 'rgba(72,187,120,0.04)', border: '1px solid rgba(72,187,120,0.1)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                  <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#48bb78' }}>● Auto-Scanning every {scanInterval}s</span>
+                  {autoExecute && <span style={{ fontSize: '0.65rem', padding: '2px 8px', borderRadius: 4, background: 'rgba(245,101,101,0.15)', color: '#f56565', fontWeight: 700 }}>AUTO-EXEC ON</span>}
+                </div>
+                {scanLog.length > 0 && (
+                  <div style={{ maxHeight: 120, overflowY: 'auto' }}>
+                    {scanLog.map((l, i) => (
+                      <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0', fontSize: '0.68rem', color: '#8b8b9d', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                        <span>{l.time}</span>
+                        <span>SPY ${l.price}</span>
+                        <span>RSI {l.rsi}</span>
+                        <span style={{ color: l.signal ? '#48bb78' : '#555', fontWeight: 600 }}>{l.signal ? '🟢 SIGNAL' : '—'}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
