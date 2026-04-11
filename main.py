@@ -8,6 +8,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# Strategy imports
+from strategies.consecutive_days import ConsecutiveDaysStrategy
+from strategies.combo_spread import ComboSpreadStrategy
+
 app = FastAPI(title="SPY Options Backtesting Engine")
 
 app.add_middleware(
@@ -27,9 +31,24 @@ class BacktestRequest(BaseModel):
     risk_percent: float = 5.0
     max_trade_cap: float = 0.0
     spread_cost_target: float = 250.0
-    strategy_type: str = "bull_call"
+    
+    # Strategy selector
+    strategy_id: str = "consecutive_days"  # "consecutive_days", "combo_spread"
+    strategy_type: str = "bull_call"      # "bull_call" or "bear_put"
+    
+    # Consecutive Days Params
     entry_red_days: int = 2
     exit_green_days: int = 2
+    
+    # Combo Spread Params
+    combo_sma1: int = 3
+    combo_sma2: int = 8
+    combo_sma3: int = 10
+    combo_ema1: int = 5
+    combo_ema2: int = 3
+    combo_max_bars: int = 10
+    combo_max_profit_closes: int = 5
+
     target_dte: int = 14
     stop_loss_pct: float = 50
     commission_per_contract: float = 0.65
@@ -57,6 +76,16 @@ class OptimizerRequest(BaseModel):
     param_y: str = "target_dte"
     x_values: List[float] = [1, 2, 3, 4]
     y_values: List[float] = [7, 14, 21, 30]
+
+
+class StrategyFactory:
+    @staticmethod
+    def get_strategy(strategy_id: str):
+        if strategy_id == "consecutive_days":
+            return ConsecutiveDaysStrategy()
+        elif strategy_id == "combo_spread":
+            return ComboSpreadStrategy()
+        return ConsecutiveDaysStrategy()
 
 
 # ── Data fetching ──────────────────────────────────────────────────────────
@@ -105,48 +134,19 @@ def bs_put_price(S, K, T, r, sigma):
     return bs_call_price(S, K, T, r, sigma) - S + K * np.exp(-r * T)
 
 
-# ── Indicators ─────────────────────────────────────────────────────────────
-def compute_indicators(df: pd.DataFrame, ema_length: int) -> pd.DataFrame:
-    df = df.copy()
-    df['is_green'] = df['Close'] > df['Open']
-    df['is_red']   = df['Close'] < df['Open']
-
-    def streak(col):
-        s = col.astype(int)
-        group = (col != col.shift()).cumsum()
-        return s.groupby(group).cumsum().where(col, 0)
-
-    df['greenDays'] = streak(df['is_green'])
-    df['redDays']   = streak(df['is_red'])
-    df[f'EMA_{ema_length}'] = df['Close'].ewm(span=ema_length, adjust=False).mean()
-    df['SMA_200'] = df['Close'].rolling(window=200).mean()
-    df['SMA_50']  = df['Close'].rolling(window=50).mean()
-    df['Volume_MA'] = df['Volume'].rolling(window=10).mean()
-
-    log_ret = np.log(df['Close'] / df['Close'].shift(1))
-    df['HV_21'] = (log_ret.rolling(window=21).std() * np.sqrt(252)).fillna(0.15)
-
-    delta = df['Close'].diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df['RSI'] = (100 - (100 / (1 + rs))).fillna(50)
-
-    # Regime detection: SMA-based classification
+# ── Core backtest engine ───────────────────────────────────────────────────
+def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int = 200):
+    RISK_FREE_RATE = 0.045
+    strategy = StrategyFactory.get_strategy(req.strategy_id)
+    df = strategy.compute_indicators(df, req)
+    
+    # Regime detection (global)
     df['regime'] = 'sideways'
     bull_mask = (df['Close'] > df['SMA_200']) & (df['SMA_50'] > df['SMA_200'])
     bear_mask = (df['Close'] < df['SMA_200']) & (df['SMA_50'] < df['SMA_200'])
     df.loc[bull_mask, 'regime'] = 'bull'
     df.loc[bear_mask, 'regime'] = 'bear'
 
-    return df
-
-
-# ── Core backtest engine ───────────────────────────────────────────────────
-def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int = 200):
-    RISK_FREE_RATE = 0.045
     is_bear = req.strategy_type == "bear_put"
     price_fn = bs_put_price if is_bear else bs_call_price
 
@@ -181,17 +181,10 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
         equity_curve.append({"date": date, "equity": round(mtm_equity, 2), "drawdown": round(dd, 2)})
 
         if not in_trade:
-            # Entry logic
-            if is_bear:
-                streak_val = int(row['greenDays'])
-            else:
-                streak_val = int(row['redDays'])
-            entry_trigger = (streak_val == req.entry_red_days or streak_val == req.entry_red_days + 1)
-
-            if entry_trigger:
+            if strategy.check_entry(df, i, req):
                 allow = True
 
-                # Standard filters
+                # Standard filters (Global)
                 if is_bear:
                     if req.use_rsi_filter and float(row['RSI']) <= (100 - req.rsi_threshold): allow = False
                     if req.use_ema_filter and float(row['Close']) <= float(row[f'EMA_{req.ema_length}']): allow = False
@@ -260,9 +253,12 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
                     in_trade, entry_idx, entry_dte = True, i, req.target_dte
                     current_entry = {"entry_date": date, "entry_spy": S, "spread_cost": entry_cost,
                                      "contracts": contracts, "commission": comm,
-                                     "regime": row.get('regime', 'unknown')}
+                                     "regime": row.get('regime', 'unknown'),
+                                     "entry_idx": i, "entry_dte": req.target_dte, "entry_price": S}
         else:
-            # Exit logic
+            # Check strategy exit
+            should_exit, reason = strategy.check_exit(df, i, current_entry, req)
+            
             days_held = i - entry_idx
             new_dte = entry_dte - days_held
             T_c = max(new_dte / 365.25, 0.0)
@@ -272,11 +268,9 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
             cv = (price_fn(S, K_long, T_c, RISK_FREE_RATE, sigma) -
                   price_fn(S, K_short, T_c, RISK_FREE_RATE, sigma)) * 100 * sc
 
-            exit_streak = int(row['redDays'] if is_bear else row['greenDays']) >= req.exit_green_days
             stop_exit = req.stop_loss_pct > 0 and cv <= entry_cost * (1 - req.stop_loss_pct / 100)
-            expired = new_dte <= 0
 
-            if exit_streak or stop_exit or expired:
+            if should_exit or stop_exit:
                 ec = req.commission_per_contract * sc * 2
                 equity += cv - ec
                 tc = current_entry.get("commission", 0) + ec
@@ -287,8 +281,9 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
                     "spread_cost": round(entry_cost, 2), "spread_exit": round(cv, 2),
                     "pnl": round(float(pnl), 2), "contracts": sc, "days_held": days_held,
                     "commission": round(tc, 2), "win": bool(pnl > 0),
-                    "stopped_out": bool(stop_exit and not exit_streak),
-                    "expired": bool(expired and not exit_streak and not stop_exit),
+                    "stopped_out": bool(stop_exit and not should_exit),
+                    "expired": bool(reason == "expired" and not stop_exit),
+                    "reason": reason if should_exit else "stop_loss",
                     "regime": current_entry.get("regime", "unknown"),
                 })
                 in_trade = False
@@ -447,7 +442,7 @@ def run_walk_forward(req, df):
 def backtest(req: BacktestRequest):
     try:
         raw_df = fetch_historical_data(req.ticker, req.years_history)
-        df = compute_indicators(raw_df, req.ema_length)
+        df = raw_df.copy() # Indicators computed inside engine now per strategy
         if len(df) == 0: return {"error": "No data returned."}
 
         # Merge VIX data if filter enabled
@@ -464,13 +459,18 @@ def backtest(req: BacktestRequest):
         for c in ['open', 'high', 'low', 'close']: ph[c] = ph[c].round(2)
         price_history = ph.to_dict(orient='records')
 
-        # Regime timeline for chart overlay
-        regime_timeline = []
-        for i in range(200, len(df)):
-            regime_timeline.append({"date": df.iloc[i]['Date_str'], "regime": df.iloc[i].get('regime', 'sideways')})
-
         trades, equity_curve, equity = run_backtest_engine(req, df)
         metrics, heatmap, mc, dur_dist, regime_stats = compute_analytics(trades, equity_curve, req)
+
+        # Regime timeline (global regime detection happens inside engine for indicators)
+        strategy = StrategyFactory.get_strategy(req.strategy_id)
+        df_ind = strategy.compute_indicators(df, req)
+        df_ind['regime'] = 'sideways'
+        df_ind.loc[(df_ind['Close'] > df_ind['SMA_200']) & (df_ind['SMA_50'] > df_ind['SMA_200']), 'regime'] = 'bull'
+        df_ind.loc[(df_ind['Close'] < df_ind['SMA_200']) & (df_ind['SMA_50'] < df_ind['SMA_200']), 'regime'] = 'bear'
+        regime_timeline = []
+        for i in range(200, len(df_ind)):
+            regime_timeline.append({"date": df_ind.iloc[i]['Date_str'], "regime": df_ind.iloc[i].get('regime', 'sideways')})
 
         wf = run_walk_forward(req, df) if req.enable_walk_forward else []
 
@@ -519,7 +519,7 @@ def live_chain(ticker: str = "SPY"):
 def optimize(req: OptimizerRequest):
     try:
         raw_df = fetch_historical_data(req.base_config.ticker, req.base_config.years_history)
-        df = compute_indicators(raw_df, req.base_config.ema_length)
+        df = raw_df.copy()
         if len(df) == 0: return {"error": "No data."}
         df['Date_str'] = df['Date'].dt.strftime('%Y-%m-%d')
 
@@ -583,4 +583,3 @@ def paper_execute(req: PaperOrderRequest):
 def paper_scan(req: PaperScanRequest):
     from paper_trading import scan_signal
     return scan_signal(req.api_key, req.api_secret, req.config)
-

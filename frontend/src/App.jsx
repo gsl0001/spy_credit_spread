@@ -9,8 +9,13 @@ const PRESETS_KEY = 'spy_backtest_presets';
 const DEFAULT_CONFIG = {
   ticker: "SPY", years_history: 2, capital_allocation: 10000.0,
   use_dynamic_sizing: false, risk_percent: 5.0, max_trade_cap: 0,
-  contracts_per_trade: 1, spread_cost_target: 250.0, strategy_type: "bull_call",
-  entry_red_days: 2, exit_green_days: 2, target_dte: 14, stop_loss_pct: 50,
+  contracts_per_trade: 1, spread_cost_target: 250.0, 
+  strategy_id: "consecutive_days", strategy_type: "bull_call",
+  entry_red_days: 2, exit_green_days: 2, 
+  combo_sma1: 3, combo_sma2: 8, combo_sma3: 10,
+  combo_ema1: 5, combo_ema2: 3,
+  combo_max_bars: 10, combo_max_profit_closes: 5,
+  target_dte: 14, stop_loss_pct: 50,
   commission_per_contract: 0.65, use_rsi_filter: true, rsi_threshold: 30,
   use_ema_filter: true, ema_length: 10, use_sma200_filter: false, use_volume_filter: false,
   use_mark_to_market: true, enable_mc_histogram: true,
@@ -277,8 +282,6 @@ export default function App() {
 
         <Section label="Entry / Exit">
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-            <Field label={config.strategy_type === 'bear_put' ? 'Green Days' : 'Red Days'}><input type="number" name="entry_red_days" min={1} value={config.entry_red_days} onChange={handleChange} /></Field>
-            <Field label={config.strategy_type === 'bear_put' ? 'Red Days' : 'Green Days'}><input type="number" name="exit_green_days" min={1} value={config.exit_green_days} onChange={handleChange} /></Field>
             <Field label="DTE"><input type="number" name="target_dte" min={1} value={config.target_dte} onChange={handleChange} /></Field>
             <Field label="Stop Loss %"><input type="number" name="stop_loss_pct" min={0} max={100} value={config.stop_loss_pct} onChange={handleChange} /></Field>
           </div>
@@ -312,6 +315,60 @@ export default function App() {
               ))}
             </div>
           )}
+        </Section>
+
+        <Section label="Strategy Logic">
+          <Field label="Strategy Engine">
+            <select name="strategy_id" value={config.strategy_id} onChange={handleChange} style={{ width: '100%', background: 'var(--bg-card)', color: '#fff', border: '1px solid var(--border)', borderRadius: 8, padding: 8, marginBottom: 12 }}>
+              <option value="consecutive_days">Consecutive Days</option>
+              <option value="combo_spread">Combo Spread (Modular)</option>
+            </select>
+          </Field>
+          
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
+            <button onClick={() => setConfig(prev => ({ ...prev, strategy_type: 'bull_call' }))}
+              style={{ padding: 10, borderRadius: 8, border: 'none', background: config.strategy_type === 'bull_call' ? 'rgba(72,187,120,0.2)' : 'var(--bg-card)', color: config.strategy_type === 'bull_call' ? '#48bb78' : '#8b8b9d', fontWeight: 600, cursor: 'pointer' }}>
+              Bull Call
+            </button>
+            <button onClick={() => setConfig(prev => ({ ...prev, strategy_type: 'bear_put' }))}
+              style={{ padding: 10, borderRadius: 8, border: 'none', background: config.strategy_type === 'bear_put' ? 'rgba(245,101,101,0.2)' : 'var(--bg-card)', color: config.strategy_type === 'bear_put' ? '#f56565' : '#8b8b9d', fontWeight: 600, cursor: 'pointer' }}>
+              Bear Put
+            </button>
+          </div>
+
+          {config.strategy_id === 'consecutive_days' ? (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              <Field label={config.strategy_type === 'bear_put' ? 'Entry Green Days' : 'Entry Red Days'}>
+                <input type="number" name="entry_red_days" min={1} value={config.entry_red_days} onChange={handleChange} />
+              </Field>
+              <Field label={config.strategy_type === 'bear_put' ? 'Exit Red Days' : 'Exit Green Days'}>
+                <input type="number" name="exit_green_days" min={1} value={config.exit_green_days} onChange={handleChange} />
+              </Field>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6 }}>
+                <Field label="SMA 1"><input type="number" name="combo_sma1" value={config.combo_sma1} onChange={handleChange} /></Field>
+                <Field label="SMA 2"><input type="number" name="combo_sma2" value={config.combo_sma2} onChange={handleChange} /></Field>
+                <Field label="SMA 3"><input type="number" name="combo_sma3" value={config.combo_sma3} onChange={handleChange} /></Field>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                <Field label="EMA 1"><input type="number" name="combo_ema1" value={config.combo_ema1} onChange={handleChange} /></Field>
+                <Field label="EMA 2"><input type="number" name="combo_ema2" value={config.combo_ema2} onChange={handleChange} /></Field>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                <Field label="Max Bars"><input type="number" name="combo_max_bars" value={config.combo_max_bars} onChange={handleChange} /></Field>
+                <Field label="Max Profit Closes"><input type="number" name="combo_max_profit_closes" value={config.combo_max_profit_closes} onChange={handleChange} /></Field>
+              </div>
+            </div>
+          )}
+        </Section>
+
+        <Section label="Risk / Expiry">
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+            <Field label="DTE"><input type="number" name="target_dte" min={1} value={config.target_dte} onChange={handleChange} /></Field>
+            <Field label="Stop Loss %"><input type="number" name="stop_loss_pct" min={0} max={100} value={config.stop_loss_pct} onChange={handleChange} /></Field>
+          </div>
         </Section>
 
         <Section label="Advanced">

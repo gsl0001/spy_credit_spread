@@ -114,7 +114,7 @@ def place_equity_order(api_key: str, api_secret: str, symbol: str, qty: int, sid
         return {"success": False, "error": str(e)}
 
 
-def scan_signal(api_key: str, api_secret: str, config: dict) -> dict:
+def scan_signal(api_key: str, api_secret: str, config_dict: dict) -> dict:
     """
     Check if current market conditions meet entry criteria.
     Uses live price data to determine if a signal is firing RIGHT NOW.
@@ -122,10 +122,13 @@ def scan_signal(api_key: str, api_secret: str, config: dict) -> dict:
     try:
         import yfinance as yf
         import pandas as pd
+        from main import BacktestRequest, StrategyFactory
 
-        ticker = config.get('ticker', 'SPY')
+        # Convert dict to BacktestRequest object
+        req = BacktestRequest(**config_dict)
+        ticker = req.ticker
 
-        # Fetch recent data
+        # Fetch recent data (enough for indicators)
         df = yf.download(ticker, period="1mo", interval="1d", progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -133,67 +136,65 @@ def scan_signal(api_key: str, api_secret: str, config: dict) -> dict:
         if len(df) < 20:
             return {"signal": False, "reason": "Insufficient data"}
 
-        # Compute streaks
-        df['is_red'] = df['Close'] < df['Open']
-        df['is_green'] = df['Close'] > df['Open']
+        df.reset_index(inplace=True)
+        if 'Date' not in df.columns and 'index' in df.columns:
+            df.rename(columns={'index': 'Date'}, inplace=True)
+        if hasattr(df['Date'].dt, 'tz') and df['Date'].dt.tz is not None:
+            df['Date'] = df['Date'].dt.tz_localize(None)
 
-        # Count current streak
-        is_bear = config.get('strategy_type', 'bull_call') == 'bear_put'
-        col = 'is_green' if is_bear else 'is_red'
+        # Use modular strategy logic
+        strategy = StrategyFactory.get_strategy(req.strategy_id)
+        df_ind = strategy.compute_indicators(df, req)
+        
+        # Add basic regime for filters
+        df_ind['regime'] = 'sideways'
+        if 'SMA_200' in df_ind.columns and 'SMA_50' in df_ind.columns:
+            bull_mask = (df_ind['Close'] > df_ind['SMA_200']) & (df_ind['SMA_50'] > df_ind['SMA_200'])
+            bear_mask = (df_ind['Close'] < df_ind['SMA_200']) & (df_ind['SMA_50'] < df_ind['SMA_200'])
+            df_ind.loc[bull_mask, 'regime'] = 'bull'
+            df_ind.loc[bear_mask, 'regime'] = 'bear'
 
-        current_streak = 0
-        for i in range(len(df) - 1, -1, -1):
-            if df[col].iloc[i]:
-                current_streak += 1
-            else:
-                break
+        i = len(df_ind) - 1
+        row = df_ind.iloc[i]
+        is_bear = req.strategy_type == 'bear_put'
 
-        entry_days = config.get('entry_red_days', 2)
-        signal_firing = current_streak >= entry_days
+        signal_firing = strategy.check_entry(df_ind, i, req)
 
-        # RSI check
-        delta = df['Close'].diff()
-        gain = delta.clip(lower=0)
-        loss = (-delta).clip(lower=0)
-        avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi = (100 - (100 / (1 + rs))).fillna(50).iloc[-1]
-
-        # EMA check
-        ema_len = config.get('ema_length', 10)
-        ema = df['Close'].ewm(span=ema_len, adjust=False).mean().iloc[-1]
-        current_price = float(df['Close'].iloc[-1])
-
+        # Filters logic (Global)
+        rsi = float(row['RSI'])
         rsi_ok = True
-        if config.get('use_rsi_filter', True):
-            threshold = config.get('rsi_threshold', 30)
+        if req.use_rsi_filter:
             if is_bear:
-                rsi_ok = float(rsi) > (100 - threshold)
+                rsi_ok = rsi > (100 - req.rsi_threshold)
             else:
-                rsi_ok = float(rsi) < threshold
+                rsi_ok = rsi < req.rsi_threshold
 
         ema_ok = True
-        if config.get('use_ema_filter', True):
+        if req.use_ema_filter:
+            ema = float(row[f'EMA_{req.ema_length}'])
+            current_price = float(row['Close'])
             if is_bear:
-                ema_ok = current_price > float(ema)
+                ema_ok = current_price > ema
             else:
-                ema_ok = current_price < float(ema)
+                ema_ok = current_price < ema
 
         all_pass = signal_firing and rsi_ok and ema_ok
+        current_price = float(row['Close'])
 
         return {
             "signal": all_pass,
-            "streak": current_streak,
-            "required": entry_days,
             "price": round(current_price, 2),
-            "rsi": round(float(rsi), 2),
+            "rsi": round(rsi, 2),
             "rsi_ok": rsi_ok,
-            "ema": round(float(ema), 2),
             "ema_ok": ema_ok,
-            "strategy": config.get('strategy_type', 'bull_call'),
+            "strategy": req.strategy_id,
+            "type": req.strategy_type,
             "timestamp": datetime.now().isoformat(),
         }
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return {"signal": False, "error": str(e)}
 
     except Exception as e:
         return {"signal": False, "error": str(e)}
