@@ -183,6 +183,26 @@ input:checked + .slider:before {
   transform: translateY(0);
 }
 
+.btn-secondary {
+  background-color: rgba(107, 70, 193, 0.15);
+  color: #a78bfa;
+  border: 1px solid rgba(107, 70, 193, 0.3);
+  padding: 10px;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+.btn-secondary:hover {
+  background-color: rgba(107, 70, 193, 0.25);
+  border-color: #6b46c1;
+}
+
 /* Main Content */
 .main-content {
   flex: 1;
@@ -263,14 +283,16 @@ input:checked + .slider:before {
   min-height: 400px;
 }
 
-/* Table */
 .table-container {
   background-color: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: 12px;
   overflow: hidden;
   max-height: 420px;
+  min-height: 300px;
+  flex-shrink: 0;
   overflow-y: auto;
+  margin-top: 24px;
 }
 
 table {

@@ -1,0 +1,6 @@
+@echo off
+echo Running GitHub Auth...
+"%ProgramFiles%\GitHub CLI\gh.exe" auth login --web
+echo Pushing...
+"%ProgramFiles%\GitHub CLI\gh.exe" repo create spy_credit_spread --public --source=. --remote=origin --push
+echo Done.
