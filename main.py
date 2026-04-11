@@ -540,3 +540,47 @@ def optimize(req: OptimizerRequest):
     except Exception as e:
         import traceback; traceback.print_exc()
         return {"error": str(e)}
+
+
+# ── Paper Trading endpoints ────────────────────────────────────────────────
+class PaperCredentials(BaseModel):
+    api_key: str
+    api_secret: str
+
+class PaperOrderRequest(BaseModel):
+    api_key: str
+    api_secret: str
+    symbol: str = "SPY"
+    qty: int = 1
+    side: str = "buy"
+
+class PaperScanRequest(BaseModel):
+    api_key: str
+    api_secret: str
+    config: dict = {}
+
+@app.post("/api/paper/connect")
+def paper_connect(creds: PaperCredentials):
+    from paper_trading import check_connection
+    return check_connection(creds.api_key, creds.api_secret)
+
+@app.post("/api/paper/positions")
+def paper_positions(creds: PaperCredentials):
+    from paper_trading import get_positions
+    return {"positions": get_positions(creds.api_key, creds.api_secret)}
+
+@app.post("/api/paper/orders")
+def paper_orders(creds: PaperCredentials):
+    from paper_trading import get_orders
+    return {"orders": get_orders(creds.api_key, creds.api_secret)}
+
+@app.post("/api/paper/execute")
+def paper_execute(req: PaperOrderRequest):
+    from paper_trading import place_equity_order
+    return place_equity_order(req.api_key, req.api_secret, req.symbol, req.qty, req.side)
+
+@app.post("/api/paper/scan")
+def paper_scan(req: PaperScanRequest):
+    from paper_trading import scan_signal
+    return scan_signal(req.api_key, req.api_secret, req.config)
+

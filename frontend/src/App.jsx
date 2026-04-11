@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createChart, CandlestickSeries, createSeriesMarkers } from 'lightweight-charts';
 import { AreaChart, Area, BarChart, Bar, Cell, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
-import { Play, TrendingUp, BarChart2, Activity, Settings, Zap, Save, RotateCcw } from 'lucide-react';
+import { Play, TrendingUp, BarChart2, Activity, Settings, Zap, Save, RotateCcw, Radio, ShieldCheck, AlertTriangle } from 'lucide-react';
 
 const STORAGE_KEY = 'spy_backtest_config';
 const PRESETS_KEY = 'spy_backtest_presets';
@@ -46,6 +46,16 @@ export default function App() {
   const [optParamY, setOptParamY] = useState('target_dte');
   const [customPresets, setCustomPresets] = useState(loadPresets);
   const [presetName, setPresetName] = useState('');
+  // Paper trading state
+  const [showPaper, setShowPaper] = useState(false);
+  const [paperKey, setPaperKey] = useState(localStorage.getItem('alpaca_key') || '');
+  const [paperSecret, setPaperSecret] = useState(localStorage.getItem('alpaca_secret') || '');
+  const [paperAccount, setPaperAccount] = useState(null);
+  const [paperConnecting, setPaperConnecting] = useState(false);
+  const [paperSignal, setPaperSignal] = useState(null);
+  const [paperPositions, setPaperPositions] = useState([]);
+  const [paperOrders, setPaperOrders] = useState([]);
+  const [paperMsg, setPaperMsg] = useState('');
 
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
@@ -104,6 +114,42 @@ export default function App() {
   }, [config, optParamX, optParamY]);
 
   useEffect(() => { runSimulation(); }, []);
+
+  // Paper trading functions
+  const connectPaper = async () => {
+    setPaperConnecting(true); setPaperMsg('');
+    localStorage.setItem('alpaca_key', paperKey); localStorage.setItem('alpaca_secret', paperSecret);
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/paper/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({api_key:paperKey, api_secret:paperSecret}) });
+      const json = await res.json();
+      if (json.connected) { setPaperAccount(json); loadPaperData(); } else { setPaperMsg(json.error || 'Connection failed'); setPaperAccount(null); }
+    } catch(e) { setPaperMsg(e.message); } finally { setPaperConnecting(false); }
+  };
+  const loadPaperData = async () => {
+    try {
+      const [posRes, ordRes] = await Promise.all([
+        fetch('http://127.0.0.1:8000/api/paper/positions', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({api_key:paperKey, api_secret:paperSecret}) }),
+        fetch('http://127.0.0.1:8000/api/paper/orders', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({api_key:paperKey, api_secret:paperSecret}) }),
+      ]);
+      const posJson = await posRes.json(); setPaperPositions(posJson.positions || []);
+      const ordJson = await ordRes.json(); setPaperOrders(ordJson.orders || []);
+    } catch(e) { console.error(e); }
+  };
+  const scanSignal = async () => {
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/paper/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({api_key:paperKey, api_secret:paperSecret, config}) });
+      setPaperSignal(await res.json());
+    } catch(e) { console.error(e); }
+  };
+  const executeTrade = async (side) => {
+    setPaperMsg('');
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/paper/execute', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({api_key:paperKey, api_secret:paperSecret, symbol:config.ticker, qty:config.contracts_per_trade * 100, side}) });
+      const json = await res.json();
+      if (json.success) { setPaperMsg(`Order placed: ${json.side} ${json.qty} ${json.symbol}`); loadPaperData(); }
+      else { setPaperMsg(json.error || 'Order failed'); }
+    } catch(e) { setPaperMsg(e.message); }
+  };
 
   const handleChange = (e) => {
     const { name, value, type, checked } = e.target;
@@ -233,6 +279,26 @@ export default function App() {
               <Settings size={14} /> {showOptimizer ? 'Hide Optimizer' : 'Grid Optimizer'}
             </button>
           </div>
+        </Section>
+
+        <Section label="🔴 Live Paper Trading">
+          <button className="btn-secondary" onClick={() => setShowPaper(!showPaper)} style={{ width: '100%', marginBottom: 8 }}>
+            <Radio size={14} /> {showPaper ? 'Hide Paper Trading' : 'Alpaca Paper Trading'}
+          </button>
+          {showPaper && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <input type="text" value={paperKey} onChange={e => setPaperKey(e.target.value)} placeholder="API Key"
+                style={{ background:'var(--bg-card)',border:'1px solid var(--border)',borderRadius:6,padding:'7px 10px',color:'#f0f0f5',fontSize:'0.8rem' }} />
+              <input type="password" value={paperSecret} onChange={e => setPaperSecret(e.target.value)} placeholder="API Secret"
+                style={{ background:'var(--bg-card)',border:'1px solid var(--border)',borderRadius:6,padding:'7px 10px',color:'#f0f0f5',fontSize:'0.8rem' }} />
+              <button onClick={connectPaper} disabled={paperConnecting}
+                style={{ padding:'8px',borderRadius:8,border:'none',background:paperAccount?'rgba(72,187,120,0.2)':'var(--accent)',color:paperAccount?'#48bb78':'#fff',fontWeight:600,cursor:'pointer',fontSize:'0.8rem' }}>
+                {paperConnecting ? 'Connecting…' : paperAccount ? '✓ Connected' : 'Connect'}
+              </button>
+              {paperAccount && <div style={{ fontSize:'0.72rem',color:'#48bb78',padding:'4px 0' }}>Equity: ${parseFloat(paperAccount.equity).toLocaleString()} | BP: ${parseFloat(paperAccount.buying_power).toLocaleString()}</div>}
+              {paperMsg && <div style={{ fontSize:'0.72rem',color:'#ecc94b',padding:'4px 0' }}>{paperMsg}</div>}
+            </div>
+          )}
         </Section>
 
         <button className="btn-primary" onClick={runSimulation} disabled={loading} id="run-simulation-btn">
@@ -437,6 +503,86 @@ export default function App() {
             </tbody>
           </table>
         </div>
+
+        {/* Paper Trading Panel */}
+        {showPaper && paperAccount && (
+          <div className="chart-box" style={{ marginTop: 24 }}>
+            <h3><Radio size={18} /> Live Paper Trading — {config.ticker}</h3>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginTop: 12 }}>
+              {/* Account */}
+              <div style={{ padding: 16, borderRadius: 10, background: 'rgba(72,187,120,0.06)', border: '1px solid rgba(72,187,120,0.15)' }}>
+                <div style={{ fontSize: '0.72rem', color: '#48bb78', textTransform: 'uppercase', fontWeight: 700, marginBottom: 8 }}>Account</div>
+                <div style={{ fontSize: '1.1rem', fontWeight: 700 }}>${parseFloat(paperAccount.equity).toLocaleString()}</div>
+                <div style={{ fontSize: '0.72rem', color: '#8b8b9d', marginTop: 4 }}>Buying Power: ${parseFloat(paperAccount.buying_power).toLocaleString()}</div>
+              </div>
+
+              {/* Signal Scanner */}
+              <div style={{ padding: 16, borderRadius: 10, background: paperSignal?.signal ? 'rgba(72,187,120,0.06)' : 'rgba(255,255,255,0.03)', border: `1px solid ${paperSignal?.signal ? 'rgba(72,187,120,0.2)' : 'var(--border)'}` }}>
+                <div style={{ fontSize: '0.72rem', color: '#a78bfa', textTransform: 'uppercase', fontWeight: 700, marginBottom: 8 }}>Signal Scanner</div>
+                {paperSignal ? (
+                  <>
+                    <div style={{ fontSize: '1.1rem', fontWeight: 700, color: paperSignal.signal ? '#48bb78' : '#f56565' }}>
+                      {paperSignal.signal ? '🟢 SIGNAL ACTIVE' : '⚪ NO SIGNAL'}
+                    </div>
+                    <div style={{ fontSize: '0.72rem', color: '#8b8b9d', marginTop: 4 }}>
+                      Streak: {paperSignal.streak}/{paperSignal.required} | RSI: {paperSignal.rsi} {paperSignal.rsi_ok ? '✓' : '✗'} | EMA {paperSignal.ema_ok ? '✓' : '✗'}
+                    </div>
+                  </>
+                ) : <div style={{ fontSize: '0.85rem', color: '#8b8b9d' }}>Click scan to check</div>}
+                <button onClick={scanSignal} style={{ marginTop: 8, padding: '6px 14px', borderRadius: 6, border: 'none', background: 'var(--accent)', color: '#fff', fontWeight: 600, cursor: 'pointer', fontSize: '0.75rem' }}>
+                  Scan Now
+                </button>
+              </div>
+
+              {/* Execute */}
+              <div style={{ padding: 16, borderRadius: 10, background: 'rgba(167,139,250,0.06)', border: '1px solid rgba(167,139,250,0.15)' }}>
+                <div style={{ fontSize: '0.72rem', color: '#a78bfa', textTransform: 'uppercase', fontWeight: 700, marginBottom: 8 }}>Execute Trade</div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button onClick={() => executeTrade('buy')}
+                    style={{ flex: 1, padding: '8px', borderRadius: 6, border: 'none', background: 'rgba(72,187,120,0.2)', color: '#48bb78', fontWeight: 700, cursor: 'pointer', fontSize: '0.8rem' }}>
+                    BUY {config.contracts_per_trade * 100}
+                  </button>
+                  <button onClick={() => executeTrade('sell')}
+                    style={{ flex: 1, padding: '8px', borderRadius: 6, border: 'none', background: 'rgba(245,101,101,0.2)', color: '#f56565', fontWeight: 700, cursor: 'pointer', fontSize: '0.8rem' }}>
+                    SELL {config.contracts_per_trade * 100}
+                  </button>
+                </div>
+                <div style={{ fontSize: '0.65rem', color: '#8b8b9d', marginTop: 6 }}>⚠ Paper account only</div>
+              </div>
+            </div>
+
+            {/* Positions & Orders */}
+            {(paperPositions.length > 0 || paperOrders.length > 0) && (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 16 }}>
+                {paperPositions.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: '0.75rem', color: '#a78bfa', fontWeight: 700, marginBottom: 8 }}>Open Positions</div>
+                    {paperPositions.map((p, i) => (
+                      <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--bg-card)', borderRadius: 6, marginBottom: 4, fontSize: '0.8rem' }}>
+                        <span style={{ fontWeight: 600 }}>{p.symbol} × {p.qty}</span>
+                        <span style={{ color: p.unrealized_pl >= 0 ? '#48bb78' : '#f56565', fontWeight: 600 }}>
+                          {p.unrealized_pl >= 0 ? '+' : ''}${p.unrealized_pl?.toFixed(2)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {paperOrders.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: '0.75rem', color: '#a78bfa', fontWeight: 700, marginBottom: 8 }}>Recent Orders</div>
+                    {paperOrders.slice(0, 5).map((o, i) => (
+                      <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--bg-card)', borderRadius: 6, marginBottom: 4, fontSize: '0.78rem' }}>
+                        <span>{o.side?.toUpperCase()} {o.qty} {o.symbol}</span>
+                        <span className={`badge ${o.status === 'filled' ? 'win' : o.status === 'canceled' ? 'loss' : 'expired'}`}>{o.status}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {paperMsg && <div style={{ marginTop: 8, fontSize: '0.78rem', color: '#ecc94b', padding: '8px 12px', background: 'rgba(236,201,75,0.08)', borderRadius: 6 }}>{paperMsg}</div>}
+          </div>
+        )}
       </div>
     </div>
   );
