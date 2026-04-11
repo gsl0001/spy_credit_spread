@@ -7,6 +7,13 @@ class ConsecutiveDaysStrategy(BaseStrategy):
     def name(self) -> str:
         return "Consecutive Days"
 
+    @classmethod
+    def get_schema(cls) -> dict:
+        return {
+            "entry_red_days": {"type": "number", "default": 2, "min": 1, "label": "Entry Streak Days"},
+            "exit_green_days": {"type": "number", "default": 2, "min": 1, "label": "Exit Streak Days"}
+        }
+
     def compute_indicators(self, df: pd.DataFrame, req) -> pd.DataFrame:
         df = df.copy()
         df['is_green'] = df['Close'] > df['Open']

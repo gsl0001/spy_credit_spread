@@ -67,7 +67,7 @@ def preflight():
 
 # ── Process launchers ───────────────────────────────────────────────────────
 def start_backend() -> subprocess.Popen:
-    log("BACKEND", GREEN, f"Starting FastAPI  →  http://127.0.0.1:8000")
+    log("BACKEND", GREEN, f"Starting FastAPI  ->  http://127.0.0.1:8000")
     return subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "main:app",
          "--host", "127.0.0.1", "--port", "8000", "--reload"],
@@ -80,7 +80,7 @@ def start_backend() -> subprocess.Popen:
 
 
 def start_frontend() -> subprocess.Popen:
-    log("FRONTEND", CYAN, f"Starting React     →  http://localhost:5173")
+    log("FRONTEND", CYAN, f"Starting React     ->  http://localhost:5173")
     return subprocess.Popen(
         ["npm", "run", "dev"],
         cwd=FRONTEND_DIR,
@@ -114,11 +114,9 @@ def main():
     if sys.platform == "win32":
         os.system("color")
 
-    print()
-    print(f"  {BOLD}{CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{RESET}")
-    print(f"  {BOLD}{CYAN}  📈  SPY Options Backtesting Dashboard          {RESET}")
-    print(f"  {BOLD}{CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{RESET}")
-    print()
+    print(f"  {BOLD}{CYAN}------------------------------------------------{RESET}")
+    print(f"  {BOLD}{CYAN}  SPY Options Backtesting Dashboard          {RESET}")
+    print(f"  {BOLD}{CYAN}------------------------------------------------{RESET}")
 
     preflight()
     print()
@@ -164,7 +162,7 @@ def main():
                     proc.kill()
                 log("INFO", DIM, f"{name} stopped.")
         print()
-        log("INFO", GREEN, "All done. Goodbye! 👋")
+        log("INFO", GREEN, "All done. Goodbye!")
         print()
 
 

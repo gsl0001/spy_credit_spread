@@ -7,6 +7,18 @@ class ComboSpreadStrategy(BaseStrategy):
     def name(self) -> str:
         return "Combo Spread"
 
+    @classmethod
+    def get_schema(cls) -> dict:
+        return {
+            "combo_sma1": {"type": "number", "default": 3, "min": 1, "label": "SMA 1"},
+            "combo_sma2": {"type": "number", "default": 8, "min": 1, "label": "SMA 2"},
+            "combo_sma3": {"type": "number", "default": 10, "min": 1, "label": "SMA 3"},
+            "combo_ema1": {"type": "number", "default": 5, "min": 1, "label": "EMA 1"},
+            "combo_ema2": {"type": "number", "default": 3, "min": 1, "label": "EMA 2"},
+            "combo_max_bars": {"type": "number", "default": 10, "min": 1, "label": "Max Bars Hold"},
+            "combo_max_profit_closes": {"type": "number", "default": 5, "min": 1, "label": "Max Profit Closes"}
+        }
+
     def compute_indicators(self, df: pd.DataFrame, req) -> pd.DataFrame:
         df = df.copy()
         

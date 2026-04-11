@@ -8,6 +8,12 @@ class BaseStrategy(ABC):
     def name(self) -> str:
         """Display name of the strategy."""
         pass
+        
+    @classmethod
+    @abstractmethod
+    def get_schema(cls) -> dict:
+        """Return a JSON schema dict defining the specific configurable parameters for this strategy."""
+        pass
 
     @abstractmethod
     def compute_indicators(self, df: pd.DataFrame, req) -> pd.DataFrame:

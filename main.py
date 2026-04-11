@@ -11,6 +11,13 @@ from pydantic import BaseModel
 # Strategy imports
 from strategies.consecutive_days import ConsecutiveDaysStrategy
 from strategies.combo_spread import ComboSpreadStrategy
+from strategies.builder import OptionTopologyBuilder, bs_call_price, bs_put_price
+
+# Trading & Scheduler imports
+from ibkr_trading import get_ib_connection
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime
+import asyncio
 
 app = FastAPI(title="SPY Options Backtesting Engine")
 
@@ -21,6 +28,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Global Scheduler
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+# Scanner State
+scanner_state = {
+    "active": False,
+    "frequency": "hourly", # "minutely", "hourly", "open", "close"
+    "logs": [],
+    "last_run": None,
+    "config": None,
+    "mode": "paper" # "paper" (Alpaca) or "ibkr"
+}
 
 class BacktestRequest(BaseModel):
     ticker: str = "SPY"
@@ -34,7 +55,16 @@ class BacktestRequest(BaseModel):
     
     # Strategy selector
     strategy_id: str = "consecutive_days"  # "consecutive_days", "combo_spread"
-    strategy_type: str = "bull_call"      # "bull_call" or "bear_put"
+    strategy_type: str = "bull_call"      # Legacy field, mapped to direction
+    
+    # New Topology & Direction fields
+    topology: str = "vertical_spread" # "long_call", "vertical_spread", "straddle", "iron_condor", "butterfly"
+    direction: str = "bull"          # "bull", "bear", "neutral"
+    strike_width: int = 5
+    
+    # Risk Measures
+    take_profit_pct: float = 0.0     # 0 means disabled
+    trailing_stop_pct: float = 0.0   # 0 means disabled
     
     # Consecutive Days Params
     entry_red_days: int = 2
@@ -69,6 +99,12 @@ class BacktestRequest(BaseModel):
     vix_max: float = 35.0
     use_regime_filter: bool = False
     regime_allowed: str = "all"  # "all", "bull", "bear", "sideways"
+    
+    # Targeted Spread / Dynamic Sizing
+    use_targeted_spread: bool = False
+    target_spread_pct: float = 2.0  # % of capital per trade
+    max_allocation_cap: float = 2500.0 # max $$ risk per trade
+    realism_factor: float = 1.15 # IV Multiplier
 
 class OptimizerRequest(BaseModel):
     base_config: BacktestRequest = BacktestRequest()
@@ -79,13 +115,22 @@ class OptimizerRequest(BaseModel):
 
 
 class StrategyFactory:
+    STRATEGIES = {
+        "consecutive_days": ConsecutiveDaysStrategy,
+        "combo_spread": ComboSpreadStrategy
+    }
+
     @staticmethod
     def get_strategy(strategy_id: str):
-        if strategy_id == "consecutive_days":
-            return ConsecutiveDaysStrategy()
-        elif strategy_id == "combo_spread":
-            return ComboSpreadStrategy()
-        return ConsecutiveDaysStrategy()
+        strat_cls = StrategyFactory.STRATEGIES.get(strategy_id, ConsecutiveDaysStrategy)
+        return strat_cls()
+
+    @staticmethod
+    def get_all_strategies():
+        return [
+            {"id": k, "name": v().name, "schema": v.get_schema()}
+            for k, v in StrategyFactory.STRATEGIES.items()
+        ]
 
 
 # ── Data fetching ──────────────────────────────────────────────────────────
@@ -104,6 +149,17 @@ def fetch_historical_data(ticker: str, years: int):
 
 
 @lru_cache(maxsize=5)
+def fetch_risk_free_rate():
+    """Fetch 13-week T-Bill (^IRX) as a risk-free rate proxy."""
+    try:
+        df = yf.download("^IRX", period="5y", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return float(df['Close'].iloc[-1]) / 100.0
+    except Exception:
+        return 0.045
+
+@lru_cache(maxsize=5)
 def fetch_vix_data(years: int):
     """Fetch VIX index data for regime/volatility filtering."""
     try:
@@ -119,24 +175,9 @@ def fetch_vix_data(years: int):
     except Exception:
         return pd.DataFrame(columns=['Date', 'VIX'])
 
-
-# ── Black-Scholes ──────────────────────────────────────────────────────────
-def bs_call_price(S, K, T, r, sigma):
-    if T <= 0: return max(0.0, S - K)
-    if sigma <= 0: return max(0.0, S - K * np.exp(-r * T))
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    return S * si.norm.cdf(d1) - K * np.exp(-r * T) * si.norm.cdf(d2)
-
-def bs_put_price(S, K, T, r, sigma):
-    if T <= 0: return max(0.0, K - S)
-    if sigma <= 0: return max(0.0, K * np.exp(-r * T) - S)
-    return bs_call_price(S, K, T, r, sigma) - S + K * np.exp(-r * T)
-
-
 # ── Core backtest engine ───────────────────────────────────────────────────
 def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int = 200):
-    RISK_FREE_RATE = 0.045
+    RISK_FREE_RATE = fetch_risk_free_rate()
     strategy = StrategyFactory.get_strategy(req.strategy_id)
     df = strategy.compute_indicators(df, req)
     
@@ -147,31 +188,37 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
     df.loc[bull_mask, 'regime'] = 'bull'
     df.loc[bear_mask, 'regime'] = 'bear'
 
-    is_bear = req.strategy_type == "bear_put"
-    price_fn = bs_put_price if is_bear else bs_call_price
-
     trades, equity_curve = [], []
     equity = req.capital_allocation
     in_trade = False
     entry_idx = -1
-    entry_dte = K_long = K_short = 0
+    entry_dte = 0
     entry_cost = 0.0
     current_entry = {}
     max_eq_seen = req.capital_allocation
+    
+    # Trailing Stop state
+    high_water_mark = 0.0
 
     for i in range(start_idx, len(df)):
         row = df.iloc[i]
         date = row['Date_str']
 
-        # Mark-to-market
-        if in_trade and req.use_mark_to_market:
+        # Mark-to-market and current position value
+        if in_trade:
             dh = i - entry_idx
             T_m = max((entry_dte - dh) / 365.25, 0.0)
             S_m = float(row['Close'])
             sig_m = max(float(row['HV_21']), 0.05)
             sc = current_entry.get("contracts", req.contracts_per_trade)
-            mtm_val = (price_fn(S_m, K_long, T_m, RISK_FREE_RATE, sig_m) -
-                       price_fn(S_m, K_short, T_m, RISK_FREE_RATE, sig_m)) * 100 * sc
+            
+            # Use builder to price the current position
+            cv_raw = OptionTopologyBuilder.price_topology(current_entry["legs"], S_m, T_m, RISK_FREE_RATE, sig_m, realism_factor=req.realism_factor)
+            mtm_val = cv_raw * sc
+            
+            # Update high water mark for trailing stop
+            high_water_mark = max(high_water_mark, mtm_val)
+            
             mtm_equity = equity + mtm_val
         else:
             mtm_equity = equity
@@ -183,6 +230,7 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
         if not in_trade:
             if strategy.check_entry(df, i, req):
                 allow = True
+                is_bear = req.direction == "bear" or req.strategy_type == "bear_put"
 
                 # Standard filters (Global)
                 if is_bear:
@@ -201,7 +249,6 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
                     vix_val = float(row['VIX']) if pd.notna(row['VIX']) else 20
                     if vix_val < req.vix_min or vix_val > req.vix_max: allow = False
 
-                # Regime filter
                 if req.use_regime_filter and req.regime_allowed != "all":
                     if row.get('regime', 'sideways') != req.regime_allowed: allow = False
 
@@ -209,52 +256,62 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
                     S = float(row['Close'])
                     sigma = max(float(row['HV_21']), 0.05)
                     T = req.target_dte / 365.25
-                    tgt = req.spread_cost_target / 100.0
+                    
+                    # Map legacy strategy_type to direction if needed
+                    direction = req.direction
+                    if req.strategy_type == "bear_put" and direction == "bull":
+                        direction = "bear_put"
+                    elif req.strategy_type == "bull_call" and direction == "bull":
+                        direction = "bull_call"
 
-                    if is_bear:
-                        K1 = round(S)
-                        p1 = bs_put_price(S, K1, T, RISK_FREE_RATE, sigma)
-                        best_K2, best_diff, fp2 = K1 - 5, float('inf'), 0.0
-                        for ks in range(K1 - 1, max(K1 - 41, 1), -1):
-                            p2 = bs_put_price(S, ks, T, RISK_FREE_RATE, sigma)
-                            c = p1 - p2
-                            if c < 0: break
-                            d = abs(c - tgt)
-                            if d < best_diff: best_diff, best_K2, fp2 = d, ks, p2
-                        K_long, K_short = K1, best_K2
-                        one_cc = (p1 - fp2) * 100
-                    else:
-                        K1 = round(S)
-                        c1 = bs_call_price(S, K1, T, RISK_FREE_RATE, sigma)
-                        best_K2, best_diff, fc2 = K1 + 5, float('inf'), 0.0
-                        for ks in range(K1 + 1, K1 + 41):
-                            c2 = bs_call_price(S, ks, T, RISK_FREE_RATE, sigma)
-                            c = c1 - c2
-                            if c < 0: break
-                            d = abs(c - tgt)
-                            if d < best_diff: best_diff, best_K2, fc2 = d, ks, c2
-                        K_long, K_short = K1, best_K2
-                        one_cc = (c1 - fc2) * 100
+                    # Construct position using the Builder
+                    pos = OptionTopologyBuilder.construct_legs(
+                        topology=req.topology,
+                        direction=direction,
+                        S=S,
+                        T=T,
+                        r=RISK_FREE_RATE,
+                        sigma=sigma,
+                        target_cost=req.spread_cost_target,
+                        strike_width=req.strike_width,
+                        realism_factor=req.realism_factor
+                    )
+                    
+                    one_cc = pos["net_cost"]
+                    if abs(one_cc) < 1e-3 and req.topology != "straddle": 
+                        # Fallback for weird pricing
+                        continue
 
-                    if one_cc <= 0: continue
-
-                    if req.use_dynamic_sizing:
+                    if req.use_targeted_spread:
+                        # Targeted spread sizing: allocation based on % of capital
+                        target_risk = equity * (req.target_spread_pct / 100.0)
+                        target_risk = min(target_risk, req.max_allocation_cap)
+                        risk_per_contract = pos["margin_req"] if pos["margin_req"] > 0 else abs(one_cc)
+                        contracts = int(max(1, target_risk // risk_per_contract))
+                    elif req.use_dynamic_sizing:
+                        # Dynamic sizing based on margin requirement if credit, or cost if debit
+                        risk_cap = pos["margin_req"] if pos["margin_req"] > 0 else abs(one_cc)
                         ds = equity * (req.risk_percent / 100.0)
                         if req.max_trade_cap > 0: ds = min(ds, req.max_trade_cap)
-                        contracts = int(max(1, ds // one_cc))
+                        contracts = int(max(1, ds // risk_cap))
                     else:
                         contracts = req.contracts_per_trade
 
                     entry_cost = one_cc * contracts
-                    comm = req.commission_per_contract * contracts * 2
-                    if entry_cost + comm > equity: continue
-
-                    equity -= entry_cost + comm
+                    sc = contracts
+                    comm = req.commission_per_contract * sc * len(pos["legs"])
+                    
+                    if (entry_cost + comm) > equity and one_cc > 0: continue # Check BP for debits
+                    
+                    equity -= (entry_cost + comm)
                     in_trade, entry_idx, entry_dte = True, i, req.target_dte
-                    current_entry = {"entry_date": date, "entry_spy": S, "spread_cost": entry_cost,
-                                     "contracts": contracts, "commission": comm,
-                                     "regime": row.get('regime', 'unknown'),
-                                     "entry_idx": i, "entry_dte": req.target_dte, "entry_price": S}
+                    current_entry = {
+                        "entry_date": date, "entry_spy": S, "entry_cost": entry_cost,
+                        "contracts": sc, "commission": comm, "legs": pos["legs"],
+                        "regime": row.get('regime', 'unknown'),
+                        "entry_idx": i, "entry_dte": req.target_dte, "entry_price": S
+                    }
+                    high_water_mark = entry_cost
         else:
             # Check strategy exit
             should_exit, reason = strategy.check_exit(df, i, current_entry, req)
@@ -265,26 +322,47 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
             S = float(row['Close'])
             sigma = max(float(row['HV_21']), 0.05)
             sc = current_entry.get("contracts", req.contracts_per_trade)
-            cv = (price_fn(S, K_long, T_c, RISK_FREE_RATE, sigma) -
-                  price_fn(S, K_short, T_c, RISK_FREE_RATE, sigma)) * 100 * sc
+            
+            # Current value with builder
+            cv = OptionTopologyBuilder.price_topology(current_entry["legs"], S, T_c, RISK_FREE_RATE, sigma, realism_factor=req.realism_factor) * sc
 
-            stop_exit = req.stop_loss_pct > 0 and cv <= entry_cost * (1 - req.stop_loss_pct / 100)
+            # Profit/Loss state for risk measures
+            pnl_live = cv - current_entry["entry_cost"]
+            cost_basis = abs(current_entry["entry_cost"]) if current_entry["entry_cost"] != 0 else 1.0
+            pnl_pct = (pnl_live / cost_basis) * 100
 
-            if should_exit or stop_exit:
-                ec = req.commission_per_contract * sc * 2
+            # Global Risk Measures
+            stop_exit = req.stop_loss_pct > 0 and pnl_pct <= -req.stop_loss_pct
+            tp_exit = req.take_profit_pct > 0 and pnl_pct >= req.take_profit_pct
+            
+            # Trailing stop: check drawdown from high water mark
+            ts_exit = False
+            if req.trailing_stop_pct > 0:
+                drawdown_from_peak = high_water_mark - cv
+                if drawdown_from_peak > (req.trailing_stop_pct / 100) * cost_basis:
+                    ts_exit = True
+
+            if should_exit or stop_exit or tp_exit or ts_exit:
+                ec = req.commission_per_contract * sc * len(current_entry["legs"])
                 equity += cv - ec
                 tc = current_entry.get("commission", 0) + ec
-                pnl = cv - entry_cost - tc
+                pnl = cv - current_entry["entry_cost"] - tc
+                
+                final_reason = reason
+                if stop_exit: final_reason = "stop_loss"
+                if tp_exit: final_reason = "take_profit"
+                if ts_exit: final_reason = "trailing_stop"
+
                 trades.append({
                     "entry_date": current_entry["entry_date"], "exit_date": date,
                     "entry_spy": round(current_entry["entry_spy"], 2), "exit_spy": round(S, 2),
-                    "spread_cost": round(entry_cost, 2), "spread_exit": round(cv, 2),
+                    "spread_cost": round(current_entry["entry_cost"], 2), "spread_exit": round(cv, 2),
                     "pnl": round(float(pnl), 2), "contracts": sc, "days_held": days_held,
                     "commission": round(tc, 2), "win": bool(pnl > 0),
-                    "stopped_out": bool(stop_exit and not should_exit),
-                    "expired": bool(reason == "expired" and not stop_exit),
-                    "reason": reason if should_exit else "stop_loss",
+                    "stopped_out": bool(stop_exit or ts_exit),
+                    "reason": final_reason,
                     "regime": current_entry.get("regime", "unknown"),
+                    "topology": req.topology
                 })
                 in_trade = False
 
@@ -437,6 +515,11 @@ def run_walk_forward(req, df):
     return results
 
 
+@app.get("/api/strategies")
+def get_strategies():
+    return StrategyFactory.get_all_strategies()
+
+
 # ── Main endpoint ──────────────────────────────────────────────────────────
 @app.post("/api/backtest")
 def backtest(req: BacktestRequest):
@@ -542,7 +625,6 @@ def optimize(req: OptimizerRequest):
         return {"error": str(e)}
 
 
-# ── Paper Trading endpoints ────────────────────────────────────────────────
 class PaperCredentials(BaseModel):
     api_key: str
     api_secret: str
@@ -558,6 +640,7 @@ class PaperScanRequest(BaseModel):
     api_key: str
     api_secret: str
     config: dict = {}
+
 
 @app.post("/api/paper/connect")
 def paper_connect(creds: PaperCredentials):
@@ -583,3 +666,211 @@ def paper_execute(req: PaperOrderRequest):
 def paper_scan(req: PaperScanRequest):
     from paper_trading import scan_signal
     return scan_signal(req.api_key, req.api_secret, req.config)
+
+
+# ── Unified Scanner & IBKR endpoints ───────────────────────────────────────
+
+class ScannerConfigRequest(BaseModel):
+    frequency: str = "hourly"
+    mode: str = "paper"
+    config: dict
+    creds: dict
+
+def run_market_scan():
+    """Background task for scanning market based on frequency."""
+    if not scanner_state["active"]: return
+    
+    current_time = datetime.now().isoformat()
+    config = scanner_state.get("config", {})
+    mode = scanner_state.get("mode", "paper")
+    
+    try:
+        from paper_trading import scan_signal
+        # Perform the scan using the logic in paper_trading (which is generic)
+        res = scan_signal("", "", config) # Alpaca keys not needed for just scanning YF data
+        
+        signal = res.get("signal", False)
+        price = res.get("price", 0)
+        rsi = res.get("rsi", 0)
+        
+        log_entry = {
+            "time": current_time,
+            "signal": signal,
+            "price": price,
+            "rsi": rsi,
+            "msg": f"Scan completed. Signal: {'🟢' if signal else '⚪'}",
+            "details": res
+        }
+        
+        # Limit logs to last 50
+        scanner_state["logs"].insert(0, log_entry)
+        if len(scanner_state["logs"]) > 50:
+            scanner_state["logs"].pop()
+            
+        scanner_state["last_run"] = current_time
+        
+        # AUTO-EXECUTION LOGIC (Placeholder for now, could be enabled via config)
+        if signal and config.get("auto_execute", False):
+            # TODO: Logic for automatic execution based on mode
+            pass
+
+    except Exception as e:
+        print(f"Error in background scan: {e}")
+        scanner_state["logs"].insert(0, {
+            "time": current_time,
+            "signal": False,
+            "msg": f"❌ Error: {str(e)}"
+        })
+
+@app.post("/api/scanner/start")
+def start_scanner(req: ScannerConfigRequest):
+    scanner_state["active"] = True
+    scanner_state["frequency"] = req.frequency
+    scanner_state["mode"] = req.mode
+    scanner_state["config"] = req.config
+    
+    # Remove existing jobs
+    scheduler.remove_all_jobs()
+    
+    # Add new job based on frequency
+    if req.frequency == "minutely":
+        scheduler.add_job(run_market_scan, 'interval', minutes=1, id='market_scan')
+    elif req.frequency == "hourly":
+        scheduler.add_job(run_market_scan, 'interval', hours=1, id='market_scan')
+    elif req.frequency == "open":
+        # Scan 15 mins after market open (9:45 AM EST)
+        scheduler.add_job(run_market_scan, 'cron', hour=9, minute=45, day_of_week='mon-fri', id='market_scan')
+    elif req.frequency == "close":
+        # Scan 15 mins before market close (3:45 PM EST)
+        scheduler.add_job(run_market_scan, 'cron', hour=15, minute=45, day_of_week='mon-fri', id='market_scan')
+        
+    return {"status": "started", "frequency": req.frequency}
+
+@app.post("/api/scanner/stop")
+def stop_scanner():
+    scanner_state["active"] = False
+    scheduler.remove_all_jobs()
+    return {"status": "stopped"}
+
+@app.get("/api/scanner/status")
+def get_scanner_status():
+    return scanner_state
+
+class IBKRConnectRequest(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 7497
+    client_id: int = 1
+
+@app.post("/api/ibkr/connect")
+async def ibkr_connect(req: IBKRConnectRequest):
+    trader, msg = await get_ib_connection(req.model_dump())
+    if trader:
+        summary = await trader.get_account_summary()
+        return {"connected": True, "summary": summary}
+    return {"connected": False, "error": msg}
+
+@app.post("/api/ibkr/positions")
+async def ibkr_positions(req: IBKRConnectRequest):
+    trader, msg = await get_ib_connection(req.model_dump())
+    if trader:
+        pos = await trader.get_positions()
+        return {"positions": pos}
+    return {"error": msg}
+
+class IBKROrderRequest(BaseModel):
+    creds: IBKRConnectRequest
+    symbol: str
+    topology: str
+    direction: str
+    contracts: int
+    strike_width: int = 5
+    target_dte: int = 14
+
+@app.post("/api/ibkr/execute")
+async def ibkr_execute(req: IBKROrderRequest):
+    trader, msg = await get_ib_connection(req.creds.model_dump())
+    if not trader: return {"error": msg}
+    
+    # 1. Fetch current market context (approximate with latest data)
+    raw_df = fetch_historical_data(req.symbol, 1)
+    if len(raw_df) == 0: return {"error": "Could not fetch underlying data for strikes."}
+    
+    latest_row = raw_df.iloc[-1]
+    S = float(latest_row['Close'])
+    # Recompute HV or use a default
+    log_ret = np.log(raw_df['Close'] / raw_df['Close'].shift(1))
+    sigma = (log_ret.rolling(window=21).std().iloc[-1] * np.sqrt(252))
+    if pd.isna(sigma): sigma = 0.20
+    
+    # 2. Construct legs based on topology
+    T = req.target_dte / 365.25
+    RISK_FREE_RATE = fetch_risk_free_rate()
+    
+    pos = OptionTopologyBuilder.construct_legs(
+        topology=req.topology,
+        direction=req.direction,
+        S=S,
+        T=T,
+        r=RISK_FREE_RATE,
+        sigma=sigma,
+        target_cost=0, # Market order for live usually
+        strike_width=req.strike_width
+    )
+    
+    # 3. Format legs for IBKR (YYYMMDD string format)
+    # Note: Modern IBKR requires proper expiry dates. 
+    # For this backtester, we'll approximate the nearest Friday.
+    # For this backtester, we'll approximate the nearest available daily.
+    # SPY has M/W/F and now daily expiries. 
+    # For simplicity, we search for the nearest date that isn't a weekend.
+    import datetime
+    today = datetime.date.today()
+    expiry_date = today + datetime.timedelta(days=req.target_dte)
+    while expiry_date.weekday() >= 5: # Saturday=5, Sunday=6
+        expiry_date += datetime.timedelta(days=1)
+    expiry_str = expiry_date.strftime('%Y%m%d')
+
+    ib_legs = []
+    for leg in pos["legs"]:
+        ib_legs.append({
+            "type": leg["type"],
+            "strike": leg["strike"],
+            "expiry": expiry_str,
+            "side": leg["side"]
+        })
+
+    # 4. Fetch current midpoint for the combo
+    midpoint = await trader.get_combo_midpoint(req.symbol, ib_legs)
+    
+    # 5. Place the order
+    # For credit spreads, mid is usually negative. 
+    # For debit spreads, mid is positive.
+    # LimitOrder in combo structures typically uses exactly what the mid suggests.
+    side = 'BUY' 
+    res = await trader.place_combo_order(req.symbol, ib_legs, req.contracts, side=side, lmtPrice=midpoint)
+    
+    return res
+@app.post("/api/ibkr/test_order")
+async def ibkr_test_order(req: IBKRConnectRequest):
+    trader, msg = await get_ib_connection(req.model_dump())
+    if trader:
+        res = await trader.place_test_order()
+        return res
+    return {"error": msg}
+
+@app.get("/api/ibkr/orders")
+async def ibkr_get_orders(host: str = "127.0.0.1", port: int = 7497, client_id: int = 1):
+    trader, msg = await get_ib_connection({"host": host, "port": port, "client_id": client_id})
+    if trader:
+        orders = await trader.get_active_orders()
+        return {"orders": orders}
+    return {"error": msg}
+
+@app.post("/api/ibkr/cancel")
+async def ibkr_cancel_order(req: dict):
+    # expect json { "creds": {...}, "orderId": 123 }
+    trader, msg = await get_ib_connection(req.get("creds", {}))
+    if trader:
+        res = await trader.cancel_order(req.get("orderId"))
+        return res
+    return {"error": msg}

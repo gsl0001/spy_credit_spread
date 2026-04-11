@@ -57,7 +57,7 @@ def get_positions(api_key: str, api_secret: str) -> list:
             "symbol": p.symbol,
             "qty": int(p.qty),
             "side": p.side,
-            "avg_entry": float(p.avg_entry_price),
+            "avg_price": float(p.avg_entry_price),
             "current_price": float(p.current_price),
             "market_value": float(p.market_value),
             "unrealized_pl": float(p.unrealized_pl),
