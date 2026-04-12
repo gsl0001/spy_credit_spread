@@ -56,47 +56,93 @@ class ComboSpreadStrategy(BaseStrategy):
         return df
 
     def check_entry(self, df: pd.DataFrame, i: int, req) -> bool:
-        if i < 1: return False
-        
+        if i < 1:
+            return False
+
         row = df.iloc[i]
-        prev = df.iloc[i-1]
-        
-        # Entry 01
-        e1 = (row['Close'] < row['sma_03'] and 
-              row['Close'] <= row['sma_01'] and 
-              prev['Close'] > prev['sma_01'] and 
-              row['Open'] > row['ema_01'] and 
-              row['sma_02'] < prev['sma_02'])
-        
-        # Entry 02
-        e2 = (row['Close'] < row['ema_02'] and 
-              row['Open'] > row['ohlc_avg'] and 
-              row['Volume'] <= prev['Volume'] and 
-              (row['Close'] < min(prev['Open'], prev['Close']) or 
-               row['Close'] > max(prev['Open'], prev['Close'])))
-        
+        prev = df.iloc[i - 1]
+
+        # Skip warmup bars where strategy indicators are still NaN
+        if pd.isna(row['sma_03']) or pd.isna(prev['sma_02']):
+            return False
+
+        is_bear = (
+            getattr(req, 'direction', '') == 'bear'
+            or getattr(req, 'strategy_type', '') == 'bear_put'
+        )
+
+        # Outside-body test — close breaches prior candle's body (engulf/gap)
+        outside_body = (
+            row['Close'] < min(prev['Open'], prev['Close'])
+            or row['Close'] > max(prev['Open'], prev['Close'])
+        )
+
+        if is_bear:
+            # Bearish momentum start → buy puts / put spread expecting down move
+            e1 = (
+                row['Close'] > row['sma_03']
+                and row['Close'] >= row['sma_01']
+                and prev['Close'] < prev['sma_01']
+                and row['Open'] < row['ema_01']
+                and row['sma_02'] > prev['sma_02']
+            )
+            e2 = (
+                row['Close'] > row['ema_02']
+                and row['Open'] < row['ohlc_avg']
+                and row['Volume'] <= prev['Volume']
+                and outside_body
+            )
+        else:
+            # Bullish reversal after weakness → buy calls / call spread
+            e1 = (
+                row['Close'] < row['sma_03']
+                and row['Close'] <= row['sma_01']
+                and prev['Close'] > prev['sma_01']
+                and row['Open'] > row['ema_01']
+                and row['sma_02'] < prev['sma_02']
+            )
+            e2 = (
+                row['Close'] < row['ema_02']
+                and row['Open'] > row['ohlc_avg']
+                and row['Volume'] <= prev['Volume']
+                and outside_body
+            )
+
         return bool(e1 or e2)
 
     def check_exit(self, df: pd.DataFrame, i: int, trade_state: dict, req) -> tuple[bool, str]:
         row = df.iloc[i]
+        is_bear = (
+            getattr(req, 'direction', '') == 'bear'
+            or getattr(req, 'strategy_type', '') == 'bear_put'
+        )
+
+        max_bars = int(getattr(req, 'combo_max_bars', 10))
+        max_profit_closes = int(getattr(req, 'combo_max_profit_closes', 5))
+
         days_held = i - trade_state['entry_idx']
-        
-        # Combo specific exits
-        max_bars = getattr(req, 'combo_max_bars', 10)
-        max_profit_closes = getattr(req, 'combo_max_profit_closes', 5)
-        
-        # Track profit closes manually to avoid state persistence in strategy
-        # We look back from entry to now to count profit closes
-        if days_held > 1:
-            profit_closes = 0
-            for j in range(trade_state['entry_idx'] + 1, i + 1):
-                if df.iloc[j]['Close'] > trade_state['entry_price']:
-                    profit_closes += 1
-            
-            if profit_closes >= max_profit_closes:
-                return True, "max_profit_closes"
-        
+        new_dte = trade_state['entry_dte'] - days_held
+
+        # 1. DTE expiry — must exit before Black-Scholes T hits zero
+        if new_dte <= 0:
+            return True, "expired"
+
+        # 2. Favourable-close profit take — O(1) incremental counter persisted
+        #    in trade_state across exit checks for the lifetime of this trade
+        entry_price = trade_state['entry_price']
+        favourable = (
+            row['Close'] < entry_price if is_bear
+            else row['Close'] > entry_price
+        )
+        trade_state['profit_closes'] = trade_state.get('profit_closes', 0) + (
+            1 if favourable else 0
+        )
+
+        if trade_state['profit_closes'] >= max_profit_closes:
+            return True, "max_profit_closes"
+
+        # 3. Time stop
         if days_held >= max_bars:
             return True, "max_bars"
-            
+
         return False, ""

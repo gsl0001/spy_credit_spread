@@ -175,6 +175,31 @@ def fetch_vix_data(years: int):
     except Exception:
         return pd.DataFrame(columns=['Date', 'VIX'])
 
+# ── Direction routing ──────────────────────────────────────────────────────
+def _resolve_builder_direction(topology: str, bias: str) -> str:
+    """
+    Map a high-level (topology, bias) pair to the concrete `direction` string
+    expected by `OptionTopologyBuilder.construct_legs`.
+
+    `bias` is one of: "bull", "bear", "neutral".
+    The builder uses topology-specific direction tags (e.g. `bull_call`,
+    `bear_put`) so this layer keeps the engine free of topology trivia.
+    """
+    if topology == "vertical_spread":
+        if bias == "bull":
+            return "bull_call"
+        if bias == "bear":
+            return "bear_put"
+        return "bull_call"  # neutral falls back to bull
+    if topology == "long_call":
+        # Auto-swap to long_put when bearish bias is requested
+        return "bear" if bias == "bear" else "bull"
+    if topology == "long_put":
+        return "bear"
+    # straddle / iron_condor / butterfly are direction-agnostic
+    return bias
+
+
 # ── Core backtest engine ───────────────────────────────────────────────────
 def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int = 200):
     RISK_FREE_RATE = fetch_risk_free_rate()
@@ -256,13 +281,17 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
                     S = float(row['Close'])
                     sigma = max(float(row['HV_21']), 0.05)
                     T = req.target_dte / 365.25
-                    
-                    # Map legacy strategy_type to direction if needed
-                    direction = req.direction
-                    if req.strategy_type == "bear_put" and direction == "bull":
-                        direction = "bear_put"
-                    elif req.strategy_type == "bull_call" and direction == "bull":
-                        direction = "bull_call"
+
+                    # Resolve effective bias: prefer explicit `direction`,
+                    # fall back to legacy `strategy_type` for older configs.
+                    bias = req.direction
+                    if req.strategy_type == "bear_put":
+                        bias = "bear"
+                    elif req.strategy_type == "bull_call":
+                        bias = "bull"
+
+                    # Translate (topology, bias) → builder direction string
+                    direction = _resolve_builder_direction(req.topology, bias)
 
                     # Construct position using the Builder
                     pos = OptionTopologyBuilder.construct_legs(
@@ -533,7 +562,7 @@ def backtest(req: BacktestRequest):
             vix_df = fetch_vix_data(req.years_history)
             if not vix_df.empty:
                 df = df.merge(vix_df, on='Date', how='left')
-                df['VIX'] = df['VIX'].fillna(method='ffill').fillna(20)
+                df['VIX'] = df['VIX'].ffill().fillna(20)
 
         df['Date_str'] = df['Date'].dt.strftime('%Y-%m-%d')
 

@@ -12,6 +12,7 @@ Starts:
 Press Ctrl+C to shut down both servers cleanly.
 """
 
+import shutil
 import subprocess
 import sys
 import os
@@ -20,6 +21,14 @@ import signal
 import webbrowser
 import threading
 from pathlib import Path
+
+
+def _resolve_npm() -> str:
+    """Locate npm binary in a cross-platform way (handles `npm.cmd` on Windows)."""
+    npm = shutil.which("npm") or shutil.which("npm.cmd")
+    if not npm:
+        raise FileNotFoundError("npm not found in PATH — install Node.js first.")
+    return npm
 
 BASE_DIR    = Path(__file__).parent.resolve()
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -42,11 +51,12 @@ def preflight():
     # Check frontend dependencies exist
     if not (FRONTEND_DIR / "node_modules").exists():
         log("SETUP", YELLOW, "node_modules not found — running npm install…")
-        result = subprocess.run(
-            ["npm", "install"],
-            cwd=FRONTEND_DIR,
-            shell=True,
-        )
+        try:
+            npm = _resolve_npm()
+        except FileNotFoundError as e:
+            log("ERROR", RED, str(e))
+            sys.exit(1)
+        result = subprocess.run([npm, "install"], cwd=FRONTEND_DIR)
         if result.returncode != 0:
             log("ERROR", RED, "npm install failed. Make sure Node.js is installed.")
             sys.exit(1)
@@ -81,10 +91,10 @@ def start_backend() -> subprocess.Popen:
 
 def start_frontend() -> subprocess.Popen:
     log("FRONTEND", CYAN, f"Starting React     ->  http://localhost:5173")
+    npm = _resolve_npm()
     return subprocess.Popen(
-        ["npm", "run", "dev"],
+        [npm, "run", "dev"],
         cwd=FRONTEND_DIR,
-        shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

@@ -1,10 +1,90 @@
 import asyncio
-from ib_insync import *
 from typing import List, Dict, Optional
 import logging
 
+# ── Defensive ib_insync import ─────────────────────────────────────────────
+# `ib_insync` transitively imports `eventkit`, which calls
+# `asyncio.get_event_loop_policy().get_event_loop()` at import time.
+# On Python 3.14 this raises `RuntimeError: There is no current event loop`
+# in the main thread, which would crash the entire FastAPI server before it
+# can boot. We pre-install a loop, then attempt the import inside try/except
+# so the rest of the app keeps working even when ib_insync is unavailable.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+HAS_IBSYNC = False
+_IBSYNC_IMPORT_ERROR: Optional[str] = None
+IB = Stock = Option = ComboLeg = Bag = LimitOrder = MarketOrder = None  # type: ignore
+pd = None  # type: ignore
+
+
+def _try_load_ibsync() -> bool:
+    """Attempt to import ib_insync. Safe to call repeatedly.
+
+    The eager import at module load time can fail under uvicorn (which
+    replaces the asyncio event-loop policy before our app modules are
+    imported). Calling this from inside an async request handler — where a
+    real loop exists — recovers cleanly.
+    """
+    global HAS_IBSYNC, _IBSYNC_IMPORT_ERROR
+    global IB, Stock, Option, ComboLeg, Bag, LimitOrder, MarketOrder, pd
+
+    if HAS_IBSYNC:
+        return True
+    try:
+        # Eventkit's module-level code calls policy.get_event_loop(), which
+        # in Python 3.14 raises unless `policy.set_event_loop(loop)` has
+        # been explicitly called on the current thread. Uvicorn installs a
+        # running loop without calling set_event_loop, so we have to bind
+        # it ourselves. Outside of a running loop (eager import path) we
+        # create and install a fresh loop.
+        try:
+            running = asyncio.get_running_loop()
+            asyncio.set_event_loop(running)
+        except RuntimeError:
+            try:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+            except Exception:  # noqa: BLE001
+                pass
+        from ib_insync import (
+            IB as _IB,
+            Stock as _Stock,
+            Option as _Option,
+            ComboLeg as _ComboLeg,
+            Bag as _Bag,
+            LimitOrder as _LimitOrder,
+            MarketOrder as _MarketOrder,
+        )
+        import pandas as _pd
+        IB, Stock, Option = _IB, _Stock, _Option
+        ComboLeg, Bag = _ComboLeg, _Bag
+        LimitOrder, MarketOrder = _LimitOrder, _MarketOrder
+        pd = _pd
+        HAS_IBSYNC = True
+        _IBSYNC_IMPORT_ERROR = None
+        return True
+    except Exception as e:  # noqa: BLE001
+        _IBSYNC_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+        return False
+
+
+# Best-effort eager attempt — silent failure is fine, we retry lazily.
+if not _try_load_ibsync():
+    logging.warning(
+        "ib_insync unavailable at import time — will retry at first IBKR call (%s)",
+        _IBSYNC_IMPORT_ERROR,
+    )
+
 class IBKRTrader:
-    def __init__(self, host='127.0.0.1', port=7497, client_id=1):
+    def __init__(self, host: str = '127.0.0.1', port: int = 7497, client_id: int = 1):
+        if not HAS_IBSYNC:
+            raise RuntimeError(
+                f"ib_insync is not available: {_IBSYNC_IMPORT_ERROR}. "
+                "Install with `pip install ib_insync` and ensure Python "
+                "compatibility (3.10–3.12 recommended)."
+            )
         self.ib = IB()
         self.host = host
         self.port = port
@@ -169,13 +249,21 @@ class IBKRTrader:
 _ib_instances = {}
 
 async def get_ib_connection(creds: dict):
+    if not _try_load_ibsync():
+        return None, f"IBKR disabled: ib_insync unavailable ({_IBSYNC_IMPORT_ERROR})"
+
     port = int(creds.get("port", 7497))
     cid = int(creds.get("client_id", 1))
     key = f"{creds.get('host', '127.0.0.1')}:{port}:{cid}"
-    
+
     if key not in _ib_instances:
-        _ib_instances[key] = IBKRTrader(host=creds.get("host", '127.0.0.1'), port=port, client_id=cid)
-    
+        try:
+            _ib_instances[key] = IBKRTrader(
+                host=creds.get("host", '127.0.0.1'), port=port, client_id=cid
+            )
+        except Exception as e:  # noqa: BLE001
+            return None, str(e)
+
     trader = _ib_instances[key]
     if not trader.connected:
         res = await trader.connect()

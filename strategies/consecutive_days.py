@@ -46,30 +46,39 @@ class ConsecutiveDaysStrategy(BaseStrategy):
         
         return df
 
+    @staticmethod
+    def _is_bear(req) -> bool:
+        return (
+            getattr(req, 'direction', '') == 'bear'
+            or getattr(req, 'strategy_type', '') == 'bear_put'
+        )
+
     def check_entry(self, df: pd.DataFrame, i: int, req) -> bool:
         row = df.iloc[i]
-        is_bear = req.strategy_type == "bear_put"
-        
-        if is_bear:
-            streak_val = int(row['greenDays'])
-        else:
-            streak_val = int(row['redDays'])
-            
-        # Entry logic matches previous main.py
-        entry_trigger = (streak_val == req.entry_red_days or streak_val == req.entry_red_days + 1)
-        return entry_trigger
+        is_bear = self._is_bear(req)
+
+        streak_val = int(row['greenDays'] if is_bear else row['redDays'])
+
+        # Flexible trigger window: fire on exactly N or N+1
+        return (
+            streak_val == req.entry_red_days
+            or streak_val == req.entry_red_days + 1
+        )
 
     def check_exit(self, df: pd.DataFrame, i: int, trade_state: dict, req) -> tuple[bool, str]:
         row = df.iloc[i]
-        is_bear = req.strategy_type == "bear_put"
-        
+        is_bear = self._is_bear(req)
+
         days_held = i - trade_state['entry_idx']
         new_dte = trade_state['entry_dte'] - days_held
-        
-        exit_streak = int(row['redDays'] if is_bear else row['greenDays']) >= req.exit_green_days
+
+        reversal_col = 'redDays' if is_bear else 'greenDays'
+        exit_streak = int(row[reversal_col]) >= req.exit_green_days
         expired = new_dte <= 0
-        
-        if exit_streak: return True, "streak"
-        if expired: return True, "expired"
-        
+
+        if exit_streak:
+            return True, "streak"
+        if expired:
+            return True, "expired"
+
         return False, ""

@@ -54,13 +54,19 @@ class OptionTopologyBuilder:
         S_round = round(S)
         sigma_adj = sigma * realism_factor
         
-        if topology == "long_call": # Single leg directional
-            C_price = bs_call_price(S, S_round, T, r, sigma_adj)
-            res["legs"].append({"type": "call", "strike": S_round, "side": "long", "price": C_price})
-            res["net_cost"] = C_price * 100
+        if topology == "long_call":  # Single leg directional
+            # Auto-swap to long put if a bearish bias was requested.
+            if direction == "bear":
+                P_price = bs_put_price(S, S_round, T, r, sigma_adj)
+                res["legs"].append({"type": "put", "strike": S_round, "side": "long", "price": P_price})
+                res["net_cost"] = P_price * 100
+            else:
+                C_price = bs_call_price(S, S_round, T, r, sigma_adj)
+                res["legs"].append({"type": "call", "strike": S_round, "side": "long", "price": C_price})
+                res["net_cost"] = C_price * 100
             res["margin_req"] = res["net_cost"]
 
-        elif topology == "long_put": # Single leg directional
+        elif topology == "long_put":  # Single leg directional
             P_price = bs_put_price(S, S_round, T, r, sigma_adj)
             res["legs"].append({"type": "put", "strike": S_round, "side": "long", "price": P_price})
             res["net_cost"] = P_price * 100

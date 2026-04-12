@@ -195,6 +195,3 @@ def scan_signal(api_key: str, api_secret: str, config_dict: dict) -> dict:
     except Exception as e:
         import traceback; traceback.print_exc()
         return {"signal": False, "error": str(e)}
-
-    except Exception as e:
-        return {"signal": False, "error": str(e)}
