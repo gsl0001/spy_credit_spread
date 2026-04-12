@@ -597,6 +597,33 @@ def backtest(req: BacktestRequest):
         return {"error": str(e)}
 
 
+# ── SPY Intraday Sparkline ─────────────────────────────────────────────────
+@app.get("/api/spy/intraday")
+def spy_intraday():
+    """Fetch today's SPY 1-min bars for sparkline display."""
+    try:
+        df = yf.download("SPY", period="1d", interval="1m", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.reset_index(inplace=True)
+        dt_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
+        data = []
+        for _, row in df.iterrows():
+            ts = row[dt_col]
+            if hasattr(ts, "tz_localize"):
+                ts = ts.tz_localize(None) if ts.tzinfo is None else ts.tz_convert(None)
+            data.append({"time": str(ts), "close": round(float(row["Close"]), 2)})
+        if not data:
+            return {"data": [], "current": 0, "change": 0, "change_pct": 0}
+        current = data[-1]["close"]
+        day_open = data[0]["close"]
+        change = round(current - day_open, 2)
+        change_pct = round((change / day_open) * 100, 2) if day_open else 0
+        return {"data": data, "current": current, "change": change, "change_pct": change_pct}
+    except Exception as e:
+        return {"error": str(e), "data": [], "current": 0, "change": 0, "change_pct": 0}
+
+
 # ── Live Options Chain ─────────────────────────────────────────────────────
 @app.get("/api/live_chain")
 def live_chain(ticker: str = "SPY"):
@@ -700,10 +727,13 @@ def paper_scan(req: PaperScanRequest):
 # ── Unified Scanner & IBKR endpoints ───────────────────────────────────────
 
 class ScannerConfigRequest(BaseModel):
-    frequency: str = "hourly"
-    mode: str = "paper"
+    # timing_mode: "interval" | "after_open" | "before_close" | "on_open" | "on_close"
+    timing_mode: str = "interval"
+    timing_value: int = 300   # seconds for interval; minutes offset for after_open/before_close
+    mode: str = "paper"       # "paper" or "ibkr"
+    auto_execute: bool = False
     config: dict
-    creds: dict
+    creds: dict = {}
 
 def run_market_scan():
     """Background task for scanning market based on frequency."""
@@ -738,10 +768,16 @@ def run_market_scan():
             
         scanner_state["last_run"] = current_time
         
-        # AUTO-EXECUTION LOGIC (Placeholder for now, could be enabled via config)
-        if signal and config.get("auto_execute", False):
-            # TODO: Logic for automatic execution based on mode
-            pass
+        # Auto-execute when enabled
+        if signal and scanner_state.get("auto_execute", False):
+            mode = scanner_state.get("mode", "paper")
+            creds = scanner_state.get("creds") or {}
+            if mode == "paper" and creds.get("api_key"):
+                from paper_trading import place_equity_order
+                side = "sell" if config.get("direction", "bull") == "bear" else "buy"
+                place_equity_order(creds["api_key"], creds["api_secret"],
+                                   config.get("ticker", "SPY"),
+                                   config.get("contracts_per_trade", 1) * 100, side)
 
     except Exception as e:
         print(f"Error in background scan: {e}")
@@ -754,26 +790,43 @@ def run_market_scan():
 @app.post("/api/scanner/start")
 def start_scanner(req: ScannerConfigRequest):
     scanner_state["active"] = True
-    scanner_state["frequency"] = req.frequency
+    scanner_state["timing_mode"] = req.timing_mode
+    scanner_state["timing_value"] = req.timing_value
     scanner_state["mode"] = req.mode
     scanner_state["config"] = req.config
-    
-    # Remove existing jobs
-    scheduler.remove_all_jobs()
-    
-    # Add new job based on frequency
-    if req.frequency == "minutely":
-        scheduler.add_job(run_market_scan, 'interval', minutes=1, id='market_scan')
-    elif req.frequency == "hourly":
-        scheduler.add_job(run_market_scan, 'interval', hours=1, id='market_scan')
-    elif req.frequency == "open":
-        # Scan 15 mins after market open (9:45 AM EST)
-        scheduler.add_job(run_market_scan, 'cron', hour=9, minute=45, day_of_week='mon-fri', id='market_scan')
-    elif req.frequency == "close":
-        # Scan 15 mins before market close (3:45 PM EST)
-        scheduler.add_job(run_market_scan, 'cron', hour=15, minute=45, day_of_week='mon-fri', id='market_scan')
-        
-    return {"status": "started", "frequency": req.frequency}
+    scanner_state["auto_execute"] = req.auto_execute
+
+    # Remove existing scan jobs
+    for job in scheduler.get_jobs():
+        if job.id.startswith("market_scan"):
+            job.remove()
+
+    if req.timing_mode == "interval":
+        secs = max(req.timing_value, 10)
+        scheduler.add_job(run_market_scan, "interval", seconds=secs, id="market_scan")
+    elif req.timing_mode == "after_open":
+        # N minutes after 9:30 AM ET (UTC-4 in EDT, UTC-5 in EST)
+        # Use 13:30 UTC as open reference (works for EDT; adjust for EST by using 14:30)
+        total_mins = 30 + req.timing_value  # 9:30 ET + offset → minutes past 9:00
+        hour = 9 + total_mins // 60
+        minute = total_mins % 60
+        scheduler.add_job(run_market_scan, "cron", hour=hour, minute=minute,
+                          day_of_week="mon-fri", timezone="America/New_York", id="market_scan")
+    elif req.timing_mode == "before_close":
+        # N minutes before 4:00 PM ET
+        total_mins = 16 * 60 - req.timing_value  # minutes from midnight ET
+        hour = total_mins // 60
+        minute = total_mins % 60
+        scheduler.add_job(run_market_scan, "cron", hour=hour, minute=minute,
+                          day_of_week="mon-fri", timezone="America/New_York", id="market_scan")
+    elif req.timing_mode == "on_open":
+        scheduler.add_job(run_market_scan, "cron", hour=9, minute=30,
+                          day_of_week="mon-fri", timezone="America/New_York", id="market_scan")
+    elif req.timing_mode == "on_close":
+        scheduler.add_job(run_market_scan, "cron", hour=16, minute=0,
+                          day_of_week="mon-fri", timezone="America/New_York", id="market_scan")
+
+    return {"status": "started", "timing_mode": req.timing_mode, "timing_value": req.timing_value}
 
 @app.post("/api/scanner/stop")
 def stop_scanner():
@@ -903,3 +956,41 @@ async def ibkr_cancel_order(req: dict):
         res = await trader.cancel_order(req.get("orderId"))
         return res
     return {"error": msg}
+
+
+@app.post("/api/ibkr/heartbeat")
+async def ibkr_heartbeat(req: IBKRConnectRequest):
+    """Lightweight liveness check — does not reconnect, just reports status."""
+    from ibkr_trading import _ib_instances, HAS_IBSYNC
+    if not HAS_IBSYNC:
+        return {"alive": False, "status": "unavailable"}
+    key = f"{req.host}:{req.port}:{req.client_id}"
+    trader = _ib_instances.get(key)
+    if not trader:
+        return {"alive": False, "status": "not_connected"}
+    try:
+        alive = trader.ib.isConnected()
+        if not alive:
+            trader.connected = False
+        return {"alive": alive, "status": "online" if alive else "dropped"}
+    except Exception as e:
+        trader.connected = False
+        return {"alive": False, "status": "error", "detail": str(e)}
+
+
+@app.post("/api/ibkr/reconnect")
+async def ibkr_reconnect(req: IBKRConnectRequest):
+    """Force-reconnect an existing IBKR session."""
+    from ibkr_trading import _ib_instances
+    key = f"{req.host}:{req.port}:{req.client_id}"
+    if key in _ib_instances:
+        try:
+            _ib_instances[key].ib.disconnect()
+        except Exception:
+            pass
+        del _ib_instances[key]
+    trader, msg = await get_ib_connection(req.model_dump())
+    if trader:
+        summary = await trader.get_account_summary()
+        return {"connected": True, "summary": summary}
+    return {"connected": False, "error": msg}

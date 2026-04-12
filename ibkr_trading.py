@@ -97,14 +97,33 @@ class IBKRTrader:
             self.connected = True
             return {"success": True, "msg": "Connected to IBKR"}
         except Exception as e:
+            self.connected = False
             return {"success": False, "msg": str(e)}
 
     def disconnect(self):
-        self.ib.disconnect()
+        try:
+            self.ib.disconnect()
+        except Exception:
+            pass
         self.connected = False
 
+    def is_alive(self) -> bool:
+        """Return True only when the socket is actually connected."""
+        try:
+            return self.connected and self.ib.isConnected()
+        except Exception:
+            self.connected = False
+            return False
+
+    async def ensure_connected(self):
+        """Reconnect if the socket dropped."""
+        if not self.is_alive():
+            self.disconnect()
+            return await self.connect()
+        return {"success": True, "msg": "Already connected"}
+
     async def get_account_summary(self):
-        if not self.connected: await self.connect()
+        await self.ensure_connected()
         # Request account summary for specific tags
         summary = await self.ib.accountSummaryAsync()
         data = {}
@@ -123,7 +142,7 @@ class IBKRTrader:
         }
 
     async def get_positions(self):
-        if not self.connected: await self.connect()
+        await self.ensure_connected()
         # ib.portfolio() is a cached property in ib_insync, but we should ensure it's synced
         # Use positions() for a fresh fetch if needed, but portfolio() has P&L info
         pf = self.ib.portfolio()
@@ -144,7 +163,7 @@ class IBKRTrader:
         Place a multi-leg combo order.
         If lmtPrice is provided, uses LimitOrder. Otherwise, uses MarketOrder (not recommended).
         """
-        if not self.connected: await self.connect()
+        await self.ensure_connected()
         
         # Build the Combo contract
         ib_legs = []
@@ -171,7 +190,7 @@ class IBKRTrader:
 
     async def get_combo_midpoint(self, symbol: str, legs: List[Dict]):
         """Fetches current bid/ask and returns midpoint for a combo."""
-        if not self.connected: await self.connect()
+        await self.ensure_connected()
         
         ib_legs = []
         for leg in legs:
@@ -194,7 +213,7 @@ class IBKRTrader:
         return mid
 
     async def get_active_orders(self):
-        if not self.connected: await self.connect()
+        await self.ensure_connected()
         # openTrades returns a list of Trade objects
         trades = self.ib.openTrades()
         return [
@@ -212,7 +231,7 @@ class IBKRTrader:
     async def place_test_order(self):
         """Places a non-filling limit order for SPY at $1.00."""
         try:
-            if not self.connected: await self.connect()
+            await self.ensure_connected()
             contract = Stock('SPY', 'SMART', 'USD')
             log_msg = f"Qualifying contract {contract}..."
             await self.ib.qualifyContractsAsync(contract)
@@ -236,7 +255,7 @@ class IBKRTrader:
             return {"success": False, "error": f"IBKR Error: {str(e)}"}
 
     async def cancel_order(self, orderId: int):
-        if not self.connected: await self.connect()
+        await self.ensure_connected()
         # Find the trade for this orderId
         trades = self.ib.openTrades()
         for t in trades:
@@ -265,7 +284,7 @@ async def get_ib_connection(creds: dict):
             return None, str(e)
 
     trader = _ib_instances[key]
-    if not trader.connected:
+    if not trader.is_alive():
         res = await trader.connect()
         if not res["success"]:
             return None, res["msg"]

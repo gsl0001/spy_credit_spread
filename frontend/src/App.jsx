@@ -6,6 +6,11 @@ import { Play, TrendingUp, BarChart2, Activity, Zap, Save, Radio, ShieldCheck, R
 const API = 'http://127.0.0.1:8000';
 const STORAGE_KEY = 'spy_backtest_config';
 const PRESETS_KEY = 'spy_backtest_presets';
+const TRADE_PRESETS_KEY = 'spy_trading_presets';
+
+function loadTradePresets() {
+  try { const s = localStorage.getItem(TRADE_PRESETS_KEY); if (s) return JSON.parse(s); } catch {} return {};
+}
 
 const DEFAULT_CONFIG = {
   ticker: 'SPY', years_history: 2, capital_allocation: 10000.0,
@@ -65,26 +70,125 @@ function MsgBox({ msg }) {
   return <div style={{marginTop:12,padding:'8px 12px',borderRadius:8,background:isErr?'rgba(245,101,101,0.1)':'rgba(72,187,120,0.1)',border:`1px solid ${isErr?'#f56565':'#48bb78'}`,fontSize:'0.8rem',color:isErr?'#f56565':'#48bb78'}}>{msg}</div>;
 }
 
-/* ── Paper Trading Panel ─────────────────────────────────────── */
-function PaperPanel({ paperKey, setPaperKey, paperSecret, setPaperSecret, paperAccount, paperConnecting, connectPaper, paperPositions, paperOrders, paperSignal, scanLog, paperScanning, paperAutoExec, setPaperAutoExec, scanInterval, setScanInterval, toggleScanning, manualScan, killSwitch, msg, refreshData }) {
-  const [tab, setTab] = useState('positions');
+/* ── SPY Sparkline ───────────────────────────────────────────── */
+function SpySparkline({ data, current, change, pct }) {
+  if (!data || data.length < 2) return <span style={{color:'#8b8b9d',fontSize:'0.75rem'}}>SPY –</span>;
+  const closes = data.map(d => d.close);
+  const mn = Math.min(...closes), mx = Math.max(...closes), range = mx - mn || 1;
+  const W = 100, H = 30;
+  const pts = closes.map((c, i) => `${(i / (closes.length - 1)) * W},${H - ((c - mn) / range) * H}`).join(' ');
+  const col = change >= 0 ? '#48bb78' : '#f56565';
   return (
-    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+    <div style={{display:'flex',alignItems:'center',gap:8}}>
+      <svg width={W} height={H}><polyline points={pts} fill="none" stroke={col} strokeWidth={1.5}/></svg>
+      <div>
+        <div style={{fontSize:'0.85rem',fontWeight:700,color:'#f0f0f5'}}>${current}</div>
+        <div style={{fontSize:'0.7rem',color:col}}>{change>=0?'+':''}{change} ({pct>=0?'+':''}{pct}%)</div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Account HUD ─────────────────────────────────────────────── */
+function AccountHUD({ account, mode, connStatus, spyData, onRefresh }) {
+  const col = connStatus==='online'?'#48bb78':connStatus==='connecting'?'#ecc94b':'#f56565';
+  const label = connStatus==='online'?'LIVE':connStatus==='connecting'?'CONNECTING':'OFFLINE';
+  return (
+    <div style={{background:'var(--bg-card)',borderRadius:12,border:`1px solid ${account?col:'var(--border)'}`,padding:'12px 20px',display:'flex',alignItems:'center',gap:20,flexWrap:'wrap',marginBottom:0}}>
+      <div style={{display:'flex',alignItems:'center',gap:6,minWidth:120}}>
+        <div style={{width:9,height:9,borderRadius:'50%',background:col,boxShadow:`0 0 6px ${col}`,flexShrink:0}}/>
+        <span style={{fontSize:'0.72rem',fontWeight:700,color:col,textTransform:'uppercase',letterSpacing:0.5}}>
+          {mode==='paper'?'Alpaca Paper':'IBKR Live'} · {label}
+        </span>
+      </div>
+      {account ? (
+        <div style={{display:'flex',gap:20,fontSize:'0.8rem',flex:1,flexWrap:'wrap',alignItems:'center'}}>
+          <span style={{color:'#8b8b9d'}}>Equity <strong style={{color:'#f0f0f5'}}>${Number(account.equity||0).toLocaleString(undefined,{maximumFractionDigits:0})}</strong></span>
+          <span style={{color:'#8b8b9d'}}>BP <strong style={{color:'#48bb78'}}>${Number(account.buying_power||0).toLocaleString(undefined,{maximumFractionDigits:0})}</strong></span>
+          {account.cash!==undefined&&<span style={{color:'#8b8b9d'}}>Cash <strong style={{color:'#f0f0f5'}}>${Number(account.cash||0).toLocaleString(undefined,{maximumFractionDigits:0})}</strong></span>}
+          {account.daily_pnl!==undefined&&<span style={{color:'#8b8b9d'}}>Day P&L <strong style={{color:Number(account.daily_pnl)>=0?'#48bb78':'#f56565'}}>{Number(account.daily_pnl)>=0?'+':''}${Number(account.daily_pnl||0).toFixed(2)}</strong></span>}
+          {account.unrealized_pnl!==undefined&&<span style={{color:'#8b8b9d'}}>Unrealized <strong style={{color:Number(account.unrealized_pnl)>=0?'#48bb78':'#f56565'}}>{Number(account.unrealized_pnl)>=0?'+':''}${Number(account.unrealized_pnl||0).toFixed(2)}</strong></span>}
+        </div>
+      ) : (
+        <span style={{fontSize:'0.8rem',color:'#8b8b9d',flex:1}}>Not connected — enter credentials below</span>
+      )}
+      {spyData&&spyData.current>0&&<SpySparkline data={spyData.data} current={spyData.current} change={spyData.change} pct={spyData.change_pct}/>}
+      <button onClick={onRefresh} style={{background:'none',border:'1px solid var(--border)',borderRadius:8,color:'#8b8b9d',cursor:'pointer',padding:'5px 10px',display:'flex',alignItems:'center',gap:4,fontSize:'0.72rem',whiteSpace:'nowrap'}}><RefreshCw size={11}/>Refresh</button>
+    </div>
+  );
+}
+
+/* ── Trading Presets Bar ─────────────────────────────────────── */
+function TradingPresetsBar({ presets, onLoad, onSave, onDelete }) {
+  const [showSave, setShowSave] = useState(false);
+  const [saveName, setSaveName] = useState('');
+  const doSave = () => { if (!saveName.trim()) return; onSave(saveName.trim()); setSaveName(''); setShowSave(false); };
+  return (
+    <div style={{background:'var(--bg-card)',borderRadius:12,border:'1px solid var(--border)',padding:'10px 16px',display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+      <span style={{fontSize:'0.72rem',fontWeight:600,color:'#6b46c1',textTransform:'uppercase',letterSpacing:1,whiteSpace:'nowrap'}}>Trading Presets</span>
+      <div style={{display:'flex',gap:5,flex:1,flexWrap:'wrap'}}>
+        {Object.keys(presets).length===0&&<span style={{fontSize:'0.75rem',color:'#8b8b9d',fontStyle:'italic'}}>No saved presets</span>}
+        {Object.keys(presets).map(name=>(
+          <div key={name} style={{display:'flex'}}>
+            <button onClick={()=>onLoad(presets[name])} style={{padding:'4px 10px',background:'rgba(107,70,193,0.15)',border:'1px solid rgba(107,70,193,0.35)',borderRight:'none',borderRadius:'6px 0 0 6px',color:'#a78bfa',fontSize:'0.75rem',cursor:'pointer',fontWeight:600}}>{name}</button>
+            <button onClick={()=>onDelete(name)} title="Delete" style={{padding:'4px 8px',background:'rgba(245,101,101,0.08)',border:'1px solid rgba(107,70,193,0.35)',borderLeft:'none',borderRadius:'0 6px 6px 0',color:'#f56565',fontSize:'0.75rem',cursor:'pointer',lineHeight:1}}>×</button>
+          </div>
+        ))}
+      </div>
+      {showSave?(
+        <div style={{display:'flex',gap:6,alignItems:'center'}}>
+          <input value={saveName} onChange={e=>setSaveName(e.target.value)} onKeyDown={e=>e.key==='Enter'&&doSave()} placeholder="Preset name…" autoFocus style={{width:140,background:'var(--bg-dark)',border:'1px solid var(--border)',color:'#fff',padding:'5px 10px',borderRadius:6,fontSize:'0.8rem',fontFamily:'inherit'}}/>
+          <button onClick={doSave} style={{padding:'5px 12px',background:'rgba(107,70,193,0.3)',border:'1px solid var(--accent)',borderRadius:6,color:'#a78bfa',cursor:'pointer',fontSize:'0.8rem',fontWeight:700}}>Save</button>
+          <button onClick={()=>setShowSave(false)} style={{padding:'5px 8px',background:'none',border:'1px solid var(--border)',borderRadius:6,color:'#8b8b9d',cursor:'pointer',fontSize:'0.8rem'}}>✕</button>
+        </div>
+      ):(
+        <button onClick={()=>setShowSave(true)} style={{padding:'4px 12px',background:'none',border:'1px solid var(--border)',borderRadius:6,color:'#8b8b9d',cursor:'pointer',fontSize:'0.75rem',display:'flex',alignItems:'center',gap:4,whiteSpace:'nowrap'}}><Save size={12}/>Save Current</button>
+      )}
+    </div>
+  );
+}
+
+/* ── Paper Trading Panel ─────────────────────────────────────── */
+const SEL = {background:'var(--bg-dark)',border:'1px solid var(--border)',color:'#fff',padding:'8px 12px',borderRadius:8,fontFamily:'inherit',fontSize:'0.85rem',width:'100%'};
+const INP = {background:'var(--bg-dark)',border:'1px solid var(--border)',color:'#fff',padding:'8px 12px',borderRadius:8,fontFamily:'inherit',fontSize:'0.85rem'};
+
+function SignalBadge({ signal }) {
+  if (!signal) return null;
+  return (
+    <div style={{padding:'12px 16px',borderRadius:8,background:signal.signal?'rgba(72,187,120,0.08)':'rgba(255,255,255,0.03)',border:`1px solid ${signal.signal?'#48bb78':'var(--border)'}`}}>
+      <div style={{display:'flex',gap:16,alignItems:'center',flexWrap:'wrap'}}>
+        <div style={{display:'flex',alignItems:'center',gap:8}}>
+          <div style={{width:12,height:12,borderRadius:'50%',background:signal.signal?'#48bb78':'#8b8b9d',boxShadow:signal.signal?'0 0 8px #48bb78':'none'}}/>
+          <span style={{fontWeight:700,fontSize:'1rem',color:signal.signal?'#48bb78':'#8b8b9d'}}>{signal.signal?'SIGNAL FIRING':'NO SIGNAL'}</span>
+        </div>
+        {signal.price&&<span style={{fontSize:'0.8rem',color:'#8b8b9d'}}>Price <strong style={{color:'#f0f0f5'}}>${signal.price}</strong></span>}
+        {signal.rsi&&<span style={{fontSize:'0.8rem',color:'#8b8b9d'}}>RSI <strong style={{color:'#f0f0f5'}}>{signal.rsi}</strong></span>}
+        {signal.rsi_ok!==undefined&&<span style={{fontSize:'0.75rem',color:signal.rsi_ok?'#48bb78':'#f56565'}}>RSI {signal.rsi_ok?'✓':'✗'}</span>}
+        {signal.ema_ok!==undefined&&<span style={{fontSize:'0.75rem',color:signal.ema_ok?'#48bb78':'#f56565'}}>EMA {signal.ema_ok?'✓':'✗'}</span>}
+        {signal.timestamp&&<span style={{fontSize:'0.7rem',color:'#8b8b9d'}}>{new Date(signal.timestamp).toLocaleTimeString()}</span>}
+      </div>
+    </div>
+  );
+}
+
+function PaperPanel({ paperKey, setPaperKey, paperSecret, setPaperSecret, paperAccount, paperConnecting, connectPaper, paperPositions, paperOrders, paperSignal, scanLog, paperScanning, paperAutoExec, setPaperAutoExec, scanTimingMode, setScanTimingMode, scanTimingValue, setScanTimingValue, toggleScanning, manualScan, killSwitch, msg, refreshData, spyData, tradePresets, onSavePreset, onLoadPreset, onDeletePreset }) {
+  const [tab, setTab] = useState('positions');
+  const connStatus = paperAccount ? 'online' : paperConnecting ? 'connecting' : 'offline';
+
+  const timingLabel = {interval:'Every N sec',after_open:'N min after open',before_close:'N min before close',on_open:'At market open',on_close:'At market close'};
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:14}}>
+      <AccountHUD account={paperAccount} mode="paper" connStatus={connStatus} spyData={spyData} onRefresh={refreshData}/>
+
+      <TradingPresetsBar presets={tradePresets} onLoad={onLoadPreset} onSave={onSavePreset} onDelete={onDeletePreset}/>
+
       {/* Connection */}
       <div style={{background:'var(--bg-card)',borderRadius:12,border:'1px solid var(--border)',padding:20}}>
-        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16}}>
-          <h3 style={{fontSize:'0.9rem',color:'#8b8b9d',display:'flex',alignItems:'center',gap:8}}><Radio size={16}/>Alpaca Paper Trading</h3>
-          {paperAccount && (
-            <div style={{display:'flex',gap:20,fontSize:'0.8rem'}}>
-              <span style={{color:'#8b8b9d'}}>Equity: <strong style={{color:'#f0f0f5'}}>${Number(paperAccount.equity||0).toLocaleString()}</strong></span>
-              <span style={{color:'#8b8b9d'}}>BP: <strong style={{color:'#48bb78'}}>${Number(paperAccount.buying_power||0).toLocaleString()}</strong></span>
-              <span style={{color:'#8b8b9d'}}>Cash: <strong style={{color:'#f0f0f5'}}>${Number(paperAccount.cash||0).toLocaleString()}</strong></span>
-            </div>
-          )}
-        </div>
+        <h3 style={{marginBottom:14,fontSize:'0.9rem',color:'#8b8b9d',display:'flex',alignItems:'center',gap:8}}><Radio size={16}/>Alpaca Paper Trading</h3>
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr auto',gap:12,alignItems:'flex-end'}}>
-          <Field label="API Key"><input type="password" value={paperKey} onChange={e=>setPaperKey(e.target.value)} placeholder="Alpaca API Key" style={{width:'100%',background:'var(--bg-dark)',border:'1px solid var(--border)',color:'#fff',padding:'8px 12px',borderRadius:8,fontFamily:'inherit',fontSize:'0.85rem'}}/></Field>
-          <Field label="Secret Key"><input type="password" value={paperSecret} onChange={e=>setPaperSecret(e.target.value)} placeholder="Alpaca Secret" style={{width:'100%',background:'var(--bg-dark)',border:'1px solid var(--border)',color:'#fff',padding:'8px 12px',borderRadius:8,fontFamily:'inherit',fontSize:'0.85rem'}}/></Field>
+          <Field label="API Key"><input type="password" value={paperKey} onChange={e=>setPaperKey(e.target.value)} placeholder="Alpaca API Key" style={INP}/></Field>
+          <Field label="Secret Key"><input type="password" value={paperSecret} onChange={e=>setPaperSecret(e.target.value)} placeholder="Alpaca Secret" style={INP}/></Field>
           <button className="btn-primary" onClick={connectPaper} disabled={paperConnecting} style={{width:'auto',padding:'8px 20px',marginTop:0}}>
             <Wifi size={14}/>{paperConnecting?'Connecting…':paperAccount?'Reconnect':'Connect'}
           </button>
@@ -94,38 +198,34 @@ function PaperPanel({ paperKey, setPaperKey, paperSecret, setPaperSecret, paperA
 
       {/* Scanner */}
       <div style={{background:'var(--bg-card)',borderRadius:12,border:'1px solid var(--border)',padding:20}}>
-        <h3 style={{marginBottom:16,fontSize:'0.9rem',color:'#8b8b9d',display:'flex',alignItems:'center',gap:8}}><Activity size={16}/>Market Scanner</h3>
-        <div style={{display:'flex',gap:16,flexWrap:'wrap',alignItems:'center'}}>
-          <Field label="Interval (sec)" style={{marginBottom:0}}>
-            <input type="number" value={scanInterval} onChange={e=>setScanInterval(Number(e.target.value))} min={10} style={{width:90,background:'var(--bg-dark)',border:'1px solid var(--border)',color:'#fff',padding:'8px 12px',borderRadius:8,fontFamily:'inherit',fontSize:'0.85rem'}}/>
+        <h3 style={{marginBottom:14,fontSize:'0.9rem',color:'#8b8b9d',display:'flex',alignItems:'center',gap:8}}><Activity size={16}/>Scanner</h3>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12,marginBottom:12}}>
+          <Field label="Scan Timing">
+            <select value={scanTimingMode} onChange={e=>setScanTimingMode(e.target.value)} style={SEL}>
+              {Object.entries(timingLabel).map(([k,v])=><option key={k} value={k}>{v}</option>)}
+            </select>
           </Field>
-          <div style={{display:'flex',alignItems:'center',gap:8,paddingTop:22}}>
+          {['interval','after_open','before_close'].includes(scanTimingMode)&&(
+            <Field label={scanTimingMode==='interval'?'Interval (sec)':'Offset (min)'}>
+              <input type="number" value={scanTimingValue} onChange={e=>setScanTimingValue(Number(e.target.value))} min={1} style={{...INP,width:'100%'}}/>
+            </Field>
+          )}
+        </div>
+        <div style={{display:'flex',gap:10,flexWrap:'wrap',alignItems:'center'}}>
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
             <label style={{fontSize:'0.78rem',color:'#8b8b9d'}}>Auto-Execute</label>
             <label className="switch"><input type="checkbox" checked={paperAutoExec} onChange={e=>setPaperAutoExec(e.target.checked)}/><span className="slider"/></label>
           </div>
-          <button onClick={manualScan} className="btn-secondary" style={{padding:'8px 16px',marginTop:22,display:'flex',alignItems:'center',gap:6}}><RefreshCw size={14}/>Scan Now</button>
-          <button onClick={toggleScanning} style={{marginTop:22,padding:'8px 20px',borderRadius:8,border:`1px solid ${paperScanning?'#f56565':'var(--accent)'}`,background:paperScanning?'rgba(245,101,101,0.15)':'rgba(107,70,193,0.2)',color:paperScanning?'#f56565':'#a78bfa',cursor:'pointer',fontWeight:700,fontSize:'0.8rem',display:'flex',alignItems:'center',gap:6}}>
+          <button onClick={manualScan} className="btn-secondary" style={{padding:'8px 14px',display:'flex',alignItems:'center',gap:6}}><RefreshCw size={14}/>Scan Now</button>
+          <button onClick={toggleScanning} style={{padding:'8px 18px',borderRadius:8,border:`1px solid ${paperScanning?'#f56565':'var(--accent)'}`,background:paperScanning?'rgba(245,101,101,0.15)':'rgba(107,70,193,0.2)',color:paperScanning?'#f56565':'#a78bfa',cursor:'pointer',fontWeight:700,fontSize:'0.8rem',display:'flex',alignItems:'center',gap:6}}>
             <Radio size={14}/>{paperScanning?'Stop Scan':'Start Scan'}
           </button>
-          <button onClick={killSwitch} style={{marginTop:22,padding:'8px 16px',background:'rgba(245,101,101,0.15)',border:'1px solid #f56565',borderRadius:8,color:'#f56565',cursor:'pointer',display:'flex',alignItems:'center',gap:6,fontSize:'0.8rem',fontWeight:700}}>
+          <button onClick={killSwitch} style={{padding:'8px 14px',background:'rgba(245,101,101,0.15)',border:'1px solid #f56565',borderRadius:8,color:'#f56565',cursor:'pointer',display:'flex',alignItems:'center',gap:6,fontSize:'0.8rem',fontWeight:700}}>
             <XCircle size={14}/>KILL
           </button>
         </div>
-        {paperSignal && (
-          <div style={{marginTop:16,padding:16,borderRadius:8,background:paperSignal.signal?'rgba(72,187,120,0.08)':'rgba(255,255,255,0.03)',border:`1px solid ${paperSignal.signal?'#48bb78':'var(--border)'}`}}>
-            <div style={{display:'flex',gap:20,alignItems:'center',flexWrap:'wrap'}}>
-              <div style={{display:'flex',alignItems:'center',gap:8}}>
-                <div style={{width:12,height:12,borderRadius:'50%',background:paperSignal.signal?'#48bb78':'#8b8b9d',boxShadow:paperSignal.signal?'0 0 8px #48bb78':'none'}}/>
-                <span style={{fontWeight:700,fontSize:'1rem',color:paperSignal.signal?'#48bb78':'#8b8b9d'}}>{paperSignal.signal?'SIGNAL FIRING':'NO SIGNAL'}</span>
-              </div>
-              {paperSignal.price && <span style={{fontSize:'0.8rem',color:'#8b8b9d'}}>Price: <strong style={{color:'#f0f0f5'}}>${paperSignal.price}</strong></span>}
-              {paperSignal.rsi && <span style={{fontSize:'0.8rem',color:'#8b8b9d'}}>RSI: <strong style={{color:'#f0f0f5'}}>{paperSignal.rsi}</strong></span>}
-              {paperSignal.rsi_ok!==undefined && <span style={{fontSize:'0.75rem',color:paperSignal.rsi_ok?'#48bb78':'#f56565'}}>RSI {paperSignal.rsi_ok?'✓':'✗'}</span>}
-              {paperSignal.ema_ok!==undefined && <span style={{fontSize:'0.75rem',color:paperSignal.ema_ok?'#48bb78':'#f56565'}}>EMA {paperSignal.ema_ok?'✓':'✗'}</span>}
-              {paperSignal.timestamp && <span style={{fontSize:'0.7rem',color:'#8b8b9d'}}>{new Date(paperSignal.timestamp).toLocaleTimeString()}</span>}
-            </div>
-          </div>
-        )}
+        {paperScanning&&<div style={{marginTop:8,fontSize:'0.72rem',color:'#8b8b9d'}}>Scanning · {timingLabel[scanTimingMode]}{['interval','after_open','before_close'].includes(scanTimingMode)?` (${scanTimingValue})`:''}</div>}
+        <div style={{marginTop:12}}><SignalBadge signal={paperSignal}/></div>
       </div>
 
       {/* Data */}
@@ -136,8 +236,8 @@ function PaperPanel({ paperKey, setPaperKey, paperSecret, setPaperSecret, paperA
           ))}
           <button onClick={refreshData} style={{marginLeft:'auto',background:'none',border:'none',color:'#8b8b9d',cursor:'pointer',padding:'8px 12px',display:'flex',alignItems:'center'}}><RefreshCw size={14}/></button>
         </div>
-        {tab==='positions' && (
-          <div className="table-container"><div><table>
+        {tab==='positions'&&(
+          <div className="table-container"><table>
             <thead><tr><th>Symbol</th><th>Qty</th><th>Side</th><th>Avg Price</th><th>Current</th><th>Market Val</th><th>Unrealized P&L</th></tr></thead>
             <tbody>
               {paperPositions.length===0&&<tr><td colSpan={7} style={{textAlign:'center',color:'#8b8b9d',padding:24}}>No open positions</td></tr>}
@@ -151,36 +251,32 @@ function PaperPanel({ paperKey, setPaperKey, paperSecret, setPaperSecret, paperA
                 </tr>
               ))}
             </tbody>
-          </table></div></div>
+          </table></div>
         )}
-        {tab==='open orders' && (
-          <div className="table-container"><div><table>
+        {tab==='open orders'&&(
+          <div className="table-container"><table>
             <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th>Status</th><th>Submitted</th></tr></thead>
             <tbody>
-              {(() => {
-                const open = paperOrders.filter(o=>['new','accepted','pending_new','partially_filled'].includes(o.status));
+              {(()=>{const open=paperOrders.filter(o=>['new','accepted','pending_new','partially_filled'].includes(o.status));
                 if(!open.length) return <tr><td colSpan={6} style={{textAlign:'center',color:'#8b8b9d',padding:24}}>No open orders</td></tr>;
                 return open.map((o,i)=>(
-                  <tr key={i}>
-                    <td style={{fontWeight:600}}>{o.symbol}</td>
+                  <tr key={i}><td style={{fontWeight:600}}>{o.symbol}</td>
                     <td><span className={`badge ${o.side==='buy'?'win':'loss'}`}>{o.side.toUpperCase()}</span></td>
                     <td>{o.qty}</td><td>{o.type}</td>
                     <td><span style={{fontSize:'0.7rem',color:'#ecc94b'}}>{o.status}</span></td>
                     <td style={{fontSize:'0.75rem',color:'#8b8b9d'}}>{o.submitted_at?new Date(o.submitted_at).toLocaleTimeString():'-'}</td>
-                  </tr>
-                ));
+                  </tr>));
               })()}
             </tbody>
-          </table></div></div>
+          </table></div>
         )}
-        {tab==='all orders' && (
-          <div className="table-container"><div><table>
+        {tab==='all orders'&&(
+          <div className="table-container"><table>
             <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th>Status</th><th>Fill Price</th><th>Submitted</th></tr></thead>
             <tbody>
               {paperOrders.length===0&&<tr><td colSpan={7} style={{textAlign:'center',color:'#8b8b9d',padding:24}}>No orders</td></tr>}
               {paperOrders.map((o,i)=>(
-                <tr key={i}>
-                  <td style={{fontWeight:600}}>{o.symbol}</td>
+                <tr key={i}><td style={{fontWeight:600}}>{o.symbol}</td>
                   <td><span className={`badge ${o.side==='buy'?'win':'loss'}`}>{o.side.toUpperCase()}</span></td>
                   <td>{o.qty}</td><td>{o.type}</td>
                   <td><span style={{fontSize:'0.7rem',color:o.status==='filled'?'#48bb78':o.status==='canceled'?'#8b8b9d':'#ecc94b'}}>{o.status}</span></td>
@@ -189,10 +285,10 @@ function PaperPanel({ paperKey, setPaperKey, paperSecret, setPaperSecret, paperA
                 </tr>
               ))}
             </tbody>
-          </table></div></div>
+          </table></div>
         )}
-        {tab==='scan log' && (
-          <div className="table-container"><div><table>
+        {tab==='scan log'&&(
+          <div className="table-container"><table>
             <thead><tr><th>Time</th><th>Signal</th><th>Price</th><th>RSI</th><th>RSI OK</th><th>EMA OK</th></tr></thead>
             <tbody>
               {scanLog.length===0&&<tr><td colSpan={6} style={{textAlign:'center',color:'#8b8b9d',padding:24}}>No scans yet</td></tr>}
@@ -206,7 +302,7 @@ function PaperPanel({ paperKey, setPaperKey, paperSecret, setPaperSecret, paperA
                 </tr>
               ))}
             </tbody>
-          </table></div></div>
+          </table></div>
         )}
       </div>
     </div>
@@ -214,10 +310,10 @@ function PaperPanel({ paperKey, setPaperKey, paperSecret, setPaperSecret, paperA
 }
 
 /* ── Live IBKR Panel ─────────────────────────────────────────── */
-function LivePanel({ ibkrHost, setIbkrHost, ibkrPort, setIbkrPort, ibkrClientId, setIbkrClientId, ibkrAccount, ibkrConnecting, connStatus, connectIbkr, ibkrPositions, ibkrOrders, msg, setMsg, killSwitch, placeTestOrder, refreshData, ibkrScanning, toggleScanning, ibkrScanLog, ibkrScanSignal }) {
+function LivePanel({ ibkrHost, setIbkrHost, ibkrPort, setIbkrPort, ibkrClientId, setIbkrClientId, ibkrAccount, ibkrConnecting, connStatus, connectIbkr, reconnectIbkr, ibkrPositions, ibkrOrders, msg, setMsg, killSwitch, placeTestOrder, refreshData, ibkrScanning, toggleScanning, ibkrScanLog, ibkrScanSignal, ibkrScanTimingMode, setIbkrScanTimingMode, ibkrScanTimingValue, setIbkrScanTimingValue, spyData, tradePresets, onSavePreset, onLoadPreset, onDeletePreset }) {
   const [tab, setTab] = useState('positions');
   const [cancelLoading, setCancelLoading] = useState({});
-  const connColor = connStatus==='online'?'#48bb78':connStatus==='dropped'?'#ecc94b':'#f56565';
+  const timingLabel = {interval:'Every N sec',after_open:'N min after open',before_close:'N min before close',on_open:'At market open',on_close:'At market close'};
 
   const cancelOrder = async (orderId) => {
     setCancelLoading(p=>({...p,[orderId]:true}));
@@ -230,67 +326,62 @@ function LivePanel({ ibkrHost, setIbkrHost, ibkrPort, setIbkrPort, ibkrClientId,
     finally{setCancelLoading(p=>({...p,[orderId]:false}));}
   };
 
+  const latestScan = ibkrScanLog[0] || null;
+
   return (
-    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+    <div style={{display:'flex',flexDirection:'column',gap:14}}>
+      <AccountHUD account={ibkrAccount} mode="live" connStatus={connStatus} spyData={spyData} onRefresh={refreshData}/>
+
+      <TradingPresetsBar presets={tradePresets} onLoad={onLoadPreset} onSave={onSavePreset} onDelete={onDeletePreset}/>
+
       {/* Connection */}
       <div style={{background:'var(--bg-card)',borderRadius:12,border:'1px solid var(--border)',padding:20}}>
-        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16}}>
-          <h3 style={{fontSize:'0.9rem',color:'#8b8b9d',display:'flex',alignItems:'center',gap:8}}>
-            <ShieldCheck size={16}/>Interactive Brokers TWS
-            <span style={{fontSize:'0.72rem',padding:'3px 10px',borderRadius:20,background:`${connColor}20`,border:`1px solid ${connColor}`,color:connColor,fontWeight:700}}>{connStatus.toUpperCase()}</span>
-          </h3>
-          {ibkrAccount && (
-            <div style={{display:'flex',gap:20,fontSize:'0.8rem'}}>
-              <span style={{color:'#8b8b9d'}}>Net Liq: <strong style={{color:'#f0f0f5'}}>${Number(ibkrAccount.equity||0).toLocaleString()}</strong></span>
-              <span style={{color:'#8b8b9d'}}>BP: <strong style={{color:'#48bb78'}}>${Number(ibkrAccount.buying_power||0).toLocaleString()}</strong></span>
-              <span style={{color:'#8b8b9d'}}>Day P&L: <strong style={{color:Number(ibkrAccount.daily_pnl||0)>=0?'#48bb78':'#f56565'}}>${Number(ibkrAccount.daily_pnl||0).toFixed(2)}</strong></span>
-              <span style={{color:'#8b8b9d'}}>Unrealized: <strong style={{color:Number(ibkrAccount.unrealized_pnl||0)>=0?'#48bb78':'#f56565'}}>${Number(ibkrAccount.unrealized_pnl||0).toFixed(2)}</strong></span>
-            </div>
-          )}
-        </div>
-        <div style={{display:'grid',gridTemplateColumns:'1fr 100px 80px auto',gap:12,alignItems:'flex-end'}}>
-          <Field label="TWS Host"><input value={ibkrHost} onChange={e=>setIbkrHost(e.target.value)} style={{width:'100%',background:'var(--bg-dark)',border:'1px solid var(--border)',color:'#fff',padding:'8px 12px',borderRadius:8,fontFamily:'inherit',fontSize:'0.85rem'}}/></Field>
-          <Field label="Port"><input type="number" value={ibkrPort} onChange={e=>setIbkrPort(Number(e.target.value))} style={{width:'100%',background:'var(--bg-dark)',border:'1px solid var(--border)',color:'#fff',padding:'8px 12px',borderRadius:8,fontFamily:'inherit',fontSize:'0.85rem'}}/></Field>
-          <Field label="Client ID"><input type="number" value={ibkrClientId} onChange={e=>setIbkrClientId(Number(e.target.value))} min={1} style={{width:'100%',background:'var(--bg-dark)',border:'1px solid var(--border)',color:'#fff',padding:'8px 12px',borderRadius:8,fontFamily:'inherit',fontSize:'0.85rem'}}/></Field>
+        <h3 style={{marginBottom:14,fontSize:'0.9rem',color:'#8b8b9d',display:'flex',alignItems:'center',gap:8}}>
+          <ShieldCheck size={16}/>Interactive Brokers TWS
+        </h3>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 100px 80px auto auto',gap:12,alignItems:'flex-end'}}>
+          <Field label="TWS Host"><input value={ibkrHost} onChange={e=>setIbkrHost(e.target.value)} style={{...INP,width:'100%'}}/></Field>
+          <Field label="Port"><input type="number" value={ibkrPort} onChange={e=>setIbkrPort(Number(e.target.value))} style={{...INP,width:'100%'}}/></Field>
+          <Field label="Client ID"><input type="number" value={ibkrClientId} onChange={e=>setIbkrClientId(Number(e.target.value))} min={1} style={{...INP,width:'100%'}}/></Field>
           <button className="btn-primary" onClick={connectIbkr} disabled={ibkrConnecting} style={{width:'auto',padding:'8px 20px',marginTop:0}}>
             <Wifi size={14}/>{ibkrConnecting?'Connecting…':ibkrAccount?'Reconnect':'Connect'}
           </button>
+          {connStatus==='dropped'&&(
+            <button onClick={reconnectIbkr} style={{padding:'8px 14px',background:'rgba(236,201,75,0.15)',border:'1px solid #ecc94b',borderRadius:8,color:'#ecc94b',cursor:'pointer',fontSize:'0.8rem',fontWeight:700,display:'flex',alignItems:'center',gap:5,marginTop:0}}>
+              <RefreshCw size={13}/>Reconnect
+            </button>
+          )}
         </div>
         <MsgBox msg={msg}/>
       </div>
 
-      {/* Controls */}
+      {/* Scanner */}
       <div style={{background:'var(--bg-card)',borderRadius:12,border:'1px solid var(--border)',padding:20}}>
-        <h3 style={{marginBottom:16,fontSize:'0.9rem',color:'#8b8b9d',display:'flex',alignItems:'center',gap:8}}><Activity size={16}/>Scanner & Controls</h3>
-        <div style={{display:'flex',gap:12,flexWrap:'wrap',alignItems:'center'}}>
-          <button onClick={ibkrScanSignal} className="btn-secondary" style={{padding:'8px 16px',display:'flex',alignItems:'center',gap:6}}><RefreshCw size={14}/>Scan Now</button>
-          <button onClick={()=>toggleScanning(60)} style={{padding:'8px 20px',borderRadius:8,border:`1px solid ${ibkrScanning?'#f56565':'var(--accent)'}`,background:ibkrScanning?'rgba(245,101,101,0.15)':'rgba(107,70,193,0.2)',color:ibkrScanning?'#f56565':'#a78bfa',cursor:'pointer',fontWeight:700,fontSize:'0.8rem',display:'flex',alignItems:'center',gap:6}}>
-            <Radio size={14}/>{ibkrScanning?'Stop Auto-Scan':'Start Auto-Scan (60s)'}
+        <h3 style={{marginBottom:14,fontSize:'0.9rem',color:'#8b8b9d',display:'flex',alignItems:'center',gap:8}}><Activity size={16}/>Scanner & Controls</h3>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12,marginBottom:12}}>
+          <Field label="Scan Timing">
+            <select value={ibkrScanTimingMode} onChange={e=>setIbkrScanTimingMode(e.target.value)} style={SEL}>
+              {Object.entries(timingLabel).map(([k,v])=><option key={k} value={k}>{v}</option>)}
+            </select>
+          </Field>
+          {['interval','after_open','before_close'].includes(ibkrScanTimingMode)&&(
+            <Field label={ibkrScanTimingMode==='interval'?'Interval (sec)':'Offset (min)'}>
+              <input type="number" value={ibkrScanTimingValue} onChange={e=>setIbkrScanTimingValue(Number(e.target.value))} min={1} style={{...INP,width:'100%'}}/>
+            </Field>
+          )}
+        </div>
+        <div style={{display:'flex',gap:10,flexWrap:'wrap',alignItems:'center'}}>
+          <button onClick={ibkrScanSignal} className="btn-secondary" style={{padding:'8px 14px',display:'flex',alignItems:'center',gap:6}}><RefreshCw size={14}/>Scan Now</button>
+          <button onClick={toggleScanning} style={{padding:'8px 18px',borderRadius:8,border:`1px solid ${ibkrScanning?'#f56565':'var(--accent)'}`,background:ibkrScanning?'rgba(245,101,101,0.15)':'rgba(107,70,193,0.2)',color:ibkrScanning?'#f56565':'#a78bfa',cursor:'pointer',fontWeight:700,fontSize:'0.8rem',display:'flex',alignItems:'center',gap:6}}>
+            <Radio size={14}/>{ibkrScanning?'Stop Scan':'Start Scan'}
           </button>
-          <button onClick={placeTestOrder} className="btn-secondary" style={{padding:'8px 16px',display:'flex',alignItems:'center',gap:6}}><Zap size={14}/>Test Order ($1.05)</button>
-          <button onClick={killSwitch} style={{padding:'8px 16px',background:'rgba(245,101,101,0.15)',border:'1px solid #f56565',borderRadius:8,color:'#f56565',cursor:'pointer',display:'flex',alignItems:'center',gap:6,fontSize:'0.8rem',fontWeight:700}}>
+          <button onClick={placeTestOrder} className="btn-secondary" style={{padding:'8px 14px',display:'flex',alignItems:'center',gap:6}}><Zap size={14}/>Test Order</button>
+          <button onClick={killSwitch} style={{padding:'8px 14px',background:'rgba(245,101,101,0.15)',border:'1px solid #f56565',borderRadius:8,color:'#f56565',cursor:'pointer',display:'flex',alignItems:'center',gap:6,fontSize:'0.8rem',fontWeight:700}}>
             <XCircle size={14}/>KILL SWITCH
           </button>
-          <button onClick={refreshData} style={{marginLeft:'auto',background:'none',border:'1px solid var(--border)',borderRadius:8,color:'#8b8b9d',cursor:'pointer',padding:'8px 12px',display:'flex',alignItems:'center',gap:6,fontSize:'0.8rem'}}><RefreshCw size={14}/>Refresh</button>
         </div>
-        {ibkrScanLog.length>0 && (() => {
-          const latest = ibkrScanLog[0];
-          return (
-            <div style={{marginTop:16,padding:16,borderRadius:8,background:latest.signal?'rgba(72,187,120,0.08)':'rgba(255,255,255,0.03)',border:`1px solid ${latest.signal?'#48bb78':'var(--border)'}`}}>
-              <div style={{display:'flex',gap:20,alignItems:'center',flexWrap:'wrap'}}>
-                <div style={{display:'flex',alignItems:'center',gap:8}}>
-                  <div style={{width:12,height:12,borderRadius:'50%',background:latest.signal?'#48bb78':'#8b8b9d',boxShadow:latest.signal?'0 0 8px #48bb78':'none'}}/>
-                  <span style={{fontWeight:700,fontSize:'1rem',color:latest.signal?'#48bb78':'#8b8b9d'}}>{latest.signal?'ENTRY SIGNAL':'NO SIGNAL'}</span>
-                </div>
-                {latest.price&&<span style={{fontSize:'0.8rem',color:'#8b8b9d'}}>Price: <strong style={{color:'#f0f0f5'}}>${latest.price}</strong></span>}
-                {latest.rsi&&<span style={{fontSize:'0.8rem',color:'#8b8b9d'}}>RSI: <strong style={{color:'#f0f0f5'}}>{latest.rsi}</strong></span>}
-                {latest.rsi_ok!==undefined&&<span style={{fontSize:'0.75rem',color:latest.rsi_ok?'#48bb78':'#f56565'}}>RSI {latest.rsi_ok?'✓':'✗'}</span>}
-                {latest.ema_ok!==undefined&&<span style={{fontSize:'0.75rem',color:latest.ema_ok?'#48bb78':'#f56565'}}>EMA {latest.ema_ok?'✓':'✗'}</span>}
-                <span style={{fontSize:'0.7rem',color:'#8b8b9d'}}>{latest.time}</span>
-              </div>
-            </div>
-          );
-        })()}
+        {ibkrScanning&&<div style={{marginTop:8,fontSize:'0.72rem',color:'#8b8b9d'}}>Scanning · {timingLabel[ibkrScanTimingMode]}{['interval','after_open','before_close'].includes(ibkrScanTimingMode)?` (${ibkrScanTimingValue})`:''}</div>}
+        {latestScan&&<div style={{marginTop:12}}><SignalBadge signal={latestScan}/></div>}
       </div>
 
       {/* Data */}
@@ -299,9 +390,10 @@ function LivePanel({ ibkrHost, setIbkrHost, ibkrPort, setIbkrPort, ibkrClientId,
           {['positions','open orders','scan log'].map(t=>(
             <button key={t} onClick={()=>setTab(t)} style={{padding:'8px 16px',background:'none',border:'none',borderBottom:tab===t?'2px solid var(--accent)':'2px solid transparent',color:tab===t?'#a78bfa':'#8b8b9d',fontWeight:600,fontSize:'0.8rem',cursor:'pointer',textTransform:'capitalize'}}>{t}</button>
           ))}
+          <button onClick={refreshData} style={{marginLeft:'auto',background:'none',border:'none',color:'#8b8b9d',cursor:'pointer',padding:'8px 12px',display:'flex',alignItems:'center'}}><RefreshCw size={14}/></button>
         </div>
-        {tab==='positions' && (
-          <div className="table-container"><div><table>
+        {tab==='positions'&&(
+          <div className="table-container"><table>
             <thead><tr><th>Symbol</th><th>Type</th><th>Qty</th><th>Avg Price</th><th>Market Price</th><th>Unrealized P&L</th><th>Realized P&L</th></tr></thead>
             <tbody>
               {ibkrPositions.length===0&&<tr><td colSpan={7} style={{textAlign:'center',color:'#8b8b9d',padding:24}}>No open positions — connect to TWS first</td></tr>}
@@ -315,11 +407,11 @@ function LivePanel({ ibkrHost, setIbkrHost, ibkrPort, setIbkrPort, ibkrClientId,
                 </tr>
               ))}
             </tbody>
-          </table></div></div>
+          </table></div>
         )}
-        {tab==='open orders' && (
-          <div className="table-container"><div><table>
-            <thead><tr><th>Order ID</th><th>Symbol</th><th>Action</th><th>Qty</th><th>Type</th><th>Limit Price</th><th>Status</th><th>Cancel</th></tr></thead>
+        {tab==='open orders'&&(
+          <div className="table-container"><table>
+            <thead><tr><th>Order ID</th><th>Symbol</th><th>Action</th><th>Qty</th><th>Type</th><th>Limit</th><th>Status</th><th>Cancel</th></tr></thead>
             <tbody>
               {ibkrOrders.length===0&&<tr><td colSpan={8} style={{textAlign:'center',color:'#8b8b9d',padding:24}}>No open orders</td></tr>}
               {ibkrOrders.map((o,i)=>(
@@ -334,13 +426,13 @@ function LivePanel({ ibkrHost, setIbkrHost, ibkrPort, setIbkrPort, ibkrClientId,
                 </tr>
               ))}
             </tbody>
-          </table></div></div>
+          </table></div>
         )}
-        {tab==='scan log' && (
-          <div className="table-container"><div><table>
+        {tab==='scan log'&&(
+          <div className="table-container"><table>
             <thead><tr><th>Time</th><th>Signal</th><th>Price</th><th>RSI</th><th>RSI OK</th><th>EMA OK</th><th>Strategy</th></tr></thead>
             <tbody>
-              {ibkrScanLog.length===0&&<tr><td colSpan={7} style={{textAlign:'center',color:'#8b8b9d',padding:24}}>No scans yet — click Scan Now</td></tr>}
+              {ibkrScanLog.length===0&&<tr><td colSpan={7} style={{textAlign:'center',color:'#8b8b9d',padding:24}}>No scans yet</td></tr>}
               {ibkrScanLog.map((log,i)=>(
                 <tr key={i}>
                   <td style={{fontSize:'0.75rem',color:'#8b8b9d'}}>{log.time}</td>
@@ -352,7 +444,7 @@ function LivePanel({ ibkrHost, setIbkrHost, ibkrPort, setIbkrPort, ibkrClientId,
                 </tr>
               ))}
             </tbody>
-          </table></div></div>
+          </table></div>
         )}
       </div>
     </div>
@@ -365,6 +457,8 @@ export default function App() {
   const [config, setConfig] = useState(loadConfig);
   const [strategies, setStrategies] = useState([]);
   const [customPresets, setCustomPresets] = useState(loadPresets);
+  const [tradePresets, setTradePresets] = useState(loadTradePresets);
+  const [spyData, setSpyData] = useState(null);
   const [presetName, setPresetName] = useState('');
   const [currentTime, setCurrentTime] = useState(new Date());
 
@@ -389,7 +483,8 @@ export default function App() {
   const [paperMsg, setPaperMsg] = useState('');
   const [paperScanning, setPaperScanning] = useState(false);
   const [paperAutoExec, setPaperAutoExec] = useState(false);
-  const [scanInterval, setScanInterval] = useState(60);
+  const [scanTimingMode, setScanTimingMode] = useState('interval');
+  const [scanTimingValue, setScanTimingValue] = useState(300);
   const [scanLog, setScanLog] = useState([]);
   const autoScanRef = useRef(null);
   const paperKeyRef = useRef(paperKey);
@@ -408,6 +503,8 @@ export default function App() {
   const [ibkrMsg, setIbkrMsg] = useState('');
   const [ibkrScanning, setIbkrScanning] = useState(false);
   const [ibkrScanLog, setIbkrScanLog] = useState([]);
+  const [ibkrScanTimingMode, setIbkrScanTimingMode] = useState('interval');
+  const [ibkrScanTimingValue, setIbkrScanTimingValue] = useState(60);
   const ibkrAutoScanRef = useRef(null);
 
   // Chart
@@ -527,9 +624,16 @@ export default function App() {
   },[paperAutoExec,loadPaperData]);
 
   const togglePaperScanning = useCallback(()=>{
-    if(paperScanning){clearInterval(autoScanRef.current);setPaperScanning(false);}
-    else{scanSignal(true);autoScanRef.current=setInterval(()=>scanSignal(true),scanInterval*1000);setPaperScanning(true);}
-  },[paperScanning,scanInterval,scanSignal]);
+    if(paperScanning){
+      clearInterval(autoScanRef.current);
+      setPaperScanning(false);
+    } else {
+      const secs = scanTimingMode==='interval' ? Math.max(scanTimingValue,10) : 300;
+      scanSignal(true);
+      autoScanRef.current = setInterval(()=>scanSignal(true), secs*1000);
+      setPaperScanning(true);
+    }
+  },[paperScanning,scanTimingMode,scanTimingValue,scanSignal]);
 
   const paperKillSwitch = useCallback(async()=>{
     clearInterval(autoScanRef.current);setPaperScanning(false);
@@ -595,29 +699,76 @@ export default function App() {
     }catch{}
   },[]);
 
-  const toggleIbkrScanning = useCallback((interval_s=60)=>{
-    if(ibkrScanning){clearInterval(ibkrAutoScanRef.current);setIbkrScanning(false);}
-    else{ibkrScanSignal();ibkrAutoScanRef.current=setInterval(ibkrScanSignal,interval_s*1000);setIbkrScanning(true);}
-  },[ibkrScanning,ibkrScanSignal]);
+  const toggleIbkrScanning = useCallback(()=>{
+    if(ibkrScanning){
+      clearInterval(ibkrAutoScanRef.current);
+      setIbkrScanning(false);
+    } else {
+      const secs = ibkrScanTimingMode==='interval' ? Math.max(ibkrScanTimingValue,10) : 60;
+      ibkrScanSignal();
+      ibkrAutoScanRef.current = setInterval(ibkrScanSignal, secs*1000);
+      setIbkrScanning(true);
+    }
+  },[ibkrScanning,ibkrScanTimingMode,ibkrScanTimingValue,ibkrScanSignal]);
 
-  // IBKR heartbeat
+  // Reconnect handler (force-reconnect via /api/ibkr/reconnect)
+  const reconnectIbkr = useCallback(async()=>{
+    setIbkrConnecting(true);setIbkrMsg('Reconnecting…');
+    try{
+      const res=await fetch(`${API}/api/ibkr/reconnect`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:ibkrHost,port:ibkrPort,client_id:ibkrClientId})});
+      const json=await res.json();
+      if(json.connected){setIbkrAccount(json.summary);setConnStatus('online');setLastHeartbeat(new Date());loadIbkrData();setIbkrMsg('Reconnected!');}
+      else{setConnStatus('offline');setIbkrMsg(`Error: ${json.error||'Reconnect failed'}`);}
+    }catch(e){setConnStatus('offline');setIbkrMsg(`Error: ${e.message}`);}finally{setIbkrConnecting(false);}
+  },[ibkrHost,ibkrPort,ibkrClientId,loadIbkrData]);
+
+  // IBKR heartbeat — lightweight /heartbeat endpoint, auto-reconnect on drop
   useEffect(()=>{
     if(appMode!=='live') return;
     const hb=async()=>{
       try{
-        const res=await fetch(`${API}/api/ibkr/connect`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:ibkrHost,port:ibkrPort,client_id:ibkrClientId})});
+        const res=await fetch(`${API}/api/ibkr/heartbeat`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:ibkrHost,port:ibkrPort,client_id:ibkrClientId})});
         const json=await res.json();
-        if(json.connected){setConnStatus('online');setLastHeartbeat(new Date());}
-        else if(connStatus==='online') setConnStatus('dropped');
+        if(json.alive){setConnStatus('online');setLastHeartbeat(new Date());}
+        else if(connStatus==='online'){setConnStatus('dropped');}
       }catch{if(connStatus==='online') setConnStatus('dropped');}
     };
-    const t=setInterval(hb,15000);return()=>clearInterval(t);
+    const t=setInterval(hb,10000);return()=>clearInterval(t);
   },[appMode,ibkrHost,ibkrPort,ibkrClientId,connStatus]);
 
   useEffect(()=>{
     if(appMode!=='live'||!ibkrAccount) return;
     const t=setInterval(loadIbkrData,30000);return()=>clearInterval(t);
   },[appMode,ibkrAccount,loadIbkrData]);
+
+  // SPY intraday sparkline polling
+  useEffect(()=>{
+    if(appMode!=='paper'&&appMode!=='live') return;
+    const fetchSpy=()=>fetch(`${API}/api/spy/intraday`).then(r=>r.json()).then(d=>{ if(!d.error) setSpyData(d); }).catch(()=>{});
+    fetchSpy();
+    const t=setInterval(fetchSpy,60000);
+    return()=>clearInterval(t);
+  },[appMode]);
+
+  // Trading presets
+  const saveTradePreset = useCallback((name)=>{
+    const preset={ config, scanner:{ timing_mode:scanTimingMode, timing_value:scanTimingValue, auto_execute:paperAutoExec }, ibkr_scanner:{ timing_mode:ibkrScanTimingMode, timing_value:ibkrScanTimingValue } };
+    const updated={...tradePresets,[name]:preset};
+    setTradePresets(updated);
+    localStorage.setItem(TRADE_PRESETS_KEY,JSON.stringify(updated));
+  },[config,scanTimingMode,scanTimingValue,paperAutoExec,ibkrScanTimingMode,ibkrScanTimingValue,tradePresets]);
+
+  const loadTradePreset = useCallback((preset)=>{
+    if(preset.config){ const next={...DEFAULT_CONFIG,...preset.config}; setConfig(next); localStorage.setItem(STORAGE_KEY,JSON.stringify(next)); }
+    if(preset.scanner){ setScanTimingMode(preset.scanner.timing_mode||'interval'); setScanTimingValue(preset.scanner.timing_value||300); if(preset.scanner.auto_execute!==undefined) setPaperAutoExec(preset.scanner.auto_execute); }
+    if(preset.ibkr_scanner){ setIbkrScanTimingMode(preset.ibkr_scanner.timing_mode||'interval'); setIbkrScanTimingValue(preset.ibkr_scanner.timing_value||60); }
+  },[]);
+
+  const deleteTradePreset = useCallback((name)=>{
+    const{[name]:_,...rest}=tradePresets;
+    setTradePresets(rest);
+    localStorage.setItem(TRADE_PRESETS_KEY,JSON.stringify(rest));
+  },[tradePresets]);
 
   // Presets
   const allPresets={...BUILT_IN_PRESETS,...customPresets};
@@ -1010,12 +1161,18 @@ export default function App() {
               paperSignal={paperSignal} scanLog={scanLog}
               paperScanning={paperScanning}
               paperAutoExec={paperAutoExec} setPaperAutoExec={setPaperAutoExec}
-              scanInterval={scanInterval} setScanInterval={setScanInterval}
+              scanTimingMode={scanTimingMode} setScanTimingMode={setScanTimingMode}
+              scanTimingValue={scanTimingValue} setScanTimingValue={setScanTimingValue}
               toggleScanning={togglePaperScanning}
               manualScan={()=>scanSignal(false)}
               killSwitch={paperKillSwitch}
               msg={paperMsg}
               refreshData={loadPaperData}
+              spyData={spyData}
+              tradePresets={tradePresets}
+              onSavePreset={saveTradePreset}
+              onLoadPreset={loadTradePreset}
+              onDeletePreset={deleteTradePreset}
             />
           )}
 
@@ -1026,6 +1183,7 @@ export default function App() {
               ibkrClientId={ibkrClientId} setIbkrClientId={setIbkrClientId}
               ibkrAccount={ibkrAccount} ibkrConnecting={ibkrConnecting}
               connStatus={connStatus} connectIbkr={connectIbkr}
+              reconnectIbkr={reconnectIbkr}
               ibkrPositions={ibkrPositions} ibkrOrders={ibkrOrders}
               msg={ibkrMsg} setMsg={setIbkrMsg}
               killSwitch={ibkrKillSwitch}
@@ -1035,6 +1193,13 @@ export default function App() {
               toggleScanning={toggleIbkrScanning}
               ibkrScanLog={ibkrScanLog}
               ibkrScanSignal={ibkrScanSignal}
+              ibkrScanTimingMode={ibkrScanTimingMode} setIbkrScanTimingMode={setIbkrScanTimingMode}
+              ibkrScanTimingValue={ibkrScanTimingValue} setIbkrScanTimingValue={setIbkrScanTimingValue}
+              spyData={spyData}
+              tradePresets={tradePresets}
+              onSavePreset={saveTradePreset}
+              onLoadPreset={loadTradePreset}
+              onDeletePreset={deleteTradePreset}
             />
           )}
         </div>
