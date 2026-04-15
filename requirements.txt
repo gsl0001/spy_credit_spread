@@ -6,5 +6,6 @@ scipy
 numpy
 pydantic
 apscheduler
+pytz
 ib_insync
 alpaca-trade-api
