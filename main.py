@@ -1487,7 +1487,7 @@ def journal_daily_pnl(days: int = 30):
 @app.get("/api/journal/events")
 def journal_events(limit: int = 50):
     from core.journal import get_journal
-    return {"events": get_journal().recent_events(limit)}
+    return _safe_json({"events": get_journal().recent_events(limit)})
 
 
 def _pos_to_dict(p) -> dict:
