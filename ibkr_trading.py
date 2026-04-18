@@ -173,7 +173,9 @@ class IBKRTrader:
             await self.ib.qualifyContractsAsync(opt)
             ib_legs.append(ComboLeg(conId=opt.conId, ratio=1, action=action, exchange='SMART'))
         
-        combo = Bag(symbol=symbol, secType='BAG', exchange='SMART', currency='USD', comboLegs=ib_legs)
+        # Bag.__init__ already hardcodes secType='BAG' — passing it explicitly
+        # triggers "got multiple values for argument 'secType'" on Python 3.14.
+        combo = Bag(symbol=symbol, exchange='SMART', currency='USD', comboLegs=ib_legs)
         
         if lmtPrice is not None:
             order = LimitOrder(side.upper(), sc, lmtPrice)
@@ -199,13 +201,15 @@ class IBKRTrader:
             await self.ib.qualifyContractsAsync(opt)
             ib_legs.append(ComboLeg(conId=opt.conId, ratio=1, action=action, exchange='SMART'))
             
-        combo = Bag(symbol=symbol, secType='BAG', exchange='SMART', currency='USD', comboLegs=ib_legs)
+        # Bag.__init__ already hardcodes secType='BAG' — passing it explicitly
+        # triggers "got multiple values for argument 'secType'" on Python 3.14.
+        combo = Bag(symbol=symbol, exchange='SMART', currency='USD', comboLegs=ib_legs)
         ticker = self.ib.reqMktData(combo, '', False, False)
         
         # Wait for data
         timeout = 5
-        start = asyncio.get_event_loop().time()
-        while (pd.isna(ticker.bid) or pd.isna(ticker.ask)) and (asyncio.get_event_loop().time() - start < timeout):
+        start = asyncio.get_running_loop().time()
+        while (pd.isna(ticker.bid) or pd.isna(ticker.ask)) and (asyncio.get_running_loop().time() - start < timeout):
             await asyncio.sleep(0.1)
             
         mid = (ticker.bid + ticker.ask) / 2 if not (pd.isna(ticker.bid) or pd.isna(ticker.ask)) else None
@@ -263,6 +267,40 @@ class IBKRTrader:
                 self.ib.cancelOrder(t.order)
                 return {"success": True, "msg": f"Order {orderId} cancellation submitted"}
         return {"success": False, "msg": f"Order {orderId} not found"}
+
+    async def get_order_status(self, broker_order_id) -> Optional[Dict]:
+        """Return IBKR status for ``broker_order_id`` or ``None`` if unknown.
+
+        Keys: status, filled, remaining, avgFillPrice, lastFillPrice, commission.
+        The ib_insync ``Trade.orderStatus.status`` is one of
+        ``PendingSubmit | Submitted | PreSubmitted | Filled | Cancelled |
+          ApiCancelled | Inactive``.
+        """
+        await self.ensure_connected()
+        try:
+            oid = int(broker_order_id)
+        except (TypeError, ValueError):
+            return None
+        # Check openTrades first (live), then fall back to all trades in session.
+        for t in list(self.ib.openTrades()) + list(self.ib.trades()):
+            if t.order.orderId == oid:
+                commission = 0.0
+                try:
+                    for f in t.fills:
+                        commission += float(
+                            getattr(f.commissionReport, "commission", 0.0) or 0.0
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+                return {
+                    "status": t.orderStatus.status,
+                    "filled": int(t.orderStatus.filled or 0),
+                    "remaining": int(t.orderStatus.remaining or 0),
+                    "avgFillPrice": float(t.orderStatus.avgFillPrice or 0.0),
+                    "lastFillPrice": float(t.orderStatus.lastFillPrice or 0.0),
+                    "commission": commission,
+                }
+        return None
 
 # Global singleton or instance mapper
 _ib_instances = {}
