@@ -523,6 +523,108 @@ class Journal:
             for r in rows
         ]
 
+    # ── EOD reconciliation (I4) ────────────────────────────────────────────
+
+    def daily_reconciliation_report(self, date: Optional[str] = None) -> dict:
+        """Return an EOD commission/slippage reconciliation report.
+
+        For each position closed on *date* (defaults to today) the report
+        shows entry cost, exit proceeds, total commissions charged across all
+        related orders, gross P&L, net P&L after commissions, and a simple
+        slippage estimate (the commission drag).
+
+        Return shape::
+
+            {
+                "date": "YYYY-MM-DD",
+                "positions_closed": [
+                    {
+                        "id": str,
+                        "symbol": str,
+                        "entry_cost": float,
+                        "exit_proceeds": float,
+                        "commissions": float,
+                        "gross_pnl": float,
+                        "net_pnl": float,
+                        "slippage_est": float,   # == gross_pnl - net_pnl
+                    },
+                    ...
+                ],
+                "total_commissions": float,
+                "total_gross_pnl": float,
+                "total_net_pnl": float,
+            }
+
+        ``gross_pnl`` is ``realized_pnl`` as stored (which already reflects
+        fill prices vs entry cost) **before** commission is subtracted.
+        ``net_pnl`` = ``gross_pnl - commissions``.
+        ``slippage_est`` = ``commissions`` (the commission drag on gross).
+        """
+        target_date: str = date or _today_str()
+
+        with self._lock:
+            # Positions whose exit_time falls on the requested date.
+            pos_rows = self._conn.execute(
+                """
+                SELECT id, symbol, entry_cost, exit_cost, realized_pnl
+                FROM   positions
+                WHERE  state = 'closed'
+                  AND  date(exit_time) = ?
+                ORDER BY exit_time
+                """,
+                (target_date,),
+            ).fetchall()
+
+        positions_closed: list[dict] = []
+        total_commissions: float = 0.0
+        total_gross_pnl: float = 0.0
+        total_net_pnl: float = 0.0
+
+        for row in pos_rows:
+            pos_id: str = row["id"]
+            symbol: str = row["symbol"]
+            entry_cost: float = float(row["entry_cost"] or 0.0)
+            exit_proceeds: float = float(row["exit_cost"] or 0.0)
+            gross_pnl: float = float(row["realized_pnl"] or 0.0)
+
+            # Sum commissions from all orders linked to this position.
+            with self._lock:
+                comm_row = self._conn.execute(
+                    """
+                    SELECT COALESCE(SUM(commission), 0.0) AS total_commission
+                    FROM   orders
+                    WHERE  position_id = ?
+                    """,
+                    (pos_id,),
+                ).fetchone()
+            commissions: float = float(comm_row["total_commission"] or 0.0)
+
+            net_pnl: float = gross_pnl - commissions
+            slippage_est: float = commissions  # commission drag
+
+            positions_closed.append({
+                "id": pos_id,
+                "symbol": symbol,
+                "entry_cost": entry_cost,
+                "exit_proceeds": exit_proceeds,
+                "commissions": commissions,
+                "gross_pnl": gross_pnl,
+                "net_pnl": net_pnl,
+                "slippage_est": slippage_est,
+            })
+
+            total_commissions += commissions
+            total_gross_pnl += gross_pnl
+            total_net_pnl += net_pnl
+
+        return {
+            "date": target_date,
+            "positions_closed": positions_closed,
+            "total_commissions": total_commissions,
+            "total_gross_pnl": total_gross_pnl,
+            "total_net_pnl": total_net_pnl,
+        }
+
 
 # ── Row mappers ────────────────────────────────────────────────────────────
 

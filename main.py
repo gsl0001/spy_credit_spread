@@ -1,5 +1,27 @@
-from functools import lru_cache
-from typing import List, Optional
+import contextlib
+import functools
+import time as _time
+from typing import List, Optional, Any
+
+# ── TTL cache (replaces lru_cache on data-fetching functions) ─────────────────
+# lru_cache never expires — live scanner would use bars fetched during backtest.
+# 300-second TTL ensures live mode always sees fresh data.
+_TTL_CACHE: dict = {}
+
+def _ttl_cache(ttl: int = 300):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args):
+            key = (fn.__qualname__, args)
+            entry = _TTL_CACHE.get(key)
+            if entry and (_time.monotonic() - entry[0]) < ttl:
+                return entry[1]
+            result = fn(*args)
+            _TTL_CACHE[key] = (_time.monotonic(), result)
+            return result
+        wrapper.cache_clear = lambda: _TTL_CACHE.clear()
+        return wrapper
+    return decorator
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -26,7 +48,18 @@ configure_root_logging()
 _startup_log = _logging.getLogger("main")
 log_event(_startup_log, "server_startup", message="FastAPI app initialising")
 
-app = FastAPI(title="SPY Options Backtesting Engine")
+_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(application):
+    global _MAIN_LOOP
+    _MAIN_LOOP = asyncio.get_running_loop()
+    yield
+    _MAIN_LOOP = None
+
+
+app = FastAPI(title="SPY Options Backtesting Engine", lifespan=_lifespan)
 
 
 def _safe_json(obj):
@@ -179,7 +212,7 @@ class StrategyFactory:
 
 
 # ── Data fetching ──────────────────────────────────────────────────────────
-@lru_cache(maxsize=10)
+@_ttl_cache(300)
 def fetch_historical_data(ticker: str, years: int):
     period = f"{years}y"
     df = yf.download(ticker, period=period, progress=False)
@@ -193,7 +226,7 @@ def fetch_historical_data(ticker: str, years: int):
     return df
 
 
-@lru_cache(maxsize=5)
+@_ttl_cache(300)
 def fetch_risk_free_rate():
     """Fetch 13-week T-Bill (^IRX) as a risk-free rate proxy."""
     try:
@@ -204,7 +237,7 @@ def fetch_risk_free_rate():
     except Exception:
         return 0.045
 
-@lru_cache(maxsize=5)
+@_ttl_cache(300)
 def fetch_vix_data(years: int):
     """Fetch VIX index data for regime/volatility filtering."""
     try:
@@ -868,11 +901,41 @@ def run_market_scan():
             mode = scanner_state.get("mode", "paper")
             creds = scanner_state.get("creds") or {}
             if mode == "paper" and creds.get("api_key"):
-                from paper_trading import place_equity_order
-                side = "sell" if config.get("direction", "bull") == "bear" else "buy"
-                place_equity_order(creds["api_key"], creds["api_secret"],
-                                   config.get("ticker", "SPY"),
-                                   config.get("contracts_per_trade", 1) * 100, side)
+                # I5: Generate an idempotency key scoped to date + symbol + strategy
+                # so rapid scanner fires on the same day are suppressed as duplicates.
+                _scan_date = datetime.now().strftime("%Y-%m-%d")
+                _scan_symbol = config.get("ticker", "SPY")
+                _scan_strategy = config.get("strategy_id", "default")
+                _idem_key = f"scan:{_scan_date}:{_scan_symbol}:{_scan_strategy}"
+
+                from core.journal import get_journal as _get_j, Order as _Order
+                import uuid as _uuid_scan
+                _jnl = _get_j()
+                _existing = _jnl.get_order_by_idempotency(_idem_key)
+                if _existing is not None:
+                    import logging as _scan_log
+                    _scan_log.getLogger(__name__).info(
+                        "duplicate scan signal suppressed (key=%s)", _idem_key
+                    )
+                else:
+                    from paper_trading import place_equity_order
+                    side = "sell" if config.get("direction", "bull") == "bear" else "buy"
+                    place_equity_order(creds["api_key"], creds["api_secret"],
+                                       _scan_symbol,
+                                       config.get("contracts_per_trade", 1) * 100, side)
+                    _now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                    _jnl.record_order(_Order(
+                        id=str(_uuid_scan.uuid4()),
+                        position_id=None,
+                        broker="paper",
+                        broker_order_id=None,
+                        side=side.upper(),
+                        limit_price=None,
+                        status="submitted",
+                        submitted_at=_now_iso,
+                        kind="entry",
+                        idempotency_key=_idem_key,
+                    ))
 
     except Exception as e:
         import logging
@@ -1490,6 +1553,16 @@ def journal_events(limit: int = 50):
     return _safe_json({"events": get_journal().recent_events(limit)})
 
 
+@app.get("/api/journal/reconciliation")
+def journal_reconciliation(date: Optional[str] = None):
+    """EOD commission/slippage reconciliation report.
+
+    Optional query param ``?date=YYYY-MM-DD`` selects the day; defaults to today.
+    """
+    from core.journal import get_journal
+    return _safe_json(get_journal().daily_reconciliation_report(date))
+
+
 def _pos_to_dict(p) -> dict:
     return {
         "id": p.id, "symbol": p.symbol, "topology": p.topology,
@@ -1526,13 +1599,12 @@ def _run_monitor_tick():
         return trader
 
     global _last_monitor_tick_iso
+    loop = _MAIN_LOOP
+    if loop is None or not loop.is_running():
+        return  # app not fully started yet
     try:
-        loop = _aio.get_event_loop()
-        if loop.is_running():
-            _aio.ensure_future(tick(_factory))
-        else:
-            loop.run_until_complete(tick(_factory))
-        # I10: record successful drive (scheduling counts as a heartbeat).
+        future = _aio.run_coroutine_threadsafe(tick(_factory), loop)
+        future.result(timeout=55)  # block until done; propagates exceptions
         _last_monitor_tick_iso = datetime.now(timezone.utc).isoformat(
             timespec="seconds"
         )
@@ -1558,12 +1630,12 @@ def _run_fill_reconcile():
         if trader:
             await reconcile_once(trader)
 
+    loop = _MAIN_LOOP
+    if loop is None or not loop.is_running():
+        return  # app not fully started yet
     try:
-        loop = _aio.get_event_loop()
-        if loop.is_running():
-            _aio.ensure_future(_go())
-        else:
-            loop.run_until_complete(_go())
+        future = _aio.run_coroutine_threadsafe(_go(), loop)
+        future.result(timeout=55)
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning("fill reconcile failed: %s", e)
