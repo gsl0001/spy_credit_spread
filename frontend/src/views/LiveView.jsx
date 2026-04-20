@@ -1,11 +1,9 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useData } from '../useBackendData.jsx';
 import { Ico } from '../icons.jsx';
-import { fmtUsd, fmtPct, fmtTimeAgo, Card, Kpi, Badge, Btn, Pill, Heartbeat, Chip } from '../primitives.jsx';
-import { PriceChart } from '../chart.jsx';
+import { fmtUsd, fmtTimeAgo, Card, Kpi, Badge, Btn, Pill, Heartbeat, Chip } from '../primitives.jsx';
 import { api, safe, IBKR_CREDS, setIbkrCreds } from '../api.js';
 import { loadConfig } from '../backtestConfig.js';
-import { CalendarStrip } from '../calendarStrip.jsx';
 
 export function LiveView() {
   const m = useData();
@@ -22,6 +20,12 @@ export function LiveView() {
   const [contractsOverride, setContractsOverride] = useState(0);
   const [chainPreview, setChainPreview] = useState(null);
   const [chainBusy, setChainBusy] = useState(false);
+
+  // Preset scanner state
+  const [presetList, setPresetList] = useState([]);
+  const [activePreset, setActivePreset] = useState('');
+  const [scannerRunning, setScannerRunning] = useState(false);
+  const [scannerMsg, setScannerMsg] = useState('');
 
   const monitorAge = m.monitor.last_tick_iso
     ? Math.floor((new Date() - new Date(m.monitor.last_tick_iso)) / 1000)
@@ -55,6 +59,10 @@ export function LiveView() {
     const id = setInterval(poll, 30000);
     return () => clearInterval(id);
   }, [ibkrAccount]);
+
+  useEffect(() => {
+    safe(api.presetsList, []).then(r => setPresetList(Array.isArray(r) ? r : []));
+  }, []);
 
   const submitOrder = useCallback(async () => {
     setBusy(true); setTicketMsg('Submitting order…');
@@ -108,92 +116,111 @@ export function LiveView() {
     finally { setBusy(false); }
   }, []);
 
-  const accountDisplay = ibkrAccount || m.account;
+  const startPreset = useCallback(async () => {
+    if (!activePreset) return;
+    setScannerMsg('Starting…');
+    try {
+      const r = await api.presetScannerStart(activePreset);
+      setScannerRunning(!r?.error);
+      setScannerMsg(r?.error || `Scanning · ${activePreset}`);
+    } catch (e) { setScannerMsg(e.message); }
+  }, [activePreset]);
+
+  const stopPreset = useCallback(async () => {
+    try { await api.presetScannerStop(); } catch (_) {}
+    setScannerRunning(false);
+    setScannerMsg('Stopped');
+  }, []);
+
+  // Only show financial figures that came from IBKR — show '—' from MOCK zeros
+  const connected = !!ibkrAccount;
+  const acct = ibkrAccount || {};
+  const cfg = useMemo(() => loadConfig(), []);   // cache once per render cycle
 
   return (
     <div className="page">
-      <CalendarStrip onChange={() => {}} />
-      <Card title="IBKR connection" icon="radar" subtitle={connectMsg || (ibkrAccount ? 'connected' : 'not connected')} actions={
-        <>
-          <Pill kind={ibkrAccount ? 'live' : m.__ibkr === 'live' ? 'live' : 'off'}>
-            {ibkrAccount ? 'CONNECTED' : (m.__ibkr || 'off').toUpperCase()}
-          </Pill>
-          <Btn size="sm" icon="activity" variant="primary" disabled={busy} onClick={connect}>Connect</Btn>
-          <Btn size="sm" variant="danger" icon="zap" disabled={busy || !ibkrAccount} onClick={flattenAll}>Flatten all</Btn>
-        </>
-      }>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
-          <div className="field"><label>Host</label><input className="inp" value={host} onChange={e => setHost(e.target.value)} /></div>
-          <div className="field"><label>Port</label><input className="inp" type="number" value={port} onChange={e => setPort(Number(e.target.value))} /></div>
-          <div className="field"><label>Client ID</label><input className="inp" type="number" value={clientId} onChange={e => setClientId(Number(e.target.value))} /></div>
-        </div>
-      </Card>
 
-      <div className="grid g-4" style={{ marginBottom: 14, marginTop: 14 }}>
-        <Card>
-          <Kpi label="Equity" value={fmtUsd(accountDisplay.equity)}
-            delta={{ text: fmtPct((accountDisplay.daily_pnl || 0) / (accountDisplay.equity || 1) * 100) + ' today',
-              color: (accountDisplay.daily_pnl || 0) >= 0 ? 'var(--pos)' : 'var(--neg)' }} big />
+      {/* ── Row 1: Account Info | IBKR Connection ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 10, marginBottom: 10 }}>
+
+        {/* Account Info */}
+        <Card title="Account Info" icon="dashboard"
+              subtitle={connected ? `Account ${acct.account_id || ''}` : 'connect IBKR to load'}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10 }}>
+            <Kpi label="Equity"
+                 value={connected ? fmtUsd(acct.equity) : '—'} big />
+            <Kpi label="Day P&L"
+                 value={connected ? fmtUsd(acct.daily_pnl ?? m.account.daily_pnl, true) : (m.account.daily_pnl ? fmtUsd(m.account.daily_pnl, true) : '—')}
+                 color={connected || m.account.daily_pnl ? ((acct.daily_pnl ?? m.account.daily_pnl) >= 0 ? 'var(--pos)' : 'var(--neg)') : undefined} big />
+            <Kpi label="Unrealized"
+                 value={connected ? fmtUsd(acct.unrealized_pnl ?? 0, true) : '—'}
+                 color={connected ? ((acct.unrealized_pnl ?? 0) >= 0 ? 'var(--pos)' : 'var(--neg)') : undefined} big />
+            <Kpi label="Buying Power"
+                 value={connected ? fmtUsd(acct.buying_power ?? 0) : '—'} big />
+          </div>
         </Card>
-        <Card>
-          <Kpi label="Day P&L" value={fmtUsd(accountDisplay.daily_pnl || 0, true)}
-            color={(accountDisplay.daily_pnl || 0) >= 0 ? 'var(--pos)' : 'var(--neg)'}
-            delta={{ text: `${m.closed.filter(c => { const d = new Date() - c.closed; return d < 86400000; }).length} closed today` }} big />
-        </Card>
-        <Card>
-          <Kpi label="Unrealized" value={fmtUsd(accountDisplay.unrealized_pnl || 0, true)}
-            color={(accountDisplay.unrealized_pnl || 0) >= 0 ? 'var(--pos)' : 'var(--neg)'}
-            delta={{ text: `${(ibkrPositions.length || m.positions.length)} open positions` }} big />
-        </Card>
-        <Card>
-          <Kpi label="Buying Power" value={fmtUsd(accountDisplay.buying_power || 0)}
-            delta={{ text: `${m.risk.buying_power_used_pct.toFixed(1)}% used · $${(accountDisplay.excess_liquidity || 0).toLocaleString()} excess` }} big />
+
+        {/* IBKR Connection */}
+        <Card title="IBKR Connection" icon="radar"
+              subtitle={connectMsg || (connected ? 'connected' : 'not connected')}
+              actions={
+                <Pill kind={connected ? 'live' : m.__ibkr === 'warn' ? 'warn' : 'off'}>
+                  {connected ? 'CONNECTED' : (m.__ibkr||'off').toUpperCase()}
+                </Pill>
+              }>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6 }}>
+              <div className="field"><label>Host</label><input className="inp" value={host} onChange={e=>setHost(e.target.value)} /></div>
+              <div className="field"><label>Port</label><input className="inp" type="number" value={port} onChange={e=>setPort(Number(e.target.value))} /></div>
+              <div className="field"><label>Client ID</label><input className="inp" type="number" value={clientId} onChange={e=>setClientId(Number(e.target.value))} /></div>
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <Btn variant="primary" icon="activity" disabled={busy} onClick={connect} style={{flex:1}}>Connect</Btn>
+              <Btn variant="danger" icon="zap" disabled={busy||!connected} onClick={flattenAll} style={{flex:1}}>Flatten all</Btn>
+            </div>
+          </div>
         </Card>
       </div>
 
-      <div className="grid g-23" style={{ marginBottom: 14 }}>
-        <Card title="Monitor heartbeat" icon="activity" subtitle={m.monitor.tick_interval_sec ? `tick every ${m.monitor.tick_interval_sec}s` : 'monitor'} actions={
-          <Pill kind={tickState === 'ok' ? 'live' : 'warn'}>
-            <span className="dot" />{tickState === 'ok' ? 'HEALTHY' : tickState === 'stale' ? 'STALE' : 'STALLED'}
-          </Pill>
-        }>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 18, justifyContent: 'space-between', marginBottom: 12 }}>
-            <div>
-              <div style={{ fontSize: 11, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Last tick</div>
-              <div className="mono" style={{ fontSize: 18, fontWeight: 600 }}>{monitorAge !== null ? `${monitorAge}s ago` : '—'}</div>
-              <div style={{ fontSize: 11, color: 'var(--text-4)' }}>{m.monitor.last_tick_iso ? new Date(m.monitor.last_tick_iso).toTimeString().slice(0, 8) : '—'}</div>
+      {/* ── Row 2: Monitor Heartbeat | Kill Switch | Alerts ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'auto auto 1fr', gap: 10, marginBottom: 10 }}>
+
+        {/* Monitor Heartbeat */}
+        <Card title="Monitor Heartbeat" icon="activity" style={{ minWidth: 180 }}
+              actions={<Pill kind={tickState==='ok'?'live':'warn'}>{tickState==='ok'?'HEALTHY':tickState==='stale'?'STALE':'STALLED'}</Pill>}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div className="mono" style={{ fontSize: 22, fontWeight: 700, textAlign: 'center' }}>
+              {monitorAge !== null ? `${monitorAge}s` : '—'}
             </div>
-            <div style={{ flex: 1 }}><Heartbeat history={m.monitor.history} /></div>
+            <div style={{ fontSize: 10, color: 'var(--text-3)', textAlign: 'center' }}>
+              {m.monitor.last_tick_iso ? new Date(m.monitor.last_tick_iso).toTimeString().slice(0,8) : 'no tick'}
+            </div>
+            <Heartbeat history={m.monitor.history} />
           </div>
-          <hr className="sep" />
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 16, fontSize: 12 }}>
-            <div>
-              <div className="muted" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2 }}>Leader</div>
-              <div style={{ fontWeight: 600 }}>{m.monitor.leader_info.host}</div>
-              <div className="muted mono" style={{ fontSize: 11 }}>pid {m.monitor.leader_info.pid ?? '—'} · held {m.monitor.leader_info.acquired_at ? fmtTimeAgo(m.monitor.leader_info.acquired_at) : '—'}</div>
-            </div>
-            <div>
-              <div className="muted" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2 }}>Scheduler jobs</div>
-              <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                {m.monitor.scheduler_jobs.map(j => <Badge key={j} variant="info">{j}</Badge>)}
-              </div>
-            </div>
-            <div>
-              <div className="muted" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2 }}>Fill watcher</div>
-              <div style={{ fontWeight: 600 }}>{m.orders.filter(o => o.status === 'pending').length} pending · {m.orders.filter(o => o.status === 'cancelling').length} cancelling</div>
-              <div className="muted" style={{ fontSize: 11 }}>{m.monitor.monitor_registered ? 'registered' : 'not registered'}</div>
+        </Card>
+
+        {/* Kill Switch */}
+        <Card title="Kill Switch" icon="zap" style={{ minWidth: 120 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'center', padding: '4px 0' }}>
+            <Btn variant="danger" icon="zap" disabled={busy||!connected} onClick={flattenAll}
+                 style={{ width: '100%', justifyContent: 'center', padding: '12px 0', fontWeight: 700, fontSize: 13 }}>
+              FLATTEN ALL
+            </Btn>
+            <div style={{ fontSize: 10, color: 'var(--text-3)', textAlign: 'center' }}>
+              {connected ? 'Ready — closes all open positions' : 'Connect IBKR first'}
             </div>
           </div>
         </Card>
 
+        {/* Alerts */}
         <Card title="Alerts" icon="bell" actions={<Btn variant="ghost" size="sm">Mark all read</Btn>}>
-          <div className="alerts" style={{ margin: '-16px -20px' }}>
-            {m.alerts.length === 0 && <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-3)', fontSize: 12 }}>No active alerts</div>}
+          <div style={{ maxHeight: 140, overflowY: 'auto', margin: '-16px -20px' }}>
+            {m.alerts.length === 0 && (
+              <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-3)', fontSize: 12 }}>No active alerts</div>
+            )}
             {m.alerts.map((a, i) => (
-              <div key={i} className={`alert ${a.level === 'warn' ? 'warn' : a.level === 'crit' ? 'crit' : 'info'}`}>
-                <div className="alert__icon">
-                  <Ico name={a.level === 'warn' ? 'alert' : a.level === 'crit' ? 'alert' : 'info'} size={12} />
-                </div>
+              <div key={i} className={`alert ${a.level==='warn'?'warn':a.level==='crit'?'crit':'info'}`}>
+                <div className="alert__icon"><Ico name={a.level==='crit'?'alert':'info'} size={12} /></div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div className="alert__title">{a.title}</div>
                   <div className="alert__msg">{a.msg}</div>
@@ -205,124 +232,189 @@ export function LiveView() {
         </Card>
       </div>
 
-      <div className="grid g-32" style={{ marginBottom: 14 }}>
-        <Card title="SPY · intraday" icon="activity" flush>
-          <PriceChart series={m.spy.series} height={300} />
-        </Card>
+      {/* ── Row 3: Scanner Load Presets | Scanning Shows ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
 
-        <Card title="Order ticket" icon="zap" subtitle={ticketMsg || 'submit real combo order'} actions={
-          <Badge variant={ibkrAccount ? 'pos' : 'neutral'}>{ibkrAccount ? 'READY' : 'CONNECT FIRST'}</Badge>
-        }>
-          <div className="ticket">
-            <div style={{ display: 'flex', gap: 8 }}>
-              <div className="field" style={{ flex: 1 }}>
-                <label>Strategy (from config)</label>
-                <input className="inp" value={`${loadConfig().strategy_type} · ${loadConfig().topology}`} readOnly />
-              </div>
-              <div className="field" style={{ width: 90 }}>
-                <label>Target DTE</label>
-                <input className="inp" type="number" value={targetDte} onChange={e => setTargetDte(Number(e.target.value))} />
-              </div>
-              <div className="field" style={{ width: 110 }}>
-                <label>Contracts (0=auto)</label>
-                <input className="inp" type="number" value={contractsOverride} onChange={e => setContractsOverride(Number(e.target.value))} />
-              </div>
-            </div>
-            <hr className="sep" style={{ margin: 0 }} />
-            <div className="muted" style={{ fontSize: 11 }}>
-              Spread cost target <strong style={{ color: 'var(--text)' }}>${loadConfig().spread_cost_target}</strong> ·
-              Width ${loadConfig().strike_width} · Stop {loadConfig().stop_loss_pct}% / TP {loadConfig().take_profit_pct}% / TR {loadConfig().trailing_stop_pct}%
-            </div>
-            <hr className="sep" style={{ margin: '4px 0' }} />
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 11.5 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Chip ok={m.risk.current_concurrent < m.risk.max_concurrent}>Concurrent cap ({m.risk.current_concurrent}/{m.risk.max_concurrent})</Chip>
-                <Chip ok={m.risk.daily_loss_used_pct < m.risk.daily_loss_limit_pct}>Daily loss</Chip>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Chip ok={m.risk.market_open}>Market hours</Chip>
-                <Chip ok={!m.risk.event_blackout}>Event window</Chip>
-                <Chip ok={!!ibkrAccount}>IBKR connected</Chip>
-              </div>
+        {/* Scanner – Load Presets */}
+        <Card title="Scanner — Load Presets" icon="radar">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div className="field">
+              <label>Select preset</label>
+              <select className="sel" value={activePreset} onChange={e=>setActivePreset(e.target.value)}>
+                <option value="">— choose preset —</option>
+                {presetList.map(p=><option key={p.name} value={p.name}>{p.name}</option>)}
+              </select>
             </div>
             <div style={{ display: 'flex', gap: 6 }}>
-              <Btn variant="ghost" size="sm" icon="radar" disabled={chainBusy} onClick={previewChain} style={{ flex: 1, justifyContent: 'center' }}>
-                {chainBusy ? 'Loading chain…' : 'Preview chain'}
+              <Btn variant="primary" icon="play" disabled={!activePreset||scannerRunning} onClick={startPreset} style={{flex:1}}>
+                Start
               </Btn>
-              <Btn variant="primary" icon="send" disabled={busy || !ibkrAccount} onClick={submitOrder} style={{ flex: 2, justifyContent: 'center', padding: '10px' }}>
-                {busy ? 'Submitting…' : 'Submit combo LMT'}
+              <Btn variant="danger" icon="pause" disabled={!scannerRunning} onClick={stopPreset} style={{flex:1}}>
+                Stop
               </Btn>
             </div>
-            {chainPreview && (
-              <div style={{ fontSize: 11, padding: 8, background: 'var(--bg-2)', borderRadius: 6, color: 'var(--text-2)' }}>
-                {chainPreview.error ? `Chain error: ${chainPreview.error}` : (
-                  <>
-                    <div className="mono" style={{ marginBottom: 4 }}>${chainPreview.price?.toFixed(2)} · exp {chainPreview.expiration}</div>
-                    {chainPreview.legs?.length === 0 && <div className="muted">No strikes near ATM</div>}
-                    {chainPreview.legs?.map((l, i) => (
-                      <div key={i} className="mono" style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10.5 }}>
-                        <span>C {l.strike}</span>
-                        <span>bid {l.bid?.toFixed(2)} / ask {l.ask?.toFixed(2)}</span>
-                        <span className="muted">IV {(l.impliedVolatility * 100)?.toFixed(0)}%</span>
-                      </div>
-                    ))}
-                  </>
-                )}
+            {scannerMsg && <div style={{ fontSize: 11, color: 'var(--text-3)' }}>{scannerMsg}</div>}
+          </div>
+        </Card>
+
+        {/* Scanning Shows */}
+        <Card title="Scanning Shows" icon="target"
+              subtitle={scannerRunning ? `active · ${activePreset}` : 'idle'}
+              actions={<Pill kind={scannerRunning?'live':'off'}>{scannerRunning?'SCANNING':'IDLE'}</Pill>}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, fontSize: 12 }}>
+            <div>
+              <div className="muted" style={{ fontSize: 10, textTransform: 'uppercase' }}>Preset</div>
+              <div style={{ fontWeight: 600 }}>{activePreset || '—'}</div>
+            </div>
+            <div>
+              <div className="muted" style={{ fontSize: 10, textTransform: 'uppercase' }}>Scanner jobs</div>
+              <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
+                {m.monitor.scheduler_jobs.map(j=><Badge key={j} variant="info">{j}</Badge>)}
               </div>
-            )}
-            {ticketMsg && (
-              <div style={{ fontSize: 11, padding: 8, background: 'var(--bg-2)', borderRadius: 6, color: 'var(--text-2)' }}>{ticketMsg}</div>
-            )}
+            </div>
+            <div>
+              <div className="muted" style={{ fontSize: 10, textTransform: 'uppercase' }}>Last tick</div>
+              <div className="mono">{m.monitor.last_tick_iso ? fmtTimeAgo(m.monitor.last_tick_iso) : '—'}</div>
+            </div>
+            <div>
+              <div className="muted" style={{ fontSize: 10, textTransform: 'uppercase' }}>Signals today</div>
+              <div className="mono" style={{ fontWeight: 600, color: 'var(--pos)' }}>
+                {m.scanner.logs.filter(l=>l.signal).length}
+              </div>
+            </div>
           </div>
         </Card>
       </div>
 
-      <Card title="Open positions" icon="dashboard" subtitle={`${ibkrPositions.length || m.positions.length} live`} flush actions={
-        <Btn variant="ghost" size="sm" icon="refresh" onClick={async () => { const p = await safe(api.ibkrPositions); if (p?.positions) setIbkrPositions(p.positions); }} />
-      }>
-        <table className="tbl">
-          <thead><tr>
-            <th>Symbol</th><th>Position</th><th className="num">Qty</th>
-            <th className="num">Avg cost</th><th className="num">Mkt value</th>
-            <th className="num">Unrealized</th>
-          </tr></thead>
-          <tbody>
-            {ibkrPositions.length === 0 && m.positions.length === 0 && (
-              <tr><td colSpan="6" style={{ textAlign: 'center', padding: 32, color: 'var(--text-3)', fontSize: 12 }}>No open positions</td></tr>
+      {/* ── Row 4: Signals Log | Positions ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
+
+        {/* Signals Log */}
+        <Card title="Signals Log" icon="activity" flush>
+          <div style={{ maxHeight: 220, overflowY: 'auto' }}>
+            <div className="scan-row" style={{ background:'var(--bg-2)', fontWeight:600, fontSize:10, textTransform:'uppercase', letterSpacing:0.6, color:'var(--text-3)' }}>
+              <span>Time</span><span></span><span>Price</span><span>RSI</span><span>Message</span>
+            </div>
+            {m.scanner.logs.length === 0 && (
+              <div style={{ padding:20, textAlign:'center', color:'var(--text-3)', fontSize:12 }}>No scans yet</div>
             )}
-            {ibkrPositions.map((p, i) => (
-              <tr key={i}>
-                <td><div className="mono" style={{ fontSize: 11.5, fontWeight: 600 }}>{p.symbol}</div><div className="muted" style={{ fontSize: 10.5 }}>{p.sec_type || p.secType}</div></td>
-                <td><span className="mono">{p.local_symbol || p.localSymbol || '—'}</span></td>
-                <td className="num">{p.position}</td>
-                <td className="num">${(p.avg_cost ?? 0).toFixed(2)}</td>
-                <td className="num">${(p.market_value ?? 0).toFixed(2)}</td>
-                <td className="num" style={{ color: (p.unrealized_pnl ?? 0) >= 0 ? 'var(--pos)' : 'var(--neg)', fontWeight: 600 }}>
-                  {fmtUsd(p.unrealized_pnl ?? 0, true)}
-                </td>
-              </tr>
+            {m.scanner.logs.map((l,i)=>(
+              <div key={i} className="scan-row">
+                <span className="t">{l.t}</span>
+                <span className={`dot ${l.signal?'hit':''}`} />
+                <span className="mono">${l.price.toFixed(2)}</span>
+                <span className="mono" style={{color:l.rsi_ok?'var(--pos)':'var(--text-3)'}}>{l.rsi.toFixed(1)}</span>
+                <span style={{color:l.signal?'var(--pos)':'var(--text-2)',fontWeight:l.signal?600:400}}>{l.msg}</span>
+              </div>
             ))}
-            {ibkrPositions.length === 0 && m.positions.map(p => (
-              <tr key={p.id}>
-                <td><div className="mono" style={{ fontSize: 11.5, fontWeight: 600 }}>{p.symbol}</div><div className="muted" style={{ fontSize: 10.5 }}>{p.topology}</div></td>
-                <td><span className="mono">{p.legs}</span></td>
-                <td className="num">{p.contracts}</td>
-                <td className="num">${p.entry_cost.toFixed(2)}</td>
-                <td className="num">${p.mtm.toFixed(2)}</td>
-                <td className="num" style={{ color: p.pnl >= 0 ? 'var(--pos)' : 'var(--neg)', fontWeight: 600 }}>{fmtUsd(p.pnl, true)} <span style={{ opacity: 0.7, fontSize: 11 }}>({fmtPct(p.pnl_pct)})</span></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+          </div>
+        </Card>
+
+        {/* Positions */}
+        <Card title="Positions" icon="dashboard" subtitle={`${ibkrPositions.length||m.positions.length} open`} flush
+              actions={<Btn variant="ghost" size="sm" icon="refresh" onClick={async()=>{ const p=await safe(api.ibkrPositions); if(p?.positions) setIbkrPositions(p.positions); }} />}>
+          <div style={{ maxHeight: 220, overflowY: 'auto' }}>
+            <table className="tbl">
+              <thead><tr>
+                <th>Symbol</th><th className="num">Qty</th>
+                <th className="num">Avg cost</th><th className="num">Unrealized</th>
+              </tr></thead>
+              <tbody>
+                {ibkrPositions.length===0 && m.positions.length===0 && (
+                  <tr><td colSpan="4" style={{textAlign:'center',padding:24,color:'var(--text-3)',fontSize:12}}>No open positions</td></tr>
+                )}
+                {ibkrPositions.map((p,i)=>(
+                  <tr key={i}>
+                    <td><div className="mono" style={{fontSize:11.5,fontWeight:600}}>{p.symbol}</div><div className="muted" style={{fontSize:10}}>{p.sec_type||p.secType}</div></td>
+                    <td className="num">{p.position}</td>
+                    <td className="num">${(p.avg_cost??0).toFixed(2)}</td>
+                    <td className="num" style={{color:(p.unrealized_pnl??0)>=0?'var(--pos)':'var(--neg)',fontWeight:600}}>{fmtUsd(p.unrealized_pnl??0,true)}</td>
+                  </tr>
+                ))}
+                {ibkrPositions.length===0 && m.positions.map(p=>(
+                  <tr key={p.id}>
+                    <td><div className="mono" style={{fontSize:11.5,fontWeight:600}}>{p.symbol}</div><div className="muted" style={{fontSize:10}}>{p.topology}</div></td>
+                    <td className="num">{p.contracts}</td>
+                    <td className="num">${p.entry_cost.toFixed(2)}</td>
+                    <td className="num" style={{color:p.pnl>=0?'var(--pos)':'var(--neg)',fontWeight:600}}>{fmtUsd(p.pnl,true)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      </div>
+
+      {/* ── Row 5: Order Ticket (full-width) ── */}
+      <Card title="Order Ticket" icon="zap" subtitle={ticketMsg||'submit real combo order'}
+            actions={<Badge variant={connected?'pos':'neutral'}>{connected?'READY':'CONNECT FIRST'}</Badge>}>
+        <div className="ticket">
+          <div style={{ display: 'flex', gap: 8 }}>
+            <div className="field" style={{flex:1}}>
+              <label>Strategy (from config)</label>
+              <input className="inp" value={`${cfg.strategy_type} · ${cfg.topology}`} readOnly />
+            </div>
+            <div className="field" style={{width:90}}>
+              <label>Target DTE</label>
+              <input className="inp" type="number" value={targetDte} onChange={e=>setTargetDte(Number(e.target.value))} />
+            </div>
+            <div className="field" style={{width:110}}>
+              <label>Contracts (0=auto)</label>
+              <input className="inp" type="number" value={contractsOverride} onChange={e=>setContractsOverride(Number(e.target.value))} />
+            </div>
+          </div>
+          <hr className="sep" style={{margin:0}} />
+          <div className="muted" style={{fontSize:11}}>
+            Spread cost target <strong style={{color:'var(--text)'}}>${cfg.spread_cost_target}</strong> ·
+            Width ${cfg.strike_width} · Stop {cfg.stop_loss_pct}% / TP {cfg.take_profit_pct}% / TR {cfg.trailing_stop_pct}%
+          </div>
+          <hr className="sep" style={{margin:'4px 0'}} />
+          <div style={{display:'flex',flexDirection:'column',gap:6,fontSize:11.5}}>
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              <Chip ok={m.risk.current_concurrent<m.risk.max_concurrent}>Concurrent cap ({m.risk.current_concurrent}/{m.risk.max_concurrent})</Chip>
+              <Chip ok={m.risk.daily_loss_used_pct<m.risk.daily_loss_limit_pct}>Daily loss</Chip>
+              <Chip ok={m.risk.market_open}>Market hours</Chip>
+              <Chip ok={!m.risk.event_blackout}>Event window</Chip>
+              <Chip ok={connected}>IBKR connected</Chip>
+            </div>
+          </div>
+          <div style={{display:'flex',gap:6}}>
+            <Btn variant="ghost" size="sm" icon="radar" disabled={chainBusy} onClick={previewChain} style={{flex:1,justifyContent:'center'}}>
+              {chainBusy?'Loading…':'Preview chain'}
+            </Btn>
+            <Btn variant="primary" icon="send" disabled={busy||!connected} onClick={submitOrder} style={{flex:2,justifyContent:'center',padding:'10px'}}>
+              {busy?'Submitting…':'Submit combo LMT'}
+            </Btn>
+          </div>
+          {chainPreview && (
+            <div style={{fontSize:11,padding:8,background:'var(--bg-2)',borderRadius:6,color:'var(--text-2)'}}>
+              {chainPreview.error ? `Chain error: ${chainPreview.error}` : (
+                <>
+                  <div className="mono" style={{marginBottom:4}}>${chainPreview.price?.toFixed(2)} · exp {chainPreview.expiration}</div>
+                  {chainPreview.legs?.length===0 && <div className="muted">No strikes near ATM</div>}
+                  {chainPreview.legs?.map((l,i)=>(
+                    <div key={i} className="mono" style={{display:'flex',justifyContent:'space-between',fontSize:10.5}}>
+                      <span>C {l.strike}</span>
+                      <span>bid {l.bid?.toFixed(2)} / ask {l.ask?.toFixed(2)}</span>
+                      <span className="muted">IV {(l.impliedVolatility*100)?.toFixed(0)}%</span>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          )}
+          {ticketMsg && <div style={{fontSize:11,padding:8,background:'var(--bg-2)',borderRadius:6,color:'var(--text-2)'}}>{ticketMsg}</div>}
+        </div>
       </Card>
 
+      {/* Order confirmation modal */}
       {showTicket && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'grid', placeItems: 'center', zIndex: 200 }} onClick={() => setShowTicket(false)}>
-          <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border-strong)', borderRadius: 10, padding: 24, width: 400, textAlign: 'center' }} onClick={e => e.stopPropagation()}>
+        <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',display:'grid',placeItems:'center',zIndex:200}} onClick={()=>setShowTicket(false)}>
+          <div style={{background:'var(--bg-1)',border:'1px solid var(--border-strong)',borderRadius:10,padding:24,width:400,textAlign:'center'}} onClick={e=>e.stopPropagation()}>
             <Ico name="check" size={36} stroke={2.5} />
-            <h3 style={{ margin: '10px 0 4px' }}>Order submitted</h3>
-            <p className="muted" style={{ margin: 0, fontSize: 12 }}>{ticketMsg}</p>
-            <Btn variant="primary" onClick={() => setShowTicket(false)} style={{ marginTop: 14 }}>Dismiss</Btn>
+            <h3 style={{margin:'10px 0 4px'}}>Order submitted</h3>
+            <p className="muted" style={{margin:0,fontSize:12}}>{ticketMsg}</p>
+            <Btn variant="primary" onClick={()=>setShowTicket(false)} style={{marginTop:14}}>Dismiss</Btn>
           </div>
         </div>
       )}
