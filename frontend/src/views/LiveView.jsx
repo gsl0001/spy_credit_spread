@@ -26,6 +26,7 @@ export function LiveView() {
   const [activePreset, setActivePreset] = useState('');
   const [scannerRunning, setScannerRunning] = useState(false);
   const [scannerMsg, setScannerMsg] = useState('');
+  const [logClearedAt, setLogClearedAt] = useState(null);  // timestamp to filter old logs
 
   const monitorAge = m.monitor.last_tick_iso
     ? Math.floor((new Date() - new Date(m.monitor.last_tick_iso)) / 1000)
@@ -61,7 +62,8 @@ export function LiveView() {
   }, [ibkrAccount]);
 
   useEffect(() => {
-    safe(api.presetsList, []).then(r => setPresetList(Array.isArray(r) ? r : []));
+    // API returns { presets: [...] } — unwrap the wrapper
+    safe(api.presetsList, {}).then(r => setPresetList(Array.isArray(r?.presets) ? r.presets : []));
   }, []);
 
   const submitOrder = useCallback(async () => {
@@ -290,57 +292,71 @@ export function LiveView() {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
 
         {/* Signals Log */}
-        <Card title="Signals Log" icon="activity" flush>
+        <Card title="Signals Log" icon="activity" flush
+              actions={<Btn variant="ghost" size="sm" onClick={() => setLogClearedAt(Date.now())}>Clear</Btn>}>
           <div style={{ maxHeight: 220, overflowY: 'auto' }}>
             <div className="scan-row" style={{ background:'var(--bg-2)', fontWeight:600, fontSize:10, textTransform:'uppercase', letterSpacing:0.6, color:'var(--text-3)' }}>
               <span>Time</span><span></span><span>Price</span><span>RSI</span><span>Message</span>
             </div>
-            {m.scanner.logs.length === 0 && (
-              <div style={{ padding:20, textAlign:'center', color:'var(--text-3)', fontSize:12 }}>No scans yet</div>
-            )}
-            {m.scanner.logs.map((l,i)=>(
-              <div key={i} className="scan-row">
-                <span className="t">{l.t}</span>
-                <span className={`dot ${l.signal?'hit':''}`} />
-                <span className="mono">${l.price.toFixed(2)}</span>
-                <span className="mono" style={{color:l.rsi_ok?'var(--pos)':'var(--text-3)'}}>{l.rsi.toFixed(1)}</span>
-                <span style={{color:l.signal?'var(--pos)':'var(--text-2)',fontWeight:l.signal?600:400}}>{l.msg}</span>
-              </div>
-            ))}
+            {(() => {
+              // Filter out logs that arrived before user hit Clear
+              const visibleLogs = logClearedAt
+                ? m.scanner.logs.filter(l => {
+                    // l.t is HH:MM:SS — compare against today's clearedAt timestamp
+                    const [h, mn, s] = (l.t || '00:00:00').split(':').map(Number);
+                    const logMs = new Date().setHours(h, mn, s, 0);
+                    return logMs > logClearedAt;
+                  })
+                : m.scanner.logs;
+              if (visibleLogs.length === 0) {
+                return <div style={{ padding:20, textAlign:'center', color:'var(--text-3)', fontSize:12 }}>
+                  {scannerRunning ? 'Waiting for first scan…' : 'No scans yet — start a preset scan'}
+                </div>;
+              }
+              return visibleLogs.map((l,i) => (
+                <div key={i} className="scan-row">
+                  <span className="t">{l.t}</span>
+                  <span className={`dot ${l.signal?'hit':''}`} />
+                  <span className="mono">${l.price.toFixed(2)}</span>
+                  <span className="mono" style={{color:l.rsi_ok?'var(--pos)':'var(--text-3)'}}>{l.rsi.toFixed(1)}</span>
+                  <span style={{color:l.signal?'var(--pos)':'var(--text-2)',fontWeight:l.signal?600:400}}>{l.msg}</span>
+                </div>
+              ));
+            })()}
           </div>
         </Card>
 
-        {/* Positions */}
-        <Card title="Positions" icon="dashboard" subtitle={`${ibkrPositions.length||m.positions.length} open`} flush
-              actions={<Btn variant="ghost" size="sm" icon="refresh" onClick={async()=>{ const p=await safe(api.ibkrPositions); if(p?.positions) setIbkrPositions(p.positions); }} />}>
+        {/* Positions — only show IBKR live positions when connected */}
+        <Card title="Positions" icon="dashboard"
+              subtitle={connected ? `${ibkrPositions.length} live` : 'not connected'}
+              flush
+              actions={connected && <Btn variant="ghost" size="sm" icon="refresh" onClick={async()=>{ const p=await safe(api.ibkrPositions); if(p?.positions) setIbkrPositions(p.positions); }} />}>
           <div style={{ maxHeight: 220, overflowY: 'auto' }}>
-            <table className="tbl">
-              <thead><tr>
-                <th>Symbol</th><th className="num">Qty</th>
-                <th className="num">Avg cost</th><th className="num">Unrealized</th>
-              </tr></thead>
-              <tbody>
-                {ibkrPositions.length===0 && m.positions.length===0 && (
-                  <tr><td colSpan="4" style={{textAlign:'center',padding:24,color:'var(--text-3)',fontSize:12}}>No open positions</td></tr>
-                )}
-                {ibkrPositions.map((p,i)=>(
-                  <tr key={i}>
-                    <td><div className="mono" style={{fontSize:11.5,fontWeight:600}}>{p.symbol}</div><div className="muted" style={{fontSize:10}}>{p.sec_type||p.secType}</div></td>
-                    <td className="num">{p.position}</td>
-                    <td className="num">${(p.avg_cost??0).toFixed(2)}</td>
-                    <td className="num" style={{color:(p.unrealized_pnl??0)>=0?'var(--pos)':'var(--neg)',fontWeight:600}}>{fmtUsd(p.unrealized_pnl??0,true)}</td>
-                  </tr>
-                ))}
-                {ibkrPositions.length===0 && m.positions.map(p=>(
-                  <tr key={p.id}>
-                    <td><div className="mono" style={{fontSize:11.5,fontWeight:600}}>{p.symbol}</div><div className="muted" style={{fontSize:10}}>{p.topology}</div></td>
-                    <td className="num">{p.contracts}</td>
-                    <td className="num">${p.entry_cost.toFixed(2)}</td>
-                    <td className="num" style={{color:p.pnl>=0?'var(--pos)':'var(--neg)',fontWeight:600}}>{fmtUsd(p.pnl,true)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            {!connected ? (
+              <div style={{padding:32,textAlign:'center',color:'var(--text-3)',fontSize:12}}>
+                Connect IBKR to see live positions
+              </div>
+            ) : (
+              <table className="tbl">
+                <thead><tr>
+                  <th>Symbol</th><th className="num">Qty</th>
+                  <th className="num">Avg cost</th><th className="num">Unrealized</th>
+                </tr></thead>
+                <tbody>
+                  {ibkrPositions.length === 0 && (
+                    <tr><td colSpan="4" style={{textAlign:'center',padding:24,color:'var(--text-3)',fontSize:12}}>No open positions</td></tr>
+                  )}
+                  {ibkrPositions.map((p,i)=>(
+                    <tr key={i}>
+                      <td><div className="mono" style={{fontSize:11.5,fontWeight:600}}>{p.symbol}</div><div className="muted" style={{fontSize:10}}>{p.sec_type||p.secType}</div></td>
+                      <td className="num">{p.position}</td>
+                      <td className="num">${(p.avg_cost??0).toFixed(2)}</td>
+                      <td className="num" style={{color:(p.unrealized_pnl??0)>=0?'var(--pos)':'var(--neg)',fontWeight:600}}>{fmtUsd(p.unrealized_pnl??0,true)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
         </Card>
       </div>
