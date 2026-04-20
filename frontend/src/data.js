@@ -1,0 +1,56 @@
+export const MOCK = {
+  account: {
+    equity: 0, buying_power: 0, cash: 0, excess_liquidity: 0,
+    daily_pnl: 0, unrealized_pnl: 0, ytd_pnl: 0, open_positions: 0,
+  },
+  spy: {
+    current: 0, change: 0, change_pct: 0,
+    series: [],
+  },
+  monitor: {
+    is_leader: false,
+    leader_info: { pid: null, host: '—', acquired_at: null },
+    last_tick_iso: null,
+    seconds_since_tick: null,
+    monitor_registered: false,
+    scheduler_jobs: [],
+    tick_interval_sec: 15,
+    history: [],
+  },
+  risk: {
+    max_concurrent: 2, current_concurrent: 0,
+    daily_loss_limit_pct: 2.0, daily_loss_used_pct: 0,
+    daily_loss_limit_usd: 0, daily_loss_used_usd: 0,
+    buying_power_used_pct: 0,
+    market_open: false, next_close: '—',
+    event_blackout: false,
+    next_event: { name: '—', date: '—', days_until: '—', window: '—' },
+    sizing_mode: 'targeted_spread', target_pct: 1.0, max_trade_cap: 500,
+    haircut_bps: 5,
+  },
+  alerts: [],
+  positions: [],
+  orders: [],
+  closed: [],
+  dailyPnl: [],
+  scanner: {
+    running: false, mode: 'IBKR', cadence: 'every 15s',
+    last_signal: { fire: false, price: 0, rsi: 0, rsi_ok: false, ema_ok: false, sma200_ok: false, vol_ok: false, vix_ok: false, regime_ok: false, time: null },
+    logs: [],
+  },
+  chain: {
+    spy_px: 0, iv_atm: 0, target_dte: 14, expiry: '—',
+    legs: [],
+    net_debit: 0, max_gain: 0, max_loss: 0, break_even: 0,
+    margin_req: 0, prob_profit: 0,
+  },
+  backtest: {
+    total_return_pct: 0, sharpe: 0, max_dd_pct: 0, win_rate: 0,
+    avg_win: 0, avg_loss: 0, trades: 0,
+    equity: [],
+  },
+  digest: {
+    url_set: false, channel: '—', last_sent: null,
+    cron: '—', last_status: null,
+  },
+};

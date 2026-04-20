@@ -4,7 +4,7 @@
 
 ### *Institutional-Grade Algorithmic Options Research & Trading Platform*
 
-A full-stack platform for backtesting, optimizing, paper trading, and live trading options strategies on SPY (and any yfinance-supported ticker). Three modes in one dashboard: backtester with advanced analytics, Alpaca paper trading with real-time scanning, and Interactive Brokers live trading via TWS.
+A full-stack platform for backtesting, optimizing, paper trading, and live trading options strategies on SPY (and any yfinance-supported ticker). Six modes in one dashboard: backtester with advanced analytics, Alpaca paper trading, Interactive Brokers live trading via TWS, signal scanner, journal, and risk console.
 
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
@@ -37,20 +37,40 @@ A full-stack platform for backtesting, optimizing, paper trading, and live tradi
 
 ```
 spy_credit_spread/
-├── main.py                   # FastAPI backend — REST endpoints, backtest engine, analytics
+├── main.py                   # FastAPI backend — REST endpoints, backtest engine, analytics (31 routes)
 ├── paper_trading.py          # Alpaca integration — positions, orders, signal scanner
 ├── ibkr_trading.py           # IBKR TWS integration — combo orders, positions, heartbeat
 ├── start.py                  # One-command launcher (backend + frontend)
 ├── requirements.txt
+├── core/                     # Production runtime modules
+│   ├── settings.py           # .env loader, runtime config (risk caps, paths)
+│   ├── logger.py             # Structured JSON logging, daily rotation
+│   ├── risk.py               # Pre-trade risk checks: market hours, daily loss, concurrent cap
+│   ├── monitor.py            # Heartbeat tick loop, alert generation
+│   ├── calendar.py           # US market holidays + FOMC/CPI/NFP blackout gate
+│   ├── filters.py            # Entry filters shared by backtest + scanner (parity)
+│   ├── fill_watcher.py       # Order fill FSM with idempotency + timeout handling
+│   ├── leader.py             # Single-leader election via fcntl flock
+│   └── journal.py            # SQLite persistence: positions, orders, fills, scanner_logs
+├── config/
+│   ├── .env.example
+│   └── events_2026.json      # FOMC / CPI / NFP blackout calendar
 ├── strategies/
 │   ├── base.py               # BaseStrategy ABC
 │   ├── builder.py            # Black-Scholes pricer + OptionTopologyBuilder (6 topologies)
 │   ├── consecutive_days.py   # Red/green day mean-reversion strategy
 │   └── combo_spread.py       # SMA/EMA crossover + volume breakout strategy
+├── tests/                    # 274 passing tests across 19 files
 └── frontend/
     └── src/
-        ├── App.jsx            # React 19 SPA — all three modes, ~1,050 lines
-        └── index.css          # Dark theme design system
+        ├── App.jsx           # React 19 SPA shell + routing
+        ├── useBackendData.jsx# Polling hook — heartbeat 5s, scanner 3s, positions 10s
+        ├── api.js            # 27 typed API methods
+        ├── primitives.jsx    # Card, Btn, Pill, Kpi, Chip, Badge, Heartbeat
+        ├── chart.jsx         # SPY sparkline + intraday line
+        ├── topbar.jsx, sidebar.jsx
+        ├── views/            # 6 mode views: Live, Paper, Backtest, Scanner, Journal, Risk
+        └── index.css         # Dark theme design system
 ```
 
 **Backend**: FastAPI + Uvicorn · **Scheduling**: APScheduler BackgroundScheduler
@@ -59,15 +79,18 @@ spy_credit_spread/
 
 ---
 
-## Three Engine Modes
+## Six Sidebar Modes
 
-Switch between modes using the sidebar toggle. The left sidebar (strategy, filters, risk rules, presets) is shared — the same config drives backtesting, paper scanning, and live scanning consistently.
+Switch between modes using the sidebar. Strategy + filter config persists in `localStorage` and drives both backtest and live scanner consistently.
 
 | Mode | Purpose |
 |------|---------|
-| **Backtest** | Simulate strategy over historical data, optimize parameters, review risk metrics |
-| **Paper** | Connect Alpaca paper account, scan live signals, auto-execute, monitor positions & orders |
-| **Live** | Connect IBKR TWS, scan live signals, place real combo orders, kill switch, heartbeat |
+| **Live** | Connect IBKR TWS — account HUD, monitor heartbeat, alerts, SPY chart, combo order ticket, positions table, kill switch |
+| **Paper** | Connect Alpaca paper account — positions, orders, auto-execute on signal |
+| **Backtest** | Simulate strategy over historical data, presets, equity curve, optimizer, regime breakdown |
+| **Scanner** | Background APScheduler signal scanner — interval / after-open / before-close / on-open cadences, auto-execute toggle |
+| **Journal** | SQLite-backed audit trail — open/closed positions, daily P&L, event log, backtest↔live reconciliation |
+| **Risk** | Live pre-trade gate display — concurrent cap, daily loss, market-hours, event blackout, buying-power utilization |
 
 ---
 
@@ -123,14 +146,16 @@ Parameters: `combo_sma1/2/3`, `combo_ema1/2`, `combo_max_bars`, `combo_max_profi
 
 All pricing uses **Black-Scholes** (European) with 21-day rolling historical volatility and live T-bill risk-free rate (^IRX).
 
-| Topology | Description | Direction |
-|----------|-------------|-----------|
-| `vertical_spread` | Bull call spread or bear put spread | bull / bear |
-| `long_call` | ATM long call (auto-swaps to long put on bear) | bull / bear |
-| `long_put` | ATM long put | bear |
-| `straddle` | ATM call + ATM put | neutral |
-| `iron_condor` | OTM put spread + OTM call spread | neutral |
-| `butterfly` | Long ATM, short 2× OTM, long far OTM | neutral |
+| Topology | Description | Direction | Backtest | Live (IBKR) |
+|----------|-------------|-----------|:--------:|:-----------:|
+| `vertical_spread` | Bull call spread or bear put spread | bull / bear | ✅ | ✅ |
+| `long_call` | ATM long call (auto-swaps to long put on bear) | bull / bear | ✅ | ⚠️ MVP scope |
+| `long_put` | ATM long put | bear | ✅ | ⚠️ MVP scope |
+| `straddle` | ATM call + ATM put | neutral | ✅ | ⚠️ MVP scope |
+| `iron_condor` | OTM put spread + OTM call spread | neutral | ✅ | ⚠️ MVP scope |
+| `butterfly` | Long ATM, short 2× OTM, long far OTM | neutral | ✅ | ⚠️ MVP scope |
+
+> **Live execution scope:** Only `vertical_spread` (bull_call) is wired into `/api/ibkr/execute` for the MVP rollout. Other topologies are fully implemented in the backtest engine but require additional QA before live wiring — see `LIVE_TRADING_DEPLOYMENT_PLAN.md`.
 
 **IV Realism Factor**: Multiplied onto historical vol before pricing to account for implied/realized spread. Default `1.15`.
 
@@ -306,52 +331,92 @@ react@19  react-dom@19  vite@8  lightweight-charts@5  recharts  lucide-react
 
 ## API Reference
 
-All endpoints at `http://127.0.0.1:8000`. Interactive docs at `/docs` (Swagger).
+All endpoints at `http://127.0.0.1:8000`. Interactive docs at `/docs` (Swagger). 31 routes total.
+
+### Strategy & Backtest
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/strategies` | List registered strategy plugins |
 | POST | `/api/backtest` | Run backtest → trades, metrics, equity curve, analytics |
 | POST | `/api/optimize` | Grid search two parameters → ranked results |
+| GET | `/api/spy/intraday` | SPY intraday sparkline data |
 | GET | `/api/live_chain` | Live options chain via yfinance |
+
+### Scanner
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/scanner/start` | Start background APScheduler scanner |
+| POST | `/api/scanner/stop` | Stop background scanner |
+| GET | `/api/scanner/status` | Scanner state + recent logs |
+
+### Paper Trading (Alpaca)
+
+| Method | Path | Description |
+|--------|------|-------------|
 | POST | `/api/paper/connect` | Alpaca connection test + account info |
 | POST | `/api/paper/positions` | Open Alpaca positions |
 | POST | `/api/paper/orders` | Recent Alpaca orders |
 | POST | `/api/paper/execute` | Place equity order (buy/sell) |
 | POST | `/api/paper/scan` | Run signal scan on live market data |
-| POST | `/api/scanner/start` | Start background APScheduler scanner |
-| POST | `/api/scanner/stop` | Stop background scanner |
-| GET | `/api/scanner/status` | Scanner state + recent logs |
+
+### Live Trading (IBKR TWS)
+
+| Method | Path | Description |
+|--------|------|-------------|
 | POST | `/api/ibkr/connect` | Connect to TWS + return account summary |
+| POST | `/api/ibkr/heartbeat` | Extended health check — alive, alerts, scheduler status |
+| POST | `/api/ibkr/reconnect` | Force IBKR reconnection |
 | POST | `/api/ibkr/positions` | IBKR portfolio positions |
 | POST | `/api/ibkr/execute` | Place multi-leg combo order |
 | POST | `/api/ibkr/test_order` | Non-filling SPY test order at $1.05 |
 | GET | `/api/ibkr/orders` | Open TWS orders |
 | POST | `/api/ibkr/cancel` | Cancel order by ID |
+| POST | `/api/ibkr/flatten_all` | Kill switch — close all positions immediately |
+| POST | `/api/ibkr/chain_debug` | Step-by-step chain resolution (diagnostic) |
+
+### Journal & Monitor
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/journal/positions` | List open or all positions from SQLite journal |
+| GET | `/api/journal/daily_pnl` | Today + N-day rolling P&L history |
+| GET | `/api/journal/events` | Audit trail event stream |
+| GET | `/api/journal/reconciliation` | Backtest↔live signal/P&L parity report |
+| POST | `/api/monitor/start` | Register monitor + fill watcher background jobs |
+| POST | `/api/monitor/stop` | Unregister scheduler jobs |
+| POST | `/api/monitor/paper_entry` | Dry-run forced entry (test endpoint) |
+| POST | `/api/notify/digest` | Manual trigger for daily digest webhook |
 
 ---
 
 ## Known Issues & Next Steps
 
-### Active Bugs (Not Yet Fixed)
+### Recently Fixed
 
-1. **Silent skip on zero-cost legs** (`main.py:309`) — `if abs(one_cc) < 1e-3` silently discards credit topologies priced near-zero. Should warn or fall back to ATM sizing.
+- ✅ **IBKR order direction** — `/api/ibkr/execute` now derives `BUY`/`SELL` from `spread.net_debit` sign
+- ✅ **Silent skip on zero-cost legs** — pricing fallback added in `strategies/builder.py`
+- ✅ **`scanner_state` thread safety** — single-leader election via `core/leader.py` (fcntl flock) prevents race conditions
+- ✅ **Circular import** — shared types extracted; backend imports cleaned up
 
-2. **Iron condor margin is wrong** — credit spreads return `net_cost < 0`, which adds to equity instead of reserving margin. Correct margin = `(strike_width × 100) − abs(net_credit)` per contract.
+### Active Bugs
 
-3. **Double `compute_indicators` call** (`main.py:574–580`) — engine runs indicators once inside `run_backtest_engine`, then again to build the regime timeline. Adds unnecessary latency.
+1. **Iron condor margin is wrong** — credit spreads return `net_cost < 0`, which adds to equity instead of reserving margin. Correct margin = `(strike_width × 100) − abs(net_credit)` per contract.
 
-4. **IBKR execute always BUYs** (`main.py:879`) — `side = 'BUY'` is hardcoded. Credit/bear positions should open with `SELL`.
+2. **Double `compute_indicators` call** — engine runs indicators once inside `run_backtest_engine`, then again to build the regime timeline. Adds unnecessary latency.
 
-5. **Expiry snap is approximate** — adds `target_dte` calendar days then snaps to nearest weekday. Real SPY expirations are Mon/Wed/Fri. Should pull actual expirations from the live chain.
+3. **Expiry snap is approximate** — adds `target_dte` calendar days then snaps to nearest weekday. Real SPY expirations are Mon/Wed/Fri. Should pull actual expirations from the live chain.
 
-6. **`live_chain` is slow** — calls `t.info` (makes a secondary HTTP request). Should use `t.fast_info` and cache with TTL.
+4. **`live_chain` is slow** — calls `t.info` (makes a secondary HTTP request). Should use `t.fast_info` and cache with TTL.
 
-7. **`scanner_state` not thread-safe** — global dict has no locking. Race condition with `--workers > 1`. Needs `asyncio.Lock` or an external store.
+5. **Duplicate indicator code** — `consecutive_days` and `combo_spread` each compute RSI, EMA, SMA independently. Should share `_add_base_indicators(df, req)` in `base.py`.
 
-8. **Circular import in `paper_trading.py`** — `from main import BacktestRequest, StrategyFactory` creates a circular dependency. Shared types should move to `models.py`.
+6. **Slippage/commission reconciliation report missing** — journal schema persists commission and slippage columns but no `/api/journal/reconciliation` payload yet aggregates them (tracked as I4 in `LIVE_TRADING_DEPLOYMENT_PLAN.md`).
 
-9. **Duplicate indicator code** — `consecutive_days` and `combo_spread` each compute RSI, EMA, SMA independently. Should share `_add_base_indicators(df, req)` in `base.py`.
+7. **Idempotency keys not generated by emitters** — schema enforces uniqueness but scanner + UI don't pass keys on every submit (I5).
+
+8. **No exponential backoff on IBKR reconnect** — `ensure_connected()` retries immediately without backoff (I7).
 
 ---
 

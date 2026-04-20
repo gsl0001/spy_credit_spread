@@ -1,5 +1,27 @@
-from functools import lru_cache
-from typing import List, Optional
+import contextlib
+import functools
+import time as _time
+from typing import List, Optional, Any
+
+# ── TTL cache (replaces lru_cache on data-fetching functions) ─────────────────
+# lru_cache never expires — live scanner would use bars fetched during backtest.
+# 300-second TTL ensures live mode always sees fresh data.
+_TTL_CACHE: dict = {}
+
+def _ttl_cache(ttl: int = 300):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args):
+            key = (fn.__qualname__, args)
+            entry = _TTL_CACHE.get(key)
+            if entry and (_time.monotonic() - entry[0]) < ttl:
+                return entry[1]
+            result = fn(*args)
+            _TTL_CACHE[key] = (_time.monotonic(), result)
+            return result
+        wrapper.cache_clear = lambda: _TTL_CACHE.clear()
+        return wrapper
+    return decorator
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -16,10 +38,46 @@ from strategies.builder import OptionTopologyBuilder, bs_call_price, bs_put_pric
 # Trading & Scheduler imports
 from ibkr_trading import get_ib_connection
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 
-app = FastAPI(title="SPY Options Backtesting Engine")
+# Initialise structured JSON logging (I1) before anything else logs.
+from core.logger import configure_root_logging, log_event
+import logging as _logging
+configure_root_logging()
+_startup_log = _logging.getLogger("main")
+log_event(_startup_log, "server_startup", message="FastAPI app initialising")
+
+_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(application):
+    global _MAIN_LOOP
+    _MAIN_LOOP = asyncio.get_running_loop()
+    yield
+    _MAIN_LOOP = None
+
+
+app = FastAPI(title="SPY Options Backtesting Engine", lifespan=_lifespan)
+
+
+def _safe_json(obj):
+    """Recursively replace NaN/Inf floats with None so JSONResponse doesn't crash.
+
+    IBKR returns IEEE-754 NaN for quotes when the market is closed.  Python's
+    ``json`` module serialises NaN as the bare token ``NaN`` which is not valid
+    JSON-RFC-8259, and FastAPI's JSONResponse raises ``ValueError`` on it.
+    """
+    import math
+    if isinstance(obj, dict):
+        return {k: _safe_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_safe_json(v) for v in obj]
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    return obj
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,11 +101,30 @@ scanner_state = {
     "mode": "paper" # "paper" (Alpaca) or "ibkr"
 }
 
+# I11: hydrate scanner log buffer from SQLite so history survives restarts.
+try:
+    from core.journal import get_journal as _get_journal_boot
+    _persisted = _get_journal_boot().list_scan_logs(limit=50)
+    if _persisted:
+        scanner_state["logs"] = _persisted
+        scanner_state["last_run"] = _persisted[0].get("time")
+        log_event(
+            _startup_log,
+            "scanner_logs_hydrated",
+            count=len(_persisted),
+            message="restored scanner history from journal",
+        )
+except Exception as _hydrate_err:  # pragma: no cover - best effort
+    _startup_log.warning("scanner log hydrate failed: %s", _hydrate_err)
+
 class BacktestRequest(BaseModel):
     ticker: str = "SPY"
     years_history: int = 2
     capital_allocation: float = 10000.0
     contracts_per_trade: int = 1
+    # use_request §2 — single dropdown:
+    #   "fixed" | "dynamic_risk" | "targeted_spread" | "" (legacy/derive)
+    position_size_method: str = ""
     use_dynamic_sizing: bool = False
     risk_percent: float = 5.0
     max_trade_cap: float = 0.0
@@ -106,6 +183,10 @@ class BacktestRequest(BaseModel):
     max_allocation_cap: float = 2500.0 # max $$ risk per trade
     realism_factor: float = 1.15 # IV Multiplier
 
+    # I9: bid-ask haircut — fraction of mid-price paid as spread on each fill.
+    # 0.02 = 2% adverse fill (mid ± half spread).  Default 0.0 for backward compat.
+    bid_ask_haircut: float = 0.0
+
 class OptimizerRequest(BaseModel):
     base_config: BacktestRequest = BacktestRequest()
     param_x: str = "entry_red_days"
@@ -134,7 +215,7 @@ class StrategyFactory:
 
 
 # ── Data fetching ──────────────────────────────────────────────────────────
-@lru_cache(maxsize=10)
+@_ttl_cache(300)
 def fetch_historical_data(ticker: str, years: int):
     period = f"{years}y"
     df = yf.download(ticker, period=period, progress=False)
@@ -148,7 +229,7 @@ def fetch_historical_data(ticker: str, years: int):
     return df
 
 
-@lru_cache(maxsize=5)
+@_ttl_cache(300)
 def fetch_risk_free_rate():
     """Fetch 13-week T-Bill (^IRX) as a risk-free rate proxy."""
     try:
@@ -159,7 +240,7 @@ def fetch_risk_free_rate():
     except Exception:
         return 0.045
 
-@lru_cache(maxsize=5)
+@_ttl_cache(300)
 def fetch_vix_data(years: int):
     """Fetch VIX index data for regime/volatility filtering."""
     try:
@@ -307,9 +388,16 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
                     )
                     
                     one_cc = pos["net_cost"]
-                    if abs(one_cc) < 1e-3 and req.topology != "straddle": 
+                    if abs(one_cc) < 1e-3 and req.topology != "straddle":
                         # Fallback for weird pricing
                         continue
+
+                    # I9: bid-ask haircut — you always fill at a price worse than
+                    # theoretical mid.  For a debit you pay more; for a credit you
+                    # receive less.  Formula: one_cc += |one_cc| * haircut preserves
+                    # sign while making the fill adversarially worse.
+                    if req.bid_ask_haircut > 0:
+                        one_cc = one_cc + abs(one_cc) * req.bid_ask_haircut
 
                     if req.use_targeted_spread:
                         # Targeted spread sizing: allocation based on % of capital
@@ -373,9 +461,13 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
 
             if should_exit or stop_exit or tp_exit or ts_exit:
                 ec = req.commission_per_contract * sc * len(current_entry["legs"])
-                equity += cv - ec
+                # I9: apply bid-ask haircut at exit — you close at a price worse
+                # than mid.  cv_exit < cv_mid for debits (selling at bid) and
+                # cv_exit > cv_mid for credits (buying back at ask).
+                cv_exit = cv - abs(cv) * req.bid_ask_haircut if req.bid_ask_haircut > 0 else cv
+                equity += cv_exit - ec
                 tc = current_entry.get("commission", 0) + ec
-                pnl = cv - current_entry["entry_cost"] - tc
+                pnl = cv_exit - current_entry["entry_cost"] - tc
                 
                 final_reason = reason
                 if stop_exit: final_reason = "stop_loss"
@@ -385,7 +477,7 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
                 trades.append({
                     "entry_date": current_entry["entry_date"], "exit_date": date,
                     "entry_spy": round(current_entry["entry_spy"], 2), "exit_spy": round(S, 2),
-                    "spread_cost": round(current_entry["entry_cost"], 2), "spread_exit": round(cv, 2),
+                    "spread_cost": round(current_entry["entry_cost"], 2), "spread_exit": round(cv_exit, 2),
                     "pnl": round(float(pnl), 2), "contracts": sc, "days_held": days_held,
                     "commission": round(tc, 2), "win": bool(pnl > 0),
                     "stopped_out": bool(stop_exit or ts_exit),
@@ -654,6 +746,34 @@ def live_chain(ticker: str = "SPY"):
 
 
 # ── Optimizer endpoint ─────────────────────────────────────────────────────
+@app.get("/api/strategies")
+def list_strategies():
+    """Return all registered strategies and their parameter schemas."""
+    out = []
+    for sid, cls in StrategyFactory.STRATEGIES.items():
+        try:
+            schema = cls.get_schema()
+        except Exception:  # noqa: BLE001
+            schema = {}
+        out.append({
+            "id": sid,
+            "name": getattr(cls(), "name", sid),
+            "schema": schema,
+        })
+    return {"strategies": out}
+
+
+@app.get("/api/strategies/{strategy_id}/schema")
+def get_strategy_schema(strategy_id: str):
+    cls = StrategyFactory.STRATEGIES.get(strategy_id)
+    if cls is None:
+        return {"error": "unknown_strategy", "strategy_id": strategy_id}
+    try:
+        return {"strategy_id": strategy_id, "schema": cls.get_schema()}
+    except Exception as e:  # noqa: BLE001
+        return {"error": "schema_failed", "detail": str(e)}
+
+
 @app.post("/api/optimize")
 def optimize(req: OptimizerRequest):
     try:
@@ -736,56 +856,142 @@ class ScannerConfigRequest(BaseModel):
     creds: dict = {}
 
 def run_market_scan():
-    """Background task for scanning market based on frequency."""
+    """Background task for scanning market based on frequency.
+
+    C8: Uses core.filters.apply_filters for parity with backtest engine.
+    """
     if not scanner_state["active"]: return
-    
+
     current_time = datetime.now().isoformat()
     config = scanner_state.get("config", {})
     mode = scanner_state.get("mode", "paper")
-    
+
     try:
         from paper_trading import scan_signal
+        from core.filters import apply_filters
         # Perform the scan using the logic in paper_trading (which is generic)
         res = scan_signal("", "", config) # Alpaca keys not needed for just scanning YF data
-        
+
         signal = res.get("signal", False)
         price = res.get("price", 0)
         rsi = res.get("rsi", 0)
-        
+
+        # C8: Apply the FULL filter set (SMA200, Volume, VIX, regime) that
+        # the backtest engine uses. scan_signal only checks RSI + EMA.
+        filter_rejected = ""
+        if signal:
+            # Build a row-like dict from the scan result + config
+            row = res.get("row_data", {})
+            if row:
+                # Wrap config as a namespace so apply_filters can read attrs
+                class _Cfg:
+                    pass
+                cfg = _Cfg()
+                for k, v in config.items():
+                    setattr(cfg, k, v)
+                allowed, filter_rejected = apply_filters(row, cfg)
+                if not allowed:
+                    signal = False
+
         log_entry = {
             "time": current_time,
             "signal": signal,
             "price": price,
             "rsi": rsi,
-            "msg": f"Scan completed. Signal: {'🟢' if signal else '⚪'}",
-            "details": res
+            "msg": f"Scan completed. Signal: {'YES' if signal else 'NO'}"
+                   + (f" (filtered: {filter_rejected})" if filter_rejected else ""),
+            "details": res,
         }
-        
-        # Limit logs to last 50
+
+        # Limit logs to last 50 (in-memory)
         scanner_state["logs"].insert(0, log_entry)
         if len(scanner_state["logs"]) > 50:
             scanner_state["logs"].pop()
-            
+
+        # I11: persist to SQLite so scanner history survives restarts.
+        try:
+            from core.journal import get_journal
+            get_journal().record_scan_log(
+                time=current_time,
+                signal=bool(signal),
+                price=float(price) if price is not None else None,
+                rsi=float(rsi) if rsi is not None else None,
+                msg=log_entry["msg"],
+                details=res if isinstance(res, dict) else {"raw": str(res)},
+            )
+        except Exception as _persist_err:
+            import logging as _pl
+            _pl.getLogger(__name__).warning(
+                "scanner log persist failed: %s", _persist_err
+            )
+
         scanner_state["last_run"] = current_time
-        
+
         # Auto-execute when enabled
         if signal and scanner_state.get("auto_execute", False):
             mode = scanner_state.get("mode", "paper")
             creds = scanner_state.get("creds") or {}
             if mode == "paper" and creds.get("api_key"):
-                from paper_trading import place_equity_order
-                side = "sell" if config.get("direction", "bull") == "bear" else "buy"
-                place_equity_order(creds["api_key"], creds["api_secret"],
-                                   config.get("ticker", "SPY"),
-                                   config.get("contracts_per_trade", 1) * 100, side)
+                # I5: Generate an idempotency key scoped to date + symbol + strategy
+                # so rapid scanner fires on the same day are suppressed as duplicates.
+                _scan_date = datetime.now().strftime("%Y-%m-%d")
+                _scan_symbol = config.get("ticker", "SPY")
+                _scan_strategy = config.get("strategy_id", "default")
+                _idem_key = f"scan:{_scan_date}:{_scan_symbol}:{_scan_strategy}"
+
+                from core.journal import get_journal as _get_j, Order as _Order
+                import uuid as _uuid_scan
+                _jnl = _get_j()
+                _existing = _jnl.get_order_by_idempotency(_idem_key)
+                if _existing is not None:
+                    import logging as _scan_log
+                    _scan_log.getLogger(__name__).info(
+                        "duplicate scan signal suppressed (key=%s)", _idem_key
+                    )
+                else:
+                    from paper_trading import place_equity_order
+                    side = "sell" if config.get("direction", "bull") == "bear" else "buy"
+                    place_equity_order(creds["api_key"], creds["api_secret"],
+                                       _scan_symbol,
+                                       config.get("contracts_per_trade", 1) * 100, side)
+                    _now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                    _jnl.record_order(_Order(
+                        id=str(_uuid_scan.uuid4()),
+                        position_id=None,
+                        broker="paper",
+                        broker_order_id=None,
+                        side=side.upper(),
+                        limit_price=None,
+                        status="submitted",
+                        submitted_at=_now_iso,
+                        kind="entry",
+                        idempotency_key=_idem_key,
+                    ))
 
     except Exception as e:
-        print(f"Error in background scan: {e}")
-        scanner_state["logs"].insert(0, {
+        import logging
+        logging.getLogger(__name__).warning("Background scan error: %s", e)
+        err_entry = {
             "time": current_time,
             "signal": False,
-            "msg": f"❌ Error: {str(e)}"
-        })
+            "msg": f"Error: {str(e)}"
+        }
+        scanner_state["logs"].insert(0, err_entry)
+        if len(scanner_state["logs"]) > 50:
+            scanner_state["logs"].pop()
+        # I11: persist error events too, so operators can see failures post-hoc.
+        try:
+            from core.journal import get_journal
+            get_journal().record_scan_log(
+                time=current_time,
+                signal=False,
+                price=None,
+                rsi=None,
+                msg=err_entry["msg"],
+                details={"error": str(e)},
+            )
+        except Exception:
+            pass
 
 @app.post("/api/scanner/start")
 def start_scanner(req: ScannerConfigRequest):
@@ -838,6 +1044,91 @@ def stop_scanner():
 def get_scanner_status():
     return scanner_state
 
+
+# ── Scanner presets (use_request §4) ──────────────────────────────────────
+
+from core.presets import PresetStore as _PresetStore, ScannerPreset as _ScannerPreset
+
+_preset_store = _PresetStore()
+
+
+@app.get("/api/presets")
+def list_presets():
+    return {"presets": [p.to_dict() for p in _preset_store.list()]}
+
+
+@app.get("/api/presets/{name}")
+def get_preset(name: str):
+    p = _preset_store.get(name)
+    if p is None:
+        return {"error": "not_found", "name": name}
+    return p.to_dict()
+
+
+@app.post("/api/presets")
+def save_preset(payload: dict):
+    try:
+        preset = _ScannerPreset.from_dict(payload)
+    except (KeyError, ValueError, TypeError) as e:
+        return {"error": "invalid_preset", "detail": str(e)}
+    saved = _preset_store.save(preset)
+    return {"saved": True, "preset": saved.to_dict()}
+
+
+@app.delete("/api/presets/{name}")
+def delete_preset(name: str):
+    ok = _preset_store.delete(name)
+    return {"deleted": ok, "name": name}
+
+
+# ── Preset-driven scanner (use_request §4) ────────────────────────────────
+
+from core.scanner import Scanner as _Scanner, PresetRequired as _PresetRequired
+
+_preset_scanner = _Scanner(store=_preset_store)
+
+
+@app.post("/api/scanner/preset/start")
+def start_preset_scanner(payload: dict):
+    name = (payload or {}).get("name")
+    if not name:
+        return {"error": "missing_preset_name"}
+    try:
+        preset = _preset_scanner.load_preset(name)
+    except KeyError as e:
+        return {"error": "preset_not_found", "detail": str(e)}
+    return {"started": True, "preset": preset.to_dict()}
+
+
+@app.post("/api/scanner/preset/tick")
+def tick_preset_scanner():
+    """Manual tick — useful for tests + UI 'Scan Now' button."""
+    try:
+        signals = _preset_scanner.tick()
+    except _PresetRequired as e:
+        return {"error": "preset_required", "detail": str(e)}
+    return {
+        "signals": [s.to_dict() for s in signals],
+        "history": _preset_scanner.history(limit=20),
+    }
+
+
+@app.post("/api/scanner/preset/stop")
+def stop_preset_scanner():
+    _preset_scanner.stop()
+    return {"stopped": True}
+
+
+@app.get("/api/scanner/preset/status")
+def preset_scanner_status():
+    p = _preset_scanner.active_preset
+    return {
+        "active": _preset_scanner.is_active,
+        "preset": p.to_dict() if p else None,
+        "history": _preset_scanner.history(limit=20),
+    }
+
+
 class IBKRConnectRequest(BaseModel):
     host: str = "127.0.0.1"
     port: int = 7497
@@ -861,77 +1152,303 @@ async def ibkr_positions(req: IBKRConnectRequest):
 
 class IBKROrderRequest(BaseModel):
     creds: IBKRConnectRequest
-    symbol: str
-    topology: str
-    direction: str
-    contracts: int
+    symbol: str = "SPY"
+    topology: str = "vertical_spread"
+    direction: str = "bull_call"
+    contracts: int = 0               # 0 = auto-size from config
     strike_width: int = 5
     target_dte: int = 14
+    spread_cost_target: float = 250.0
+    # Sizing overrides (0 = use SETTINGS defaults)
+    position_size_method: str = ""  # "fixed"|"dynamic_risk"|"targeted_spread"|""
+    use_dynamic_sizing: bool = False
+    use_targeted_spread: bool = False
+    risk_percent: float = 5.0
+    target_spread_pct: float = 2.0
+    max_allocation_cap: float = 2500.0
+    max_trade_cap: float = 0.0
+    # Risk overrides stored per-position
+    stop_loss_pct: float = 50.0
+    take_profit_pct: float = 50.0
+    trailing_stop_pct: float = 0.0
+
 
 @app.post("/api/ibkr/execute")
 async def ibkr_execute(req: IBKROrderRequest):
-    trader, msg = await get_ib_connection(req.creds.model_dump())
-    if not trader: return {"error": msg}
-    
-    # 1. Fetch current market context (approximate with latest data)
-    raw_df = fetch_historical_data(req.symbol, 1)
-    if len(raw_df) == 0: return {"error": "Could not fetch underlying data for strikes."}
-    
-    latest_row = raw_df.iloc[-1]
-    S = float(latest_row['Close'])
-    # Recompute HV or use a default
-    log_ret = np.log(raw_df['Close'] / raw_df['Close'].shift(1))
-    sigma = (log_ret.rolling(window=21).std().iloc[-1] * np.sqrt(252))
-    if pd.isna(sigma): sigma = 0.20
-    
-    # 2. Construct legs based on topology
-    T = req.target_dte / 365.25
-    RISK_FREE_RATE = fetch_risk_free_rate()
-    
-    pos = OptionTopologyBuilder.construct_legs(
-        topology=req.topology,
-        direction=req.direction,
-        S=S,
-        T=T,
-        r=RISK_FREE_RATE,
-        sigma=sigma,
-        target_cost=0, # Market order for live usually
-        strike_width=req.strike_width
+    """Live order path — uses real chain, risk checks, journal, and fill watcher."""
+    import uuid as _uuid
+    from core.journal import Position, Order, get_journal
+    from core.risk import (
+        AccountSnapshot, RiskContext, RiskLimits, evaluate_pre_trade,
+        size_position, sizing_mode_from_request,
     )
-    
-    # 3. Format legs for IBKR (YYYMMDD string format)
-    # Note: Modern IBKR requires proper expiry dates. 
-    # For this backtester, we'll approximate the nearest Friday.
-    # For this backtester, we'll approximate the nearest available daily.
-    # SPY has M/W/F and now daily expiries. 
-    # For simplicity, we search for the nearest date that isn't a weekend.
-    import datetime
-    today = datetime.date.today()
-    expiry_date = today + datetime.timedelta(days=req.target_dte)
-    while expiry_date.weekday() >= 5: # Saturday=5, Sunday=6
-        expiry_date += datetime.timedelta(days=1)
-    expiry_str = expiry_date.strftime('%Y%m%d')
+    from core.chain import resolve_bull_call_spread
+    from core.calendar import load_event_calendar
+    from core.settings import SETTINGS
 
-    ib_legs = []
-    for leg in pos["legs"]:
-        ib_legs.append({
-            "type": leg["type"],
-            "strike": leg["strike"],
-            "expiry": expiry_str,
-            "side": leg["side"]
+    journal = get_journal()
+
+    # 1. Connect to IBKR
+    trader, msg = await get_ib_connection(req.creds.model_dump())
+    if not trader:
+        return {"error": msg}
+
+    # 2. Fetch account snapshot for risk checks
+    try:
+        acct = await trader.get_account_summary()
+    except Exception as e:
+        return {"error": f"account_summary_failed: {e}"}
+
+    account = AccountSnapshot(
+        equity=acct.get("equity", 0),
+        buying_power=acct.get("buying_power", 0),
+        excess_liquidity=acct.get("excess_liquidity", 0),
+        daily_pnl=acct.get("daily_pnl", 0),
+    )
+
+    # 3. Resolve real option chain from IBKR (C4 + C5 fixes)
+    spread = await resolve_bull_call_spread(
+        trader, req.symbol, req.target_dte, req.spread_cost_target,
+        max_width=req.strike_width + 35,
+    )
+    if spread is None:
+        journal.log_event("chain_resolve_failed", subject=req.symbol)
+        return {"error": "Could not resolve live option chain. Check TWS data subscriptions."}
+
+    # 4. Position sizing (C9)
+    mode = sizing_mode_from_request(req)
+    if req.contracts > 0:
+        contracts = req.contracts
+    else:
+        contracts = size_position(
+            equity=account.equity,
+            debit_per_contract=spread.net_debit,
+            margin_per_contract=spread.margin_req,
+            mode=mode,
+            fixed_contracts=max(req.contracts, 1),
+            risk_percent=req.risk_percent,
+            max_trade_cap=req.max_trade_cap,
+            target_spread_pct=req.target_spread_pct,
+            max_allocation_cap=req.max_allocation_cap,
+            excess_liquidity=account.excess_liquidity,
+        )
+    if contracts <= 0:
+        return {"error": "sizing_zero", "detail": "Position size computed to 0 contracts."}
+
+    # 5. Pre-trade risk check (C3)
+    events = load_event_calendar()
+    ctx = RiskContext(
+        account=account,
+        open_positions=len(journal.list_open()),
+        today_realized_pnl=journal.today_realized_pnl(),
+        debit_per_contract=spread.net_debit,
+        margin_per_contract=spread.margin_req,
+        contracts=contracts,
+        target_dte=req.target_dte,
+        limits=RiskLimits.from_settings(),
+        events=events,
+    )
+    decision = evaluate_pre_trade(ctx)
+    if not decision.allowed:
+        journal.log_event("risk_rejected", subject=req.symbol, payload={
+            "reason": decision.reason, **decision.details,
         })
+        return {"error": "risk_rejected", "reason": decision.reason, "details": decision.details}
 
-    # 4. Fetch current midpoint for the combo
+    # 6. Determine order side from spread type (C5 fix — no more hardcoded BUY)
+    side = "BUY" if spread.net_debit > 0 else "SELL"
+
+    # 7. Compute limit price with haircut
+    haircut = SETTINGS.risk.limit_price_haircut
+    ib_legs = spread.as_ib_legs()
     midpoint = await trader.get_combo_midpoint(req.symbol, ib_legs)
-    
-    # 5. Place the order
-    # For credit spreads, mid is usually negative. 
-    # For debit spreads, mid is positive.
-    # LimitOrder in combo structures typically uses exactly what the mid suggests.
-    side = 'BUY' 
-    res = await trader.place_combo_order(req.symbol, ib_legs, req.contracts, side=side, lmtPrice=midpoint)
-    
-    return res
+    if midpoint is None or midpoint <= 0:
+        # Fall back to chain-derived mid
+        midpoint = abs(spread.net_debit) / 100.0
+    hc = haircut * abs(midpoint)
+    limit_price = round(midpoint - hc if side == "BUY" else midpoint + hc, 2)
+
+    # 8. Submit order
+    pos_id = str(_uuid.uuid4())
+    order_id = str(_uuid.uuid4())
+    idem_key = f"entry:{pos_id}"
+    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    try:
+        res = await trader.place_combo_order(
+            req.symbol, ib_legs, contracts, side=side, lmtPrice=limit_price,
+        )
+    except Exception as e:
+        journal.log_event("order_submit_failed", subject=req.symbol, payload={"error": str(e)})
+        return {"error": f"order_submit_failed: {e}"}
+
+    broker_order_id = str(res.get("orderId", "")) if isinstance(res, dict) else ""
+
+    # 9. Journal the position + entry order (C1)
+    journal.open_position(Position(
+        id=pos_id,
+        symbol=req.symbol,
+        topology=spread.topology,
+        direction=spread.direction,
+        contracts=contracts,
+        entry_cost=spread.net_debit * contracts,
+        entry_time=now_iso,
+        expiry=spread.expiry,
+        state="pending",
+        high_water_mark=abs(spread.net_debit) / 100.0,
+        broker="ibkr",
+        legs=tuple(leg.__dict__ if hasattr(leg, '__dict__') else leg for leg in ib_legs),
+        meta={
+            "combo_type": "debit" if spread.net_debit > 0 else "credit",
+            "stop_loss_pct": req.stop_loss_pct,
+            "take_profit_pct": req.take_profit_pct,
+            "trailing_stop_pct": req.trailing_stop_pct,
+            "underlying_price": spread.underlying_price,
+            "implied_vol": spread.implied_vol,
+        },
+    ))
+    journal.record_order(Order(
+        id=order_id,
+        position_id=pos_id,
+        broker="ibkr",
+        broker_order_id=broker_order_id or None,
+        side=side,
+        limit_price=limit_price,
+        status="submitted",
+        submitted_at=now_iso,
+        kind="entry",
+        idempotency_key=idem_key,
+    ))
+    journal.log_event("entry_submitted", subject=pos_id, payload={
+        "symbol": req.symbol, "contracts": contracts, "side": side,
+        "limit": limit_price, "mid": midpoint, "expiry": spread.expiry,
+        "K_long": spread.meta.get("K_long"), "K_short": spread.meta.get("K_short"),
+        "broker_order_id": broker_order_id,
+    })
+
+    return {
+        "success": True,
+        "position_id": pos_id,
+        "order_id": order_id,
+        "broker_order_id": broker_order_id,
+        "symbol": req.symbol,
+        "direction": spread.direction,
+        "expiry": spread.expiry,
+        "contracts": contracts,
+        "side": side,
+        "limit_price": limit_price,
+        "midpoint": midpoint,
+        "net_debit": spread.net_debit,
+        "K_long": spread.meta.get("K_long"),
+        "K_short": spread.meta.get("K_short"),
+        "underlying_price": spread.underlying_price,
+    }
+@app.post("/api/ibkr/flatten_all")
+async def ibkr_flatten_all(req: IBKRConnectRequest):
+    """C6: Kill switch — close every open position at market mid. One-button panic."""
+    from core.journal import get_journal
+    from core.monitor import submit_exit_order
+
+    journal = get_journal()
+    trader, msg = await get_ib_connection(req.model_dump())
+    if not trader:
+        return {"error": msg}
+
+    open_positions = journal.list_open()
+    if not open_positions:
+        return {"closed": 0, "msg": "No open positions."}
+
+    results = []
+    for pos in open_positions:
+        if pos.state not in ("open", "closing"):
+            continue
+        try:
+            legs_list = [dict(leg) for leg in pos.legs]
+            mid = await trader.get_combo_midpoint(pos.symbol, legs_list)
+            if mid is None or mid <= 0:
+                mid = 0.01  # market-close fallback
+            res = await submit_exit_order(
+                trader, pos, float(mid), "manual_flatten", journal, haircut_pct=0.0,
+            )
+            results.append({"position_id": pos.id, **res})
+        except Exception as e:
+            results.append({"position_id": pos.id, "error": str(e)})
+
+    journal.log_event("flatten_all", payload={"count": len(results)})
+    return {"closed": len(results), "results": results}
+
+
+@app.post("/api/ibkr/chain_debug")
+async def ibkr_chain_debug(
+    req: IBKRConnectRequest,
+    symbol: str = "SPY",
+    target_dte: int = 7,
+    target_cost: float = 150.0,
+):
+    """Diagnose chain resolution step-by-step without placing an order.
+
+    Returns a detailed breakdown of each resolution step plus a synthetic
+    fallback so you can see what the paper_entry would use.  Useful for
+    verifying TWS data subscriptions and market-hours constraints.
+    """
+    import traceback as _tb
+    import math as _math
+    try:
+        from core.chain import (
+            resolve_bull_call_spread_with_diagnostics,
+            build_synthetic_spread,
+        )
+        trader, msg = await get_ib_connection(req.model_dump())
+        if not trader:
+            return {"error": msg}
+
+        spread, diag = await resolve_bull_call_spread_with_diagnostics(
+            trader, symbol, target_dte, target_cost, quote_wait=2.0
+        )
+
+        # NaN guard: IBKR returns IEEE-754 NaN for closed-market quotes.
+        # NaN is truthy so `nan or 0` == nan, and nan<=0 is False — yfinance
+        # branch would be skipped.  Force to 0.0 so synthetic fetches price.
+        _raw_und = diag.get("underlying") or 0.0
+        _underlying_hint = 0.0 if (
+            _raw_und is None or not isinstance(_raw_und, (int, float))
+            or _math.isnan(_raw_und) or _math.isinf(_raw_und)
+        ) else float(_raw_und)
+        synthetic = build_synthetic_spread(
+            symbol=symbol,
+            target_dte=target_dte,
+            target_cost=target_cost,
+            underlying=_underlying_hint,
+        )
+
+        return _safe_json({
+            "live_chain": {
+                "resolved": spread is not None,
+                "net_debit": spread.net_debit if spread else None,
+                "K_long": spread.meta.get("K_long") if spread else None,
+                "K_short": spread.meta.get("K_short") if spread else None,
+                "expiry": spread.expiry if spread else None,
+            },
+            "diagnostics": diag,
+            "synthetic_chain": {
+                "available": synthetic is not None,
+                "net_debit": synthetic.net_debit if synthetic else None,
+                "K_long": synthetic.meta.get("K_long") if synthetic else None,
+                "K_short": synthetic.meta.get("K_short") if synthetic else None,
+                "underlying": synthetic.underlying_price if synthetic else None,
+                "hv_sigma": synthetic.meta.get("hv_sigma") if synthetic else None,
+            },
+            "recommendation": (
+                "live chain available — use paper_entry normally"
+                if spread else
+                "live chain unavailable (market closed or no subscription) — "
+                "paper_entry will use synthetic_bs pricing"
+            ),
+        })
+    except BaseException as _exc:
+        return {"error": str(_exc), "traceback": _tb.format_exc()}
+
+
 @app.post("/api/ibkr/test_order")
 async def ibkr_test_order(req: IBKRConnectRequest):
     trader, msg = await get_ib_connection(req.model_dump())
@@ -960,22 +1477,150 @@ async def ibkr_cancel_order(req: dict):
 
 @app.post("/api/ibkr/heartbeat")
 async def ibkr_heartbeat(req: IBKRConnectRequest):
-    """Lightweight liveness check — does not reconnect, just reports status."""
+    """C11 + I10: Extended liveness check.
+
+    Returns socket state, journal / scheduler health, leader state, plus I10
+    UI-facing alert flags: daily-loss consumption, monitor-tick staleness,
+    and dropped-socket signal. The UI surfaces these as banners.
+    """
     from ibkr_trading import _ib_instances, HAS_IBSYNC
+    from core.journal import get_journal
+    from core.leader import is_leader, current_leader_info
+    from core.risk import RiskLimits
+    from dataclasses import asdict as _asdict
+
+    leader_info = current_leader_info()
+    result = {
+        "alive": False,
+        "status": "unavailable",
+        "ibkr_available": HAS_IBSYNC,
+        "journal_ok": False,
+        "open_positions": 0,
+        "today_pnl": 0.0,
+        "today_trades": 0,
+        "scheduler_jobs": [],
+        "monitor_registered": False,
+        "is_leader": is_leader(),
+        "leader_info": _asdict(leader_info) if leader_info else None,
+        # I10 defaults (populated below).
+        "daily_loss_pct_used": 0.0,
+        "daily_loss_warning": False,
+        "daily_loss_limit_pct": 0.0,
+        "monitor_last_tick_iso": _last_monitor_tick_iso,
+        "monitor_seconds_since_tick": None,
+        "monitor_stalled": False,
+        "ibkr_dropped": False,
+        "alerts": [],
+    }
+
+    # Journal health + daily-loss consumption (I10).
+    try:
+        journal = get_journal()
+        result["journal_ok"] = True
+        result["open_positions"] = len(journal.list_open())
+        today_pnl = journal.today_realized_pnl()
+        result["today_pnl"] = today_pnl
+        result["today_trades"] = journal.today_trade_count()
+
+        # Compute % of daily-loss limit consumed.
+        try:
+            limits = RiskLimits.from_settings()
+            result["daily_loss_limit_pct"] = limits.daily_loss_limit_pct
+            # Only losses (negative P&L) count against the limit.
+            loss = -today_pnl if today_pnl < 0 else 0.0
+            # Use a coarse equity estimate — either last known snapshot or 1.
+            equity_est = 0.0
+            try:
+                from core.settings import SETTINGS as _S
+                equity_est = float(
+                    getattr(_S.risk, "assumed_equity_for_alerts", 0.0) or 0.0
+                )
+            except Exception:
+                equity_est = 0.0
+            if equity_est > 0 and limits.daily_loss_limit_pct > 0:
+                pct_used = (loss / equity_est * 100.0) / limits.daily_loss_limit_pct
+                result["daily_loss_pct_used"] = round(pct_used * 100.0, 2)
+                if pct_used >= 0.8:
+                    result["daily_loss_warning"] = True
+                    result["alerts"].append({
+                        "level": "warning",
+                        "code": "daily_loss_approaching",
+                        "message": (
+                            f"Daily loss at {result['daily_loss_pct_used']}% "
+                            f"of {limits.daily_loss_limit_pct}% limit"
+                        ),
+                    })
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Scheduler jobs
+    try:
+        jobs = scheduler.get_jobs()
+        result["scheduler_jobs"] = [j.id for j in jobs]
+        result["monitor_registered"] = any("monitor" in j.id for j in jobs)
+    except Exception:
+        pass
+
+    # I10: monitor-tick staleness. Only meaningful when monitor is registered.
+    if result["monitor_registered"] and _last_monitor_tick_iso:
+        try:
+            last_dt = datetime.fromisoformat(_last_monitor_tick_iso)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            delta = (datetime.now(timezone.utc) - last_dt).total_seconds()
+            result["monitor_seconds_since_tick"] = round(delta, 1)
+            if delta > 30.0:
+                result["monitor_stalled"] = True
+                result["alerts"].append({
+                    "level": "critical",
+                    "code": "monitor_stalled",
+                    "message": f"No monitor tick for {int(delta)}s",
+                })
+        except Exception:
+            pass
+    elif result["monitor_registered"] and _last_monitor_tick_iso is None:
+        # Registered but never ticked — flag once interval has had a chance.
+        result["monitor_stalled"] = True
+        result["alerts"].append({
+            "level": "warning",
+            "code": "monitor_never_ticked",
+            "message": "Monitor registered but has not ticked yet",
+        })
+
+    # IBKR socket
     if not HAS_IBSYNC:
-        return {"alive": False, "status": "unavailable"}
+        return result
     key = f"{req.host}:{req.port}:{req.client_id}"
     trader = _ib_instances.get(key)
     if not trader:
-        return {"alive": False, "status": "not_connected"}
+        result["status"] = "not_connected"
+        return result
     try:
         alive = trader.ib.isConnected()
         if not alive:
             trader.connected = False
-        return {"alive": alive, "status": "online" if alive else "dropped"}
+            result["ibkr_dropped"] = True
+            result["alerts"].append({
+                "level": "critical",
+                "code": "ibkr_dropped",
+                "message": "IBKR socket dropped — no order management possible",
+            })
+        result["alive"] = alive
+        result["status"] = "online" if alive else "dropped"
     except Exception as e:
         trader.connected = False
-        return {"alive": False, "status": "error", "detail": str(e)}
+        result["status"] = "error"
+        result["detail"] = str(e)
+        result["ibkr_dropped"] = True
+        result["alerts"].append({
+            "level": "critical",
+            "code": "ibkr_error",
+            "message": f"IBKR socket error: {e}",
+        })
+
+    return result
 
 
 @app.post("/api/ibkr/reconnect")
@@ -994,3 +1639,448 @@ async def ibkr_reconnect(req: IBKRConnectRequest):
         summary = await trader.get_account_summary()
         return {"connected": True, "summary": summary}
     return {"connected": False, "error": msg}
+
+
+# ── Journal API endpoints ─────────────────────────────────────────────────
+
+@app.get("/api/journal/positions")
+def journal_positions(state: str = "open"):
+    """List positions. state=open returns pending/open/closing; state=all returns everything."""
+    from core.journal import get_journal
+    journal = get_journal()
+    if state == "all":
+        return {"positions": [_pos_to_dict(p) for p in journal.list_all()]}
+    return {"positions": [_pos_to_dict(p) for p in journal.list_open()]}
+
+
+@app.get("/api/journal/daily_pnl")
+def journal_daily_pnl(days: int = 30):
+    from core.journal import get_journal
+    journal = get_journal()
+    return {
+        "today_pnl": journal.today_realized_pnl(),
+        "today_trades": journal.today_trade_count(),
+        "history": journal.history_pnl(days),
+    }
+
+
+@app.get("/api/journal/events")
+def journal_events(limit: int = 50):
+    from core.journal import get_journal
+    return _safe_json({"events": get_journal().recent_events(limit)})
+
+
+@app.get("/api/journal/reconciliation")
+def journal_reconciliation(date: Optional[str] = None):
+    """EOD commission/slippage reconciliation report.
+
+    Optional query param ``?date=YYYY-MM-DD`` selects the day; defaults to today.
+    """
+    from core.journal import get_journal
+    return _safe_json(get_journal().daily_reconciliation_report(date))
+
+
+def _pos_to_dict(p) -> dict:
+    return {
+        "id": p.id, "symbol": p.symbol, "topology": p.topology,
+        "direction": p.direction, "contracts": p.contracts,
+        "entry_cost": p.entry_cost, "entry_time": p.entry_time,
+        "expiry": p.expiry, "state": p.state,
+        "exit_cost": p.exit_cost, "exit_time": p.exit_time,
+        "exit_reason": p.exit_reason, "realized_pnl": p.realized_pnl,
+        "high_water_mark": p.high_water_mark, "broker": p.broker,
+        "legs": list(p.legs), "meta": p.meta,
+    }
+
+
+# ── Monitor & Fill-Watcher scheduler registration ────────────────────────
+
+# I10: track last successful monitor tick for heartbeat staleness alerts.
+_last_monitor_tick_iso: Optional[str] = None
+
+
+def _run_monitor_tick():
+    """Sync wrapper that drives the async monitor tick from APScheduler."""
+    import asyncio as _aio
+    from core.monitor import tick
+    from core.settings import SETTINGS
+    from core.leader import is_leader
+
+    # I6: no-op if another instance holds the leader lock.
+    if not is_leader():
+        return
+
+    async def _factory():
+        creds = SETTINGS.ibkr.as_dict()
+        trader, _ = await get_ib_connection(creds)
+        return trader
+
+    global _last_monitor_tick_iso
+    loop = _MAIN_LOOP
+    if loop is None or not loop.is_running():
+        return  # app not fully started yet
+    try:
+        future = _aio.run_coroutine_threadsafe(tick(_factory), loop)
+        future.result(timeout=55)  # block until done; propagates exceptions
+        _last_monitor_tick_iso = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("monitor tick failed: %s", e)
+
+
+def _run_fill_reconcile():
+    """Sync wrapper that drives the async fill reconciler from APScheduler."""
+    import asyncio as _aio
+    from core.fill_watcher import reconcile_once
+    from core.settings import SETTINGS
+    from core.leader import is_leader
+
+    # I6: no-op if another instance holds the leader lock.
+    if not is_leader():
+        return
+
+    async def _go():
+        creds = SETTINGS.ibkr.as_dict()
+        trader, _ = await get_ib_connection(creds)
+        if trader:
+            await reconcile_once(trader)
+
+    loop = _MAIN_LOOP
+    if loop is None or not loop.is_running():
+        return  # app not fully started yet
+    try:
+        future = _aio.run_coroutine_threadsafe(_go(), loop)
+        future.result(timeout=55)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("fill reconcile failed: %s", e)
+
+
+@app.post("/api/monitor/start")
+def start_monitor(interval: int = 15):
+    """Register the monitor loop + fill watcher as scheduler jobs.
+
+    I6: acquires an advisory file lock so only one server instance runs
+    the monitor tick. If another instance already holds the lock, returns
+    ``{"status": "not_leader", "holder": {...}}`` and registers no jobs.
+    """
+    from core.leader import try_acquire_leadership, _peek_lock_file
+    from pathlib import Path
+
+    secs = max(interval, 5)
+    lock_path = "data/monitor.lock"
+
+    acquired = try_acquire_leadership(lock_path)
+    if not acquired:
+        holder = _peek_lock_file(Path(lock_path))
+        log_event(_startup_log, "monitor_start_rejected_not_leader",
+                  level=_logging.WARNING, holder=holder)
+        return {
+            "status": "not_leader",
+            "holder": holder,
+            "message": "Another instance holds the monitor lock; "
+                       "this server will not register monitor jobs.",
+        }
+
+    # Remove existing monitor jobs if re-registering
+    for job in scheduler.get_jobs():
+        if job.id in ("live_monitor", "fill_watcher"):
+            job.remove()
+
+    scheduler.add_job(_run_monitor_tick, "interval", seconds=secs,
+                      id="live_monitor", replace_existing=True)
+    scheduler.add_job(_run_fill_reconcile, "interval", seconds=secs,
+                      id="fill_watcher", replace_existing=True)
+
+    # I2: daily digest at 16:05 ET (after market close) — best-effort, no-op
+    # when NOTIFY_WEBHOOK_URL is not configured.
+    for job in scheduler.get_jobs():
+        if job.id == "daily_digest":
+            job.remove()
+    scheduler.add_job(
+        _run_daily_digest,
+        "cron",
+        hour=21,       # 16:05 ET = 21:05 UTC (no DST correction; adjust via env)
+        minute=5,
+        id="daily_digest",
+        replace_existing=True,
+    )
+
+    log_event(_startup_log, "monitor_started", interval_seconds=secs)
+    return {"status": "started", "interval_seconds": secs, "leader": True}
+
+
+def _run_daily_digest():
+    """APScheduler wrapper — send the daily digest webhook (I2)."""
+    from core.notifier import send_daily_digest
+    from core.journal import get_journal
+    try:
+        send_daily_digest(get_journal())
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("daily digest send failed: %s", e)
+
+
+class PaperEntryRequest(BaseModel):
+    """Request body for /api/monitor/paper_entry (dry-run forced entry)."""
+    creds: IBKRConnectRequest
+    symbol: str = "SPY"
+    contracts: int = 1
+    target_dte: int = 7          # short DTE so exit happens quickly during dry-run
+    spread_cost_target: float = 150.0
+    strike_width: int = 5
+    stop_loss_pct: float = 40.0
+    take_profit_pct: float = 40.0
+    # Skip the market-hours check for out-of-hours dry runs.
+    skip_market_hours_check: bool = True
+    # Skip event-calendar blackouts (e.g. CPI/FOMC days) for dry-run testing.
+    skip_event_blackout: bool = False
+    # When live option quotes aren't available (market closed / no subscription),
+    # fall back to Black-Scholes synthetic pricing so the full journaling / order
+    # path can still be exercised.
+    allow_synthetic_chain: bool = True
+
+
+@app.post("/api/monitor/paper_entry")
+async def paper_entry(req: PaperEntryRequest):
+    """Dry-run helper: fire one entry immediately, bypassing strategy signal.
+
+    Runs the *full* live path — chain resolution, risk gate (market-hours
+    check skippable), sizing, journal, order — so all infrastructure is
+    exercised on demand.  Use this when the underlying strategy would only
+    fire 2×/month and you need faster paper-trading validation.
+
+    Typical use::
+
+        POST /api/monitor/paper_entry
+        {"creds": {"port": 7497}, "target_dte": 7, "skip_market_hours_check": true}
+    """
+    import traceback as _tb
+    try:
+        return await _paper_entry_inner(req)
+    except BaseException as _exc:
+        return {"error": str(_exc), "traceback": _tb.format_exc()}
+
+
+async def _paper_entry_inner(req: PaperEntryRequest):
+    """Inner implementation — wrapped by paper_entry for top-level error capture."""
+    from core.journal import Position, Order, get_journal
+    from core.risk import (
+        AccountSnapshot, RiskContext, RiskLimits, evaluate_pre_trade,
+        size_position,
+    )
+    from core.chain import (
+        resolve_bull_call_spread_with_diagnostics,
+        build_synthetic_spread,
+    )
+    from core.calendar import load_event_calendar
+    from core.settings import SETTINGS
+    import uuid as _uuid
+
+    journal = get_journal()
+
+    # 1. Connect
+    trader, msg = await get_ib_connection(req.creds.model_dump())
+    if not trader:
+        return {"error": msg}
+
+    # 2. Account snapshot
+    try:
+        acct = await trader.get_account_summary()
+    except Exception as e:
+        return {"error": f"account_summary_failed: {e}"}
+
+    account = AccountSnapshot(
+        equity=acct.get("equity", 0),
+        buying_power=acct.get("buying_power", 0),
+        excess_liquidity=acct.get("excess_liquidity", 0),
+        daily_pnl=acct.get("daily_pnl", 0),
+    )
+
+    # 3. Option chain — try live first, fall back to synthetic when market is closed
+    spread, chain_diag = await resolve_bull_call_spread_with_diagnostics(
+        trader, req.symbol, req.target_dte, req.spread_cost_target,
+        max_width=req.strike_width + 35,
+    )
+    chain_source = "live"
+
+    if spread is None and req.allow_synthetic_chain:
+        # Live quotes unavailable (market closed, no subscription, etc).
+        # Build a Black-Scholes priced spread so the rest of the pipeline
+        # (risk gate, journal, order path) can still be exercised.
+        # NaN guard: IEEE-754 NaN is truthy, so `nan or 0.0` == nan, and
+        # nan <= 0 is False — which would skip the yfinance fallback inside
+        # build_synthetic_spread.  Sanitise to 0.0 so yfinance is called.
+        import math as _math
+        _raw_und = chain_diag.get("underlying") or 0.0
+        _und_hint = 0.0 if (
+            _raw_und is None or not isinstance(_raw_und, (int, float))
+            or _math.isnan(float(_raw_und)) or _math.isinf(float(_raw_und))
+        ) else float(_raw_und)
+        spread = build_synthetic_spread(
+            symbol=req.symbol,
+            target_dte=req.target_dte,
+            target_cost=req.spread_cost_target,
+            strike_width=req.strike_width,
+            underlying=_und_hint,
+        )
+        chain_source = "synthetic_bs"
+
+    if spread is None:
+        journal.log_event("paper_entry_chain_failed", subject=req.symbol,
+                          payload=chain_diag)
+        return _safe_json({
+            "error": "Chain resolution failed",
+            "diagnostics": chain_diag,
+            "hint": (
+                "Live quotes unavailable and synthetic fallback failed. "
+                "Check: (1) TWS is running, (2) market data subscriptions for SPY options, "
+                "(3) try during RTH (9:30–16:00 ET). "
+                "Or pass allow_synthetic_chain=true (default) for out-of-hours testing."
+            ),
+        })
+
+    contracts = max(req.contracts, 1)
+
+    # 4. Risk gate — optionally skip market-hours and event-blackout checks
+    #    so dry-run tests can be forced on any day.
+    limits = RiskLimits.from_settings()
+    from dataclasses import replace as _replace
+    if req.skip_market_hours_check:
+        limits = _replace(limits, require_market_open=False)
+    if req.skip_event_blackout:
+        limits = _replace(limits, block_on_events=False)
+
+    events = load_event_calendar() if not req.skip_event_blackout else []
+    ctx = RiskContext(
+        account=account,
+        open_positions=len(journal.list_open()),
+        today_realized_pnl=journal.today_realized_pnl(),
+        debit_per_contract=spread.net_debit,
+        margin_per_contract=spread.margin_req,
+        contracts=contracts,
+        target_dte=req.target_dte,
+        limits=limits,
+        events=events,
+    )
+    decision = evaluate_pre_trade(ctx)
+    if not decision.allowed:
+        return {
+            "risk_rejected": True,
+            "reason": decision.reason,
+            "details": decision.details,
+        }
+
+    # 5. Place order (same path as /api/ibkr/execute)
+    pos_id = f"dry-{_uuid.uuid4().hex[:8]}"
+    expiry_str = spread.expiry
+    side = "BUY" if spread.net_debit > 0 else "SELL"
+    midpoint = abs(spread.net_debit) / 100.0
+    haircut = SETTINGS.risk.limit_price_haircut
+    limit_price = round(midpoint * (1 + haircut) if side == "BUY" else midpoint * (1 - haircut), 2)
+
+    try:
+        # SpreadSpec.as_ib_legs() converts ChainLeg objects → List[Dict]
+        ib_legs = spread.as_ib_legs()
+        order_result = await trader.place_combo_order(
+            symbol=req.symbol,
+            legs=ib_legs,
+            sc=contracts,
+            side=side,
+            lmtPrice=limit_price,
+        )
+    except Exception as e:
+        return {"error": f"order_placement_failed: {e}"}
+
+    # 6. Journal
+    pos = Position(
+        id=pos_id,
+        symbol=req.symbol,
+        topology="vertical_spread",
+        direction="bull",
+        contracts=contracts,
+        entry_cost=spread.net_debit * contracts,
+        entry_time=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        expiry=expiry_str,
+        # Convert ChainLeg dataclass instances to dicts for JSON serialisation.
+        legs=tuple(
+            (__import__("dataclasses").asdict(leg)
+             if hasattr(leg, "__dataclass_fields__") else leg)
+            for leg in spread.legs
+        ),
+        state="pending",
+        high_water_mark=abs(spread.net_debit) / 100.0,
+        broker="ibkr",
+        meta={
+            "stop_loss_pct": req.stop_loss_pct,
+            "take_profit_pct": req.take_profit_pct,
+            "dry_run": True,
+        },
+    )
+    journal.open_position(pos)
+    order = Order(
+        id=f"ord-{_uuid.uuid4().hex[:8]}",
+        position_id=pos_id,
+        broker="ibkr",
+        broker_order_id=str(order_result.get("orderId", order_result.get("order_id", ""))),
+        side=side,
+        limit_price=limit_price,
+        status="submitted",
+        submitted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        kind="entry",
+    )
+    journal.record_order(order)
+    journal.log_event("paper_entry_placed", subject=pos_id, payload={
+        "symbol": req.symbol, "contracts": contracts,
+        "net_debit": spread.net_debit, "expiry": expiry_str,
+    })
+
+    return _safe_json({
+        "status": "placed",
+        "position_id": pos_id,
+        "contracts": contracts,
+        "net_debit": spread.net_debit,
+        "limit_price": limit_price,
+        "expiry": expiry_str,
+        "K_long": spread.meta.get("K_long"),
+        "K_short": spread.meta.get("K_short"),
+        "underlying_price": spread.underlying_price,
+        "chain_source": chain_source,          # "live" or "synthetic_bs"
+        "chain_diagnostics": chain_diag,
+        "synthetic": spread.meta.get("synthetic", False),
+        "order": order_result,
+        "risk_decision": {"allowed": True},
+        "account": {
+            "equity": account.equity,
+            "buying_power": account.buying_power,
+        },
+    })
+
+
+@app.post("/api/notify/digest")
+def trigger_digest():
+    """Manually trigger the daily digest. Returns the digest payload whether
+    or not the webhook URL is configured (useful for testing the format)."""
+    from core.notifier import build_daily_digest, send_daily_digest
+    from core.journal import get_journal
+    journal = get_journal()
+    digest = build_daily_digest(journal)
+    sent = send_daily_digest(journal)
+    return {"sent": sent, "digest": digest}
+
+
+@app.post("/api/monitor/stop")
+def stop_monitor():
+    """Remove monitor + fill watcher jobs and release the leader lock."""
+    from core.leader import release_leadership
+
+    removed = []
+    for job in scheduler.get_jobs():
+        if job.id in ("live_monitor", "fill_watcher", "daily_digest"):
+            job.remove()
+            removed.append(job.id)
+    release_leadership()
+    log_event(_startup_log, "monitor_stopped", removed=removed)
+    return {"status": "stopped", "removed": removed}
