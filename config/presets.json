@@ -1,0 +1,94 @@
+[
+  {
+    "name": "s1",
+    "ticker": "SPY",
+    "strategy_name": "consecutive_days",
+    "strategy_params": {
+      "entry_red_days": 1,
+      "exit_green_days": 1
+    },
+    "entry_filters": {
+      "use_rsi_filter": false,
+      "rsi_threshold": 30,
+      "use_ema_filter": false,
+      "ema_length": 10,
+      "use_sma200_filter": false,
+      "use_volume_filter": false,
+      "use_vix_filter": false,
+      "vix_min": 15,
+      "vix_max": 35,
+      "use_regime_filter": false,
+      "regime_allowed": "all"
+    },
+    "position_size_method": "fixed",
+    "sizing_params": {
+      "fixed_contracts": 1,
+      "risk_percent": 5,
+      "max_allocation_cap": 0,
+      "capital_allocation": 10000
+    },
+    "timing_mode": "interval",
+    "timing_value": 15,
+    "notes": "",
+    "auto_execute": true,
+    "fetch_only_live": true,
+    "topology": "vertical_spread",
+    "direction": "bull",
+    "strategy_type": "bull_call",
+    "strike_width": 5.0,
+    "target_dte": 14,
+    "spread_cost_target": 250.0,
+    "stop_loss_pct": 0.0,
+    "take_profit_pct": 0.0,
+    "trailing_stop_pct": 0.0,
+    "use_mark_to_market": false,
+    "commission_per_contract": 0.65,
+    "realism_factor": 1.15
+  },
+  {
+    "name": "dry-run",
+    "ticker": "SPY",
+    "strategy_name": "dryrun",
+    "strategy_params": {
+      "entry_red_days": 1,
+      "exit_green_days": 1
+    },
+    "entry_filters": {
+      "use_rsi_filter": false,
+      "rsi_threshold": 30,
+      "use_ema_filter": false,
+      "ema_length": 10,
+      "use_sma200_filter": false,
+      "use_volume_filter": false,
+      "use_vix_filter": false,
+      "vix_min": 15,
+      "vix_max": 35,
+      "use_regime_filter": false,
+      "regime_allowed": "all"
+    },
+    "position_size_method": "fixed",
+    "sizing_params": {
+      "fixed_contracts": 1,
+      "risk_percent": 5,
+      "max_allocation_cap": 0,
+      "capital_allocation": 10000
+    },
+    "timing_mode": "interval",
+    "timing_value": 60,
+    "notes": "",
+    "auto_execute": true,
+    "fetch_only_live": true,
+    "topology": "vertical_spread",
+    "direction": "bull",
+    "strategy_type": "bull_call",
+    "strike_width": 2.0,
+    "target_dte": 14,
+    "spread_cost_target": 250.0,
+    "stop_loss_pct": 0.0,
+    "take_profit_pct": 0.0,
+    "trailing_stop_pct": 0.0,
+    "use_mark_to_market": false,
+    "commission_per_contract": 0.65,
+    "realism_factor": 1.15
+  }
+]

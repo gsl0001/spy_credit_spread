@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# Secrets & config
+.env
+.env.local
+.env.*.local
+config/.env
+
+# Data (journal, logs)
+data/
+logs/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+*.log
+*.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Graphify
+graphify-out/

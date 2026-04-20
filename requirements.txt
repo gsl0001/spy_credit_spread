@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+yfinance
+pandas
+scipy
+numpy
+pydantic
+apscheduler
+pytz
+ib_insync
+alpaca-trade-api
+python-dotenv
+python-json-logger
+pandas_market_calendars
+pytest
+pytest-asyncio
+httpx
