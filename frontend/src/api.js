@@ -53,6 +53,7 @@ export const api = {
   ibkrPositions:  ()     => post('/api/ibkr/positions', IBKR_CREDS),
   ibkrExecute:    (payload) => post('/api/ibkr/execute', { creds: { ...IBKR_CREDS }, ...payload }, 60000),
   orders:         ()     => get(`/api/ibkr/orders?host=${IBKR_CREDS.host}&port=${IBKR_CREDS.port}&client_id=${IBKR_CREDS.client_id}`),
+  ibkrExit:       (posId) => post('/api/ibkr/exit', { creds: { ...IBKR_CREDS }, position_id: posId }, 60000),
   flatten:        ()     => post('/api/ibkr/flatten_all', IBKR_CREDS, 60000),
   reconnect:      ()     => post('/api/ibkr/reconnect', IBKR_CREDS),
   ibkrCancel:     (orderId) => post('/api/ibkr/cancel', { ...IBKR_CREDS, orderId }),

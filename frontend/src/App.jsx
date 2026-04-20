@@ -38,7 +38,7 @@ export default function App() {
   const [tweaksOpen, setTweaksOpen] = useState(false);
   const [bellOpen, setBellOpen] = useState(false);
   const [panicOpen, setPanicOpen] = useState(false);
-  const MOCK = useData();
+  const backend = useData();
 
   useEffect(() => { localStorage.setItem(STORAGE_VIEW, view); }, [view]);
 
@@ -56,7 +56,7 @@ export default function App() {
 
   const ViewComponent = VIEWS[view] || LiveView;
   const { title, sub } = VIEW_TITLES[view] || VIEW_TITLES.live;
-  const alertCount = MOCK.alerts.filter(a => !a.ack).length;
+  const alertCount = backend.alerts.filter(a => !a.ack).length;
 
   return (
     <div className="shell">
@@ -64,10 +64,10 @@ export default function App() {
 
       <Topbar
         view={view}
-        mkt={{ open: MOCK.risk.market_open, next: MOCK.risk.next_close || '—' }}
-        spy={MOCK.spy}
-        conn={{ ibkr: MOCK.__online ? MOCK.__ibkr : 'off' }}
-        leader={{ is_leader: MOCK.monitor.is_leader }}
+        mkt={{ open: backend.risk.market_open, next: backend.risk.next_close || '—' }}
+        spy={backend.spy}
+        conn={{ ibkr: backend.__online ? backend.__ibkr : 'off' }}
+        leader={{ is_leader: backend.monitor.is_leader }}
         alertCount={alertCount}
         onBell={() => setBellOpen(b => !b)}
         onPanic={() => setPanicOpen(true)}
@@ -89,9 +89,9 @@ export default function App() {
               <Ico name="x" size={14} />
             </button>
           </div>
-          {MOCK.alerts.length === 0 ? (
+          {backend.alerts.length === 0 ? (
             <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-3)', fontSize: 12 }}>No alerts</div>
-          ) : MOCK.alerts.map((a, i) => (
+          ) : backend.alerts.map((a, i) => (
             <div key={i} className={`alert alert--${a.level}`} style={{ margin: '8px 12px', borderRadius: 6 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
                 <div>
@@ -122,7 +122,7 @@ export default function App() {
             </div>
             <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 8 }}>Flatten All Positions?</div>
             <div style={{ color: 'var(--text-2)', fontSize: 13, marginBottom: 24, lineHeight: 1.5 }}>
-              This will immediately submit market orders to close all {MOCK.positions.length} open spread(s). Action cannot be undone.
+              This will immediately submit market orders to close all {backend.positions.length} open spread(s). Action cannot be undone.
             </div>
             <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
               <Btn variant="ghost" onClick={() => setPanicOpen(false)}>Cancel</Btn>

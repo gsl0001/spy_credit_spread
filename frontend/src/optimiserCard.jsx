@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api } from './api';
-import { Card, Btn } from './primitives';
+import { api } from './api.js';
+import { Card, Btn } from './primitives.jsx';
 
 /**
  * Optimiser UI (use_request §3②).

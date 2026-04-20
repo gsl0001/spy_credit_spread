@@ -23,10 +23,9 @@ export const fmtTimeAgo = (d) => {
 
 export const fmtTimeHMS = (d) => d ? new Date(d).toTimeString().slice(0, 8) : '—';
 
-export function Card({ title, actions, children, flush, icon, subtitle }) {
-  const { Ico } = window.__icons || {};
+export function Card({ title, actions, children, flush, icon, subtitle, style }) {
   return (
-    <div className="card">
+    <div className="card" style={style}>
       {title && (
         <div className="card__head">
           <span className="title">

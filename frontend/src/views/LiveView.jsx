@@ -13,6 +13,7 @@ export function LiveView() {
   const [clientId, setClientId] = useState(IBKR_CREDS.client_id);
   const [ibkrAccount, setIbkrAccount] = useState(null);
   const [ibkrPositions, setIbkrPositions] = useState([]);
+  const [journalPositions, setJournalPositions] = useState([]);
   const [connectMsg, setConnectMsg] = useState('');
   const [ticketMsg, setTicketMsg] = useState('');
   const [busy, setBusy] = useState(false);
@@ -42,8 +43,9 @@ export function LiveView() {
       if (res?.connected) {
         setIbkrAccount(res.summary);
         setConnectMsg(`Connected · ${res.summary?.account_id || ''}`);
-        const posRes = await safe(api.ibkrPositions);
-        if (posRes?.positions) setIbkrPositions(posRes.positions);
+        const [p, j] = await Promise.all([safe(api.ibkrPositions), safe(api.openPositions)]);
+        if (p?.positions) setIbkrPositions(p.positions);
+        if (j?.positions) setJournalPositions(j.positions);
       } else {
         setConnectMsg(res?.error || 'Connect failed');
       }
@@ -54,6 +56,7 @@ export function LiveView() {
   const disconnect = useCallback(() => {
     setIbkrAccount(null);
     setIbkrPositions([]);
+    setJournalPositions([]);
     setConnectMsg('Disconnected');
   }, []);
 
@@ -62,9 +65,14 @@ export function LiveView() {
     (async () => {
       const hb = await safe(api.heartbeat);
       if (hb?.alive) {
-        const [a, p] = await Promise.all([safe(api.ibkrConnect), safe(api.ibkrPositions)]);
+        const [a, p, j] = await Promise.all([
+          safe(api.ibkrConnect),
+          safe(api.ibkrPositions),
+          safe(api.openPositions)
+        ]);
         if (a?.connected) setIbkrAccount(a.summary);
         if (p?.positions) setIbkrPositions(p.positions);
+        if (j?.positions) setJournalPositions(j.positions);
         setConnectMsg(`Connected · ${a?.summary?.account_id || ''}`);
       }
     })();
@@ -76,17 +84,33 @@ export function LiveView() {
         if (ibkrAccount) { setIbkrAccount(null); setConnectMsg('Connection lost'); }
         return;
       }
-      const [a, p] = await Promise.all([safe(api.ibkrConnect), safe(api.ibkrPositions)]);
+      const [a, p, j] = await Promise.all([
+        safe(api.ibkrConnect),
+        safe(api.ibkrPositions),
+        safe(api.openPositions)
+      ]);
       if (a?.connected) {
         setIbkrAccount(a.summary);
         setConnectMsg(`Connected · ${a.summary?.account_id || ''}`);
       }
       if (p?.positions) setIbkrPositions(p.positions);
+      if (j?.positions) setJournalPositions(j.positions);
     };
     
     const id = setInterval(poll, 30000);
     return () => clearInterval(id);
   }, [ibkrAccount]); // Note: depend on ibkrAccount to react to manual disconnects
+
+  const exitPosition = useCallback(async (posId) => {
+    setBusy(true);
+    setTicketMsg(`Closing position ${posId.slice(0,8)}…`);
+    try {
+      const res = await api.ibkrExit(posId);
+      if (res?.error) setTicketMsg(`Exit failed: ${res.error}`);
+      else setTicketMsg(`Exit order submitted · ${res.order_id || ''}`);
+    } catch (e) { setTicketMsg(`Exit error: ${e.message}`); }
+    finally { setBusy(false); }
+  }, []);
 
   const refreshPresets = useCallback(async () => {
     const r = await safe(api.presetsList, {});
@@ -101,6 +125,9 @@ export function LiveView() {
     setBusy(true); setTicketMsg('Submitting order…');
     try {
       const cfg = loadConfig();
+      // I5: Generate unique ID on the client to prevent duplicate submissions
+      const clientOrderId = crypto.randomUUID();
+      
       const payload = {
         symbol: cfg.ticker,
         topology: cfg.topology,
@@ -112,10 +139,15 @@ export function LiveView() {
         stop_loss_pct: cfg.stop_loss_pct,
         take_profit_pct: cfg.take_profit_pct,
         trailing_stop_pct: cfg.trailing_stop_pct,
+        client_order_id: clientOrderId,
       };
       const res = await api.ibkrExecute(payload);
       if (res?.error) setTicketMsg(`Error: ${res.error}`);
-      else { setTicketMsg(`Submitted ${res.contracts || ''} contracts · order ${res.order_id || ''}`); setShowTicket(true); }
+      else { 
+        const status = res.duplicate ? ' (duplicate suppressed)' : '';
+        setTicketMsg(`Submitted ${res.contracts || ''} contracts · order ${res.order_id || ''}${status}`); 
+        setShowTicket(true); 
+      }
     } catch (e) { setTicketMsg(`Error: ${e.message}`); }
     finally { setBusy(false); }
   }, [targetDte, contractsOverride]);
@@ -371,9 +403,9 @@ export function LiveView() {
 
         {/* Positions */}
         <Card title="Positions" icon="dashboard"
-              subtitle={connected ? `${ibkrPositions.length} live` : 'not connected'}
+              subtitle={connected ? `${journalPositions.length} tracked` : 'not connected'}
               flush
-              actions={connected && <Btn variant="ghost" size="sm" icon="refresh" onClick={async()=>{ const p=await safe(api.ibkrPositions); if(p?.positions) setIbkrPositions(p.positions); }} />}>
+              actions={connected && <Btn variant="ghost" size="sm" icon="refresh" onClick={async()=>{ const p=await safe(api.ibkrPositions); if(p?.positions) setIbkrPositions(p.positions); const j=await safe(api.openPositions); if(j?.positions) setJournalPositions(j.positions); }} />}>
           <div style={{ maxHeight: 220, overflowY: 'auto' }}>
             {!connected ? (
               <div style={{padding:60,textAlign:'center',color:'var(--text-3)',fontSize:12}}>
@@ -383,18 +415,27 @@ export function LiveView() {
               <table className="tbl">
                 <thead style={{ position: 'sticky', top: 0, zIndex: 5 }}><tr>
                   <th>Symbol</th><th className="num">Qty</th>
-                  <th className="num">Avg cost</th><th className="num">Unrealized</th>
+                  <th className="num">Status</th><th className="num">Action</th>
                 </tr></thead>
                 <tbody>
-                  {ibkrPositions.length === 0 && (
-                    <tr><td colSpan="4" style={{textAlign:'center',padding:40,color:'var(--text-3)',fontSize:12}}>No open positions</td></tr>
+                  {journalPositions.length === 0 && (
+                    <tr><td colSpan="4" style={{textAlign:'center',padding:40,color:'var(--text-3)',fontSize:12}}>No open journal positions</td></tr>
                   )}
-                  {ibkrPositions.map((p,i)=>(
-                    <tr key={i}>
-                      <td><div className="mono" style={{fontSize:11.5,fontWeight:600}}>{p.symbol}</div><div className="muted" style={{fontSize:10}}>{p.sec_type||p.secType}</div></td>
-                      <td className="num">{p.position}</td>
-                      <td className="num">${(p.avg_cost??0).toFixed(2)}</td>
-                      <td className="num" style={{color:(p.unrealized_pnl??0)>=0?'var(--pos)':'var(--neg)',fontWeight:600}}>{fmtUsd(p.unrealized_pnl??0,true)}</td>
+                  {journalPositions.map((p,i)=>(
+                    <tr key={p.id}>
+                      <td>
+                        <div className="mono" style={{fontSize:11.5,fontWeight:600}}>{p.symbol}</div>
+                        <div className="muted" style={{fontSize:10}}>{p.topology}</div>
+                      </td>
+                      <td className="num">{p.contracts}</td>
+                      <td className="num">
+                        <Badge variant={p.state==='open'?'pos':p.state==='closing'?'warn':'neutral'}>{p.state}</Badge>
+                      </td>
+                      <td className="num">
+                        <Btn variant="danger" size="sm" icon="x" disabled={busy || p.state === 'closing'} onClick={() => exitPosition(p.id)}>
+                          Close
+                        </Btn>
+                      </td>
                     </tr>
                   ))}
                 </tbody>

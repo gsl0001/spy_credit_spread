@@ -30,10 +30,10 @@ def test_save_then_get(store: PresetStore) -> None:
 
 
 def test_save_replaces_by_name(store: PresetStore) -> None:
-    store.save(ScannerPreset(name="x", scan_interval_seconds=10))
-    store.save(ScannerPreset(name="x", scan_interval_seconds=60))
+    store.save(ScannerPreset(name="x", timing_value=10))
+    store.save(ScannerPreset(name="x", timing_value=60))
     assert len(store.list()) == 1
-    assert store.get("x").scan_interval_seconds == 60
+    assert store.get("x").timing_value == 60
 
 
 def test_delete_removes_preset(store: PresetStore) -> None:

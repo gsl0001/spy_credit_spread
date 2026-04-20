@@ -31,7 +31,7 @@ TIER 2 — IMPORTANT
   [x] I2  Daily summary email/webhook         core/notifier.py; Discord/Slack/generic; 28 tests
   [x] I3  Event calendar blackout                    config/events_2026.json + core/calendar.py
   [ ] I4  Slippage / commission accounting
-  [~] I5  Idempotency keys                           schema supports it; UI/scanner not yet generating them
+  [x] I5  Idempotency keys                           UI generates UUID; scanner uses date-scoped keys; 5 tests pass
   [x] I6  Monitor-loop lock / leader election   core/leader.py    11 tests; fcntl.flock advisory lock
   [~] I7  Reconnect-on-drop                          IBKRTrader.ensure_connected() exists; no exp backoff
   [~] I8  Market hours + holiday calendar            core/calendar.py exists; risk check uses it

@@ -83,6 +83,8 @@ def _make_trader(ib: MagicMock | None = None):
         trader.client_id = 1
         trader.connected = False
         trader.ib = ib
+        trader._retry_count = 0
+        trader._last_retry_time = 0
     return trader
 
 

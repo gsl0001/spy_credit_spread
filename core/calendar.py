@@ -40,19 +40,13 @@ def is_market_open(now: Optional[datetime] = None, at_all_hours: bool = False) -
         return True, "open"
 
     ts = now or _now_et()
-    weekday = ts.weekday()  # Mon=0 … Sun=6
-    if weekday >= 5:
-        return False, "weekend"
+    
     # Try pandas_market_calendars for full holiday + early-close support.
     try:
         import pandas_market_calendars as mcal  # type: ignore
         nyse = mcal.get_calendar("NYSE")
-        sched = nyse.schedule(start_date=ts.date().isoformat(),
-                              end_date=ts.date().isoformat())
-        if sched.empty:
-            return False, "holiday"
-        row = sched.iloc[0]
-        # Schedule is in UTC; convert current time to UTC for comparison.
+        
+        # Ensure ts is aware for accurate comparison
         try:
             import pytz
             et = pytz.timezone("US/Eastern")
@@ -63,17 +57,33 @@ def is_market_open(now: Optional[datetime] = None, at_all_hours: bool = False) -
             utc_ts = ts_aware.astimezone(pytz.UTC)
         except ImportError:
             utc_ts = ts
+
+        # Use schedule for the specific date
+        sched = nyse.schedule(start_date=ts.date().isoformat(),
+                              end_date=ts.date().isoformat())
+        if sched.empty:
+            return False, "holiday"
+        
+        row = sched.iloc[0]
         open_utc, close_utc = row["market_open"], row["market_close"]
+        
         if utc_ts >= open_utc and utc_ts < close_utc:
             return True, "open"
+        
+        if utc_ts < open_utc:
+            return False, "pre_market"
         return False, "outside_rth"
-    except ImportError:
-        pass
-    # Fallback: 9:30 to 16:00 ET
-    t = ts.time()
-    if time(9, 30) <= t < time(16, 0):
-        return True, "open"
-    return False, "outside_rth"
+        
+    except (ImportError, Exception):
+        # Fallback: 9:30 to 16:00 ET, excluding weekends
+        weekday = ts.weekday()  # Mon=0 … Sun=6
+        if weekday >= 5:
+            return False, "weekend"
+        
+        t = ts.time()
+        if time(9, 30) <= t < time(16, 0):
+            return True, "open"
+        return False, "outside_rth"
 
 
 def minutes_to_close(now: Optional[datetime] = None) -> int:

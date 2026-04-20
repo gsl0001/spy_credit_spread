@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { api } from './api';
+import { api } from './api.js';
 
 /**
  * Schema-driven strategy parameter form (use_request §3).

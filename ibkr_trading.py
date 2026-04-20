@@ -90,14 +90,20 @@ class IBKRTrader:
         self.port = port
         self.client_id = client_id
         self.connected = False
+        self._retry_count = 0
+        self._last_retry_time = 0
 
     async def connect(self):
+        import time as _time
         try:
             await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
             self.connected = True
+            self._retry_count = 0
             return {"success": True, "msg": "Connected to IBKR"}
         except Exception as e:
             self.connected = False
+            self._retry_count += 1
+            self._last_retry_time = _time.monotonic()
             return {"success": False, "msg": str(e)}
 
     def disconnect(self):
@@ -106,6 +112,7 @@ class IBKRTrader:
         except Exception:
             pass
         self.connected = False
+        self._retry_count = 0
 
     def is_alive(self) -> bool:
         """Return True only when the socket is actually connected."""
@@ -116,8 +123,18 @@ class IBKRTrader:
             return False
 
     async def ensure_connected(self):
-        """Reconnect if the socket dropped."""
+        """Reconnect if the socket dropped, with exponential backoff."""
+        import time as _time
         if not self.is_alive():
+            # I7: Exponential backoff logic
+            if self._retry_count > 0:
+                # Max delay 60s
+                delay = min(60, (2 ** (self._retry_count - 1)) * 5)
+                elapsed = _time.monotonic() - self._last_retry_time
+                if elapsed < delay:
+                    wait_remaining = round(delay - elapsed, 1)
+                    return {"success": False, "msg": f"Backoff: waiting {wait_remaining}s before retry"}
+            
             self.disconnect()
             return await self.connect()
         return {"success": True, "msg": "Already connected"}
