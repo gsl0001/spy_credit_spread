@@ -83,26 +83,48 @@ def evaluate_exit(
     force_exit: bool = False,
     high_water_mark: Optional[float] = None,
     today: Optional[date] = None,
+    strategy_exit: Optional[tuple[bool, str]] = None,
+    is_expiration_close: bool = False,
 ) -> ExitDecision:
     """Pure evaluation of a position's exit conditions.
+
+    Priority order (per use_request.md §1):
+      0. force_exit (kill switch / manual flatten)
+      1. strategy_exit  — TOP PRIORITY: signal returned by the position's
+         strategy.check_exit(); reason is namespaced ``strategy:<reason>``
+      2. expiration_close — last few minutes of the expiration session
+      3. dte_exit (DTE threshold)
+      4. take_profit / stop_loss / trailing_stop
 
     ``current_mid`` is the LIVE combo mid in per-share dollars (e.g.
     2.55 for a $2.55 spread) — the scale IBKR reports. Internally
     converted to the same scale as the stored entry debit.
-
-    Returns the first-firing exit condition, or
-    ``ExitDecision(False, "ok", {...})`` when none trigger.
     """
     entry_debit = _entry_debit_unit_price(pos)
     if entry_debit <= 0:
         return ExitDecision(False, "no_entry_cost", {})
 
-    # Manual override beats everything else.
+    # 0. Manual override beats everything else.
     if force_exit:
         return ExitDecision(True, "manual_flatten", {"mid": current_mid})
 
-    # DTE-based forced exit.
     dte = _dte_for(pos.expiry, today=today)
+
+    # 1. TOP PRIORITY — strategy exit signal (use_request §1①).
+    if strategy_exit is not None:
+        should_exit, reason = strategy_exit
+        if should_exit:
+            return ExitDecision(True, f"strategy:{reason or 'signal'}", {
+                "mid": current_mid, "dte": dte,
+            })
+
+    # 2. Before-close-on-expiration-day (use_request §1②).
+    if is_expiration_close and dte <= 0:
+        return ExitDecision(True, "expiration_close", {
+            "mid": current_mid, "dte": dte,
+        })
+
+    # 3. DTE-based forced exit.
     if dte <= dte_exit_at:
         return ExitDecision(True, "dte_exit", {
             "dte": dte, "threshold": dte_exit_at,
@@ -246,6 +268,98 @@ async def submit_exit_order(
         return {"ok": False, "error": str(e), "reason": reason}
 
 
+# ── Strategy-exit + expiration-close resolvers ────────────────────────────
+
+def _resolve_strategy_exit(
+    pos: Position,
+    defaults: dict[str, Any],
+) -> Optional[tuple[bool, str]]:
+    """Run the position's strategy.check_exit() against fresh bars.
+
+    Reads from ``defaults``:
+      - ``bars_fetcher``: ``Callable[[str], pd.DataFrame]`` returning a
+        bar history for ``pos.symbol``. If absent, the strategy check
+        is skipped (returns ``None``).
+      - ``strategy_registry``: optional ``dict[str, type[BaseStrategy]]``.
+        Defaults to ``strategies.consecutive_days.ConsecutiveDaysStrategy``
+        when not provided, only if the position recorded a strategy name.
+
+    The position's ``meta`` should carry:
+      - ``strategy_name`` (str)
+      - ``entry_state`` (dict): per-trade state passed to ``check_exit``
+      - ``strategy_request`` (dict): minimal req-shaped object for params
+
+    Failure is non-fatal — returns ``None`` so the next-priority gate runs.
+    """
+    strat_name = pos.meta.get("strategy_name") if pos.meta else None
+    fetcher = defaults.get("bars_fetcher")
+    if not strat_name or fetcher is None:
+        return None
+    try:
+        registry = defaults.get("strategy_registry") or _default_strategy_registry()
+        cls = registry.get(strat_name)
+        if cls is None:
+            return None
+        df = fetcher(pos.symbol)
+        if df is None or len(df) == 0:
+            return None
+        strat = cls()
+        req = _RequestShim(pos.meta.get("strategy_request") or {})
+        df = strat.compute_indicators(df, req)
+        i = len(df) - 1
+        entry_state = pos.meta.get("entry_state") or {}
+        should_exit, reason = strat.check_exit(df, i, entry_state, req)
+        return (bool(should_exit), str(reason or ""))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("strategy_exit check failed for %s: %s", pos.id, e)
+        return None
+
+
+def _resolve_expiration_close(
+    pos: Position,
+    *,
+    today: Optional[date] = None,
+    buffer_minutes: int = 15,
+) -> bool:
+    """True if today is the expiration date and we're inside the close window."""
+    try:
+        dte = _dte_for(pos.expiry, today=today)
+        if dte > 0:
+            return False
+        from core.calendar import minutes_to_close
+        return minutes_to_close() <= max(0, buffer_minutes)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _default_strategy_registry() -> dict[str, Any]:
+    """Lazy import of strategies; safe if module imports fail."""
+    out: dict[str, Any] = {}
+    try:
+        from strategies.consecutive_days import ConsecutiveDaysStrategy
+        out["consecutive_days"] = ConsecutiveDaysStrategy
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from strategies.combo_spread import ComboSpreadStrategy
+        out["combo_spread"] = ComboSpreadStrategy
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+class _RequestShim:
+    """Attribute-access wrapper around a dict for BaseStrategy.req params."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self._data = data or {}
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._data:
+            return self._data[name]
+        raise AttributeError(name)
+
+
 # ── Per-position tick ─────────────────────────────────────────────────────
 
 async def _process_position(
@@ -278,6 +392,11 @@ async def _process_position(
         journal.update_position(pos.id, high_water_mark=new_hwm)
 
     cfg = exit_config_for(pos, defaults)
+    strategy_exit = _resolve_strategy_exit(pos, defaults)
+    is_expiration_close = _resolve_expiration_close(
+        pos, today=today,
+        buffer_minutes=int(cfg.get("expiration_close_buffer_minutes", 15)),
+    )
     decision = evaluate_exit(
         pos,
         float(mid),
@@ -288,6 +407,8 @@ async def _process_position(
         force_exit=bool(cfg.get("force_exit", False)),
         high_water_mark=new_hwm,
         today=today,
+        strategy_exit=strategy_exit,
+        is_expiration_close=is_expiration_close,
     )
     if not decision.should_exit:
         return {"position_id": pos.id, "mid": float(mid), "status": "holding",

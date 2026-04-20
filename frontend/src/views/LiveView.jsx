@@ -5,6 +5,7 @@ import { fmtUsd, fmtPct, fmtTimeAgo, Card, Kpi, Badge, Btn, Pill, Heartbeat, Chi
 import { PriceChart } from '../chart.jsx';
 import { api, safe, IBKR_CREDS, setIbkrCreds } from '../api.js';
 import { loadConfig } from '../backtestConfig.js';
+import { CalendarStrip } from '../calendarStrip.jsx';
 
 export function LiveView() {
   const m = useData();
@@ -19,6 +20,8 @@ export function LiveView() {
   const [busy, setBusy] = useState(false);
   const [targetDte, setTargetDte] = useState(loadConfig().target_dte);
   const [contractsOverride, setContractsOverride] = useState(0);
+  const [chainPreview, setChainPreview] = useState(null);
+  const [chainBusy, setChainBusy] = useState(false);
 
   const monitorAge = m.monitor.last_tick_iso
     ? Math.floor((new Date() - new Date(m.monitor.last_tick_iso)) / 1000)
@@ -76,6 +79,26 @@ export function LiveView() {
     finally { setBusy(false); }
   }, [targetDte, contractsOverride]);
 
+  const previewChain = useCallback(async () => {
+    setChainBusy(true);
+    try {
+      const cfg = loadConfig();
+      const res = await api.liveChain(cfg.ticker || 'SPY');
+      const dte = Number(targetDte) || cfg.target_dte;
+      const target = new Date(Date.now() + dte * 86400000);
+      const chains = res?.chains || [];
+      const pick = chains.reduce((best, c) => {
+        const diff = Math.abs(new Date(c.expiration) - target);
+        return !best || diff < best._d ? { ...c, _d: diff } : best;
+      }, null);
+      const px = res?.price || 0;
+      const width = cfg.strike_width || 5;
+      const legs = pick?.calls?.filter(o => Math.abs(o.strike - px) <= width * 1.5).slice(0, 4) || [];
+      setChainPreview({ price: px, expiration: pick?.expiration, legs });
+    } catch (e) { setChainPreview({ error: e.message }); }
+    finally { setChainBusy(false); }
+  }, [targetDte]);
+
   const flattenAll = useCallback(async () => {
     setBusy(true); setTicketMsg('Flattening all…');
     try {
@@ -89,6 +112,7 @@ export function LiveView() {
 
   return (
     <div className="page">
+      <CalendarStrip onChange={() => {}} />
       <Card title="IBKR connection" icon="radar" subtitle={connectMsg || (ibkrAccount ? 'connected' : 'not connected')} actions={
         <>
           <Pill kind={ibkrAccount ? 'live' : m.__ibkr === 'live' ? 'live' : 'off'}>
@@ -221,9 +245,31 @@ export function LiveView() {
                 <Chip ok={!!ibkrAccount}>IBKR connected</Chip>
               </div>
             </div>
-            <Btn variant="primary" icon="send" disabled={busy || !ibkrAccount} onClick={submitOrder} style={{ justifyContent: 'center', padding: '10px' }}>
-              {busy ? 'Submitting…' : 'Submit combo LMT'}
-            </Btn>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <Btn variant="ghost" size="sm" icon="radar" disabled={chainBusy} onClick={previewChain} style={{ flex: 1, justifyContent: 'center' }}>
+                {chainBusy ? 'Loading chain…' : 'Preview chain'}
+              </Btn>
+              <Btn variant="primary" icon="send" disabled={busy || !ibkrAccount} onClick={submitOrder} style={{ flex: 2, justifyContent: 'center', padding: '10px' }}>
+                {busy ? 'Submitting…' : 'Submit combo LMT'}
+              </Btn>
+            </div>
+            {chainPreview && (
+              <div style={{ fontSize: 11, padding: 8, background: 'var(--bg-2)', borderRadius: 6, color: 'var(--text-2)' }}>
+                {chainPreview.error ? `Chain error: ${chainPreview.error}` : (
+                  <>
+                    <div className="mono" style={{ marginBottom: 4 }}>${chainPreview.price?.toFixed(2)} · exp {chainPreview.expiration}</div>
+                    {chainPreview.legs?.length === 0 && <div className="muted">No strikes near ATM</div>}
+                    {chainPreview.legs?.map((l, i) => (
+                      <div key={i} className="mono" style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10.5 }}>
+                        <span>C {l.strike}</span>
+                        <span>bid {l.bid?.toFixed(2)} / ask {l.ask?.toFixed(2)}</span>
+                        <span className="muted">IV {(l.impliedVolatility * 100)?.toFixed(0)}%</span>
+                      </div>
+                    ))}
+                  </>
+                )}
+              </div>
+            )}
             {ticketMsg && (
               <div style={{ fontSize: 11, padding: 8, background: 'var(--bg-2)', borderRadius: 6, color: 'var(--text-2)' }}>{ticketMsg}</div>
             )}

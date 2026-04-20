@@ -122,6 +122,9 @@ class BacktestRequest(BaseModel):
     years_history: int = 2
     capital_allocation: float = 10000.0
     contracts_per_trade: int = 1
+    # use_request §2 — single dropdown:
+    #   "fixed" | "dynamic_risk" | "targeted_spread" | "" (legacy/derive)
+    position_size_method: str = ""
     use_dynamic_sizing: bool = False
     risk_percent: float = 5.0
     max_trade_cap: float = 0.0
@@ -743,6 +746,34 @@ def live_chain(ticker: str = "SPY"):
 
 
 # ── Optimizer endpoint ─────────────────────────────────────────────────────
+@app.get("/api/strategies")
+def list_strategies():
+    """Return all registered strategies and their parameter schemas."""
+    out = []
+    for sid, cls in StrategyFactory.STRATEGIES.items():
+        try:
+            schema = cls.get_schema()
+        except Exception:  # noqa: BLE001
+            schema = {}
+        out.append({
+            "id": sid,
+            "name": getattr(cls(), "name", sid),
+            "schema": schema,
+        })
+    return {"strategies": out}
+
+
+@app.get("/api/strategies/{strategy_id}/schema")
+def get_strategy_schema(strategy_id: str):
+    cls = StrategyFactory.STRATEGIES.get(strategy_id)
+    if cls is None:
+        return {"error": "unknown_strategy", "strategy_id": strategy_id}
+    try:
+        return {"strategy_id": strategy_id, "schema": cls.get_schema()}
+    except Exception as e:  # noqa: BLE001
+        return {"error": "schema_failed", "detail": str(e)}
+
+
 @app.post("/api/optimize")
 def optimize(req: OptimizerRequest):
     try:
@@ -1013,6 +1044,91 @@ def stop_scanner():
 def get_scanner_status():
     return scanner_state
 
+
+# ── Scanner presets (use_request §4) ──────────────────────────────────────
+
+from core.presets import PresetStore as _PresetStore, ScannerPreset as _ScannerPreset
+
+_preset_store = _PresetStore()
+
+
+@app.get("/api/presets")
+def list_presets():
+    return {"presets": [p.to_dict() for p in _preset_store.list()]}
+
+
+@app.get("/api/presets/{name}")
+def get_preset(name: str):
+    p = _preset_store.get(name)
+    if p is None:
+        return {"error": "not_found", "name": name}
+    return p.to_dict()
+
+
+@app.post("/api/presets")
+def save_preset(payload: dict):
+    try:
+        preset = _ScannerPreset.from_dict(payload)
+    except (KeyError, ValueError, TypeError) as e:
+        return {"error": "invalid_preset", "detail": str(e)}
+    saved = _preset_store.save(preset)
+    return {"saved": True, "preset": saved.to_dict()}
+
+
+@app.delete("/api/presets/{name}")
+def delete_preset(name: str):
+    ok = _preset_store.delete(name)
+    return {"deleted": ok, "name": name}
+
+
+# ── Preset-driven scanner (use_request §4) ────────────────────────────────
+
+from core.scanner import Scanner as _Scanner, PresetRequired as _PresetRequired
+
+_preset_scanner = _Scanner(store=_preset_store)
+
+
+@app.post("/api/scanner/preset/start")
+def start_preset_scanner(payload: dict):
+    name = (payload or {}).get("name")
+    if not name:
+        return {"error": "missing_preset_name"}
+    try:
+        preset = _preset_scanner.load_preset(name)
+    except KeyError as e:
+        return {"error": "preset_not_found", "detail": str(e)}
+    return {"started": True, "preset": preset.to_dict()}
+
+
+@app.post("/api/scanner/preset/tick")
+def tick_preset_scanner():
+    """Manual tick — useful for tests + UI 'Scan Now' button."""
+    try:
+        signals = _preset_scanner.tick()
+    except _PresetRequired as e:
+        return {"error": "preset_required", "detail": str(e)}
+    return {
+        "signals": [s.to_dict() for s in signals],
+        "history": _preset_scanner.history(limit=20),
+    }
+
+
+@app.post("/api/scanner/preset/stop")
+def stop_preset_scanner():
+    _preset_scanner.stop()
+    return {"stopped": True}
+
+
+@app.get("/api/scanner/preset/status")
+def preset_scanner_status():
+    p = _preset_scanner.active_preset
+    return {
+        "active": _preset_scanner.is_active,
+        "preset": p.to_dict() if p else None,
+        "history": _preset_scanner.history(limit=20),
+    }
+
+
 class IBKRConnectRequest(BaseModel):
     host: str = "127.0.0.1"
     port: int = 7497
@@ -1044,6 +1160,7 @@ class IBKROrderRequest(BaseModel):
     target_dte: int = 14
     spread_cost_target: float = 250.0
     # Sizing overrides (0 = use SETTINGS defaults)
+    position_size_method: str = ""  # "fixed"|"dynamic_risk"|"targeted_spread"|""
     use_dynamic_sizing: bool = False
     use_targeted_spread: bool = False
     risk_percent: float = 5.0

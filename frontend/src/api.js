@@ -67,6 +67,20 @@ export const api = {
   // Backtest / optimizer
   runBacktest:    (cfg = {}) => post('/api/backtest', cfg, 120000),
   runOptimize:    (payload)  => post('/api/optimize', payload, 300000),
+  strategySchema: (id)       => get(`/api/strategies/${id}/schema`),
+
+  // Presets (use_request §4)
+  presetsList:    ()         => get('/api/presets'),
+  presetGet:      (name)     => get(`/api/presets/${encodeURIComponent(name)}`),
+  presetSave:     (preset)   => post('/api/presets', preset),
+  presetDelete:   (name)     => fetch(`${API}/api/presets/${encodeURIComponent(name)}`,
+                                       { method: 'DELETE' }).then(r => r.json()),
+
+  // Preset-driven scanner
+  presetScannerStart:  (name)  => post('/api/scanner/preset/start', { name }),
+  presetScannerTick:   ()      => post('/api/scanner/preset/tick'),
+  presetScannerStop:   ()      => post('/api/scanner/preset/stop'),
+  presetScannerStatus: ()      => get('/api/scanner/preset/status'),
 };
 
 export async function safe(fn, fallback = null) {

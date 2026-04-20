@@ -2,6 +2,9 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { fmtPct, fmtUsd, Card, Kpi, Badge, Btn, Switch } from '../primitives.jsx';
 import { EquityChart } from '../chart.jsx';
 import { api, safe } from '../api.js';
+import { StrategyParamsForm } from '../strategyParamsForm.jsx';
+import { OptimiserCard } from '../optimiserCard.jsx';
+import { CalendarStrip } from '../calendarStrip.jsx';
 import {
   DEFAULT_CONFIG,
   BUILT_IN_PRESETS,
@@ -130,6 +133,7 @@ export function BacktestView() {
 
   return (
     <div className="page">
+      <CalendarStrip onChange={() => {}} />
       <div className="grid g-5" style={{ marginBottom: 14 }}>
         <Card><Kpi label="Total Return" value={fmtPct(b.total_return_pct)} color={b.total_return_pct >= 0 ? 'var(--pos)' : 'var(--neg)'} big /></Card>
         <Card><Kpi label="Sharpe" value={b.sharpe.toFixed(2)} big /></Card>
@@ -215,11 +219,31 @@ export function BacktestView() {
             <Field label="Contracts"><input className="inp" type="number" value={config.contracts_per_trade} onChange={num('contracts_per_trade')} /></Field>
             <Field label="Spread cost target ($)"><input className="inp" type="number" value={config.spread_cost_target} onChange={num('spread_cost_target')} /></Field>
             <Field label="Commission / contract ($)"><input className="inp" type="number" step="0.01" value={config.commission_per_contract} onChange={num('commission_per_contract')} /></Field>
-            <Toggle label="Dynamic sizing (Kelly)" on={config.use_dynamic_sizing} onChange={bool('use_dynamic_sizing')} />
-            {config.use_dynamic_sizing && (
+            <Field label="Sizing method" full>
+              <select className="sel" value={config.position_size_method || (config.use_targeted_spread ? 'targeted_spread' : config.use_dynamic_sizing ? 'dynamic_risk' : 'fixed')}
+                      onChange={e => {
+                        const m = e.target.value;
+                        setConfig(prev => ({ ...prev,
+                          position_size_method: m,
+                          use_dynamic_sizing: m === 'dynamic_risk',
+                          use_targeted_spread: m === 'targeted_spread',
+                        }));
+                      }}>
+                <option value="fixed">Fixed (contracts)</option>
+                <option value="dynamic_risk">Dynamic risk (Kelly)</option>
+                <option value="targeted_spread">Targeted spread (% of equity, fall back to fixed)</option>
+              </select>
+            </Field>
+            {(config.position_size_method === 'dynamic_risk' || (!config.position_size_method && config.use_dynamic_sizing)) && (
               <>
                 <Field label="Risk % / trade"><input className="inp" type="number" value={config.risk_percent} onChange={num('risk_percent')} /></Field>
                 <Field label="Max trade cap ($)"><input className="inp" type="number" value={config.max_trade_cap} onChange={num('max_trade_cap')} /></Field>
+              </>
+            )}
+            {(config.position_size_method === 'targeted_spread' || (!config.position_size_method && config.use_targeted_spread)) && (
+              <>
+                <Field label="Targeted spread %"><input className="inp" type="number" step="0.01" value={config.targeted_spread_pct ?? 2} onChange={num('targeted_spread_pct')} /></Field>
+                <Field label="Spread cap ($)"><input className="inp" type="number" value={config.targeted_spread_cap ?? config.max_trade_cap ?? 2500} onChange={num('targeted_spread_cap')} /></Field>
               </>
             )}
           </Section>
@@ -247,8 +271,13 @@ export function BacktestView() {
             </Field>
             <Field label="Strike width ($)"><input className="inp" type="number" value={config.strike_width} onChange={num('strike_width')} /></Field>
             <Field label="Target DTE"><input className="inp" type="number" value={config.target_dte} onChange={num('target_dte')} /></Field>
-            <Field label="Entry red days"><input className="inp" type="number" value={config.entry_red_days} onChange={num('entry_red_days')} /></Field>
-            <Field label="Exit green days"><input className="inp" type="number" value={config.exit_green_days} onChange={num('exit_green_days')} /></Field>
+            <Field label="Strategy params" full>
+              <StrategyParamsForm
+                strategyId={config.strategy_id || 'consecutive_days'}
+                values={config}
+                onChange={(next) => setConfig(prev => ({ ...prev, ...next }))}
+              />
+            </Field>
           </Section>
 
           <Section title="Exit / risk">
@@ -302,6 +331,10 @@ export function BacktestView() {
             )}
           </Section>
         </Card>
+      </div>
+
+      <div className="grid g-32" style={{ marginBottom: 14 }}>
+        <OptimiserCard baseConfig={config} />
       </div>
     </div>
   );

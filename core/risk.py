@@ -185,16 +185,25 @@ def size_position(
     if risk_per_contract <= 0:
         return 0
 
-    if mode == "fixed":
+    # Aliases — UI dropdown uses "dynamic_risk"; canonical is "dynamic".
+    canonical = {"dynamic_risk": "dynamic"}.get(mode, mode)
+
+    if canonical == "fixed":
         contracts = max(0, int(fixed_contracts))
-    elif mode == "dynamic":
+    elif canonical == "dynamic":
         budget = equity * (risk_percent / 100.0)
         if max_trade_cap > 0:
             budget = min(budget, max_trade_cap)
         contracts = max(1, int(math.floor(budget / risk_per_contract)))
-    elif mode == "targeted_spread":
-        budget = min(equity * (target_spread_pct / 100.0), max_allocation_cap)
-        contracts = max(1, int(math.floor(budget / risk_per_contract)))
+    elif canonical == "targeted_spread":
+        # use_request §2③: try targeted % first; if it exceeds the cap,
+        # fall back to fixed_contracts.
+        raw_budget = equity * (target_spread_pct / 100.0)
+        if max_allocation_cap > 0 and raw_budget > max_allocation_cap:
+            contracts = max(0, int(fixed_contracts))
+        else:
+            budget = raw_budget if max_allocation_cap <= 0 else min(raw_budget, max_allocation_cap)
+            contracts = max(1, int(math.floor(budget / risk_per_contract)))
     else:
         raise ValueError(f"Unknown sizing mode: {mode!r}")
 
@@ -206,7 +215,14 @@ def size_position(
 
 
 def sizing_mode_from_request(req) -> str:
-    """Map the legacy BacktestRequest fields to a sizing mode string."""
+    """Map a request to a canonical sizing mode string.
+
+    Prefers the explicit ``position_size_method`` field (use_request §2),
+    falling back to the legacy boolean toggles for backward compatibility.
+    """
+    explicit = getattr(req, "position_size_method", "") or ""
+    if explicit:
+        return {"dynamic_risk": "dynamic"}.get(explicit, explicit)
     if getattr(req, "use_targeted_spread", False):
         return "targeted_spread"
     if getattr(req, "use_dynamic_sizing", False):

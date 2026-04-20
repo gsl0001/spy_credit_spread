@@ -549,14 +549,14 @@ class TestSizingParity:
         )
 
     def test_targeted_spread_cap_binds(self):
-        """When max_allocation_cap is the binding constraint."""
+        """use_request §2③: when raw % budget exceeds the allocation cap,
+        sizing falls back to ``fixed_contracts`` rather than clipping the
+        budget to the cap. This is the ``res n-contracts`` fallback."""
         equity = 100_000.0
         net_cost = 400.0
-        target_pct = 5.0
-        max_alloc = 800.0  # tight cap
-
-        target_risk = min(equity * (target_pct / 100.0), max_alloc)
-        contracts_bt = int(max(1, target_risk // net_cost))
+        target_pct = 5.0       # 5000 raw budget — well over cap
+        max_alloc = 800.0      # tight cap, triggers fallback
+        fixed = 3              # explicit fallback contracts
 
         contracts_live = size_position(
             equity=equity,
@@ -565,9 +565,9 @@ class TestSizingParity:
             mode="targeted_spread",
             target_spread_pct=target_pct,
             max_allocation_cap=max_alloc,
+            fixed_contracts=fixed,
         )
-        assert contracts_live == contracts_bt
-        assert contracts_live == 2  # 800 // 400
+        assert contracts_live == fixed
 
     def test_excess_liquidity_clamp(self):
         """size_position clamps by excess_liquidity — a live-only guard."""

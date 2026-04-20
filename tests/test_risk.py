@@ -192,11 +192,20 @@ def test_dynamic_respects_cap():
 
 
 @pytest.mark.unit
-def test_targeted_spread_caps_allocation():
-    # 1M * 2% = 20k, but capped at 2500 → floor(2500/250) = 10
+def test_targeted_spread_under_cap_uses_pct():
+    # 100k * 2% = $2000 budget, $250/contract -> 8 contracts
+    assert size_position(100_000, 250, 250, mode="targeted_spread",
+                         target_spread_pct=2.0,
+                         max_allocation_cap=2500) == 8
+
+
+@pytest.mark.unit
+def test_targeted_spread_over_cap_falls_back_to_fixed():
+    # use_request §2③: budget exceeds cap -> use fixed_contracts as fallback
     assert size_position(1_000_000, 250, 250, mode="targeted_spread",
                          target_spread_pct=2.0,
-                         max_allocation_cap=2500) == 10
+                         max_allocation_cap=2500,
+                         fixed_contracts=4) == 4
 
 
 @pytest.mark.unit
