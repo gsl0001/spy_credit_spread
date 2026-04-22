@@ -87,12 +87,39 @@ def is_market_open(now: Optional[datetime] = None, at_all_hours: bool = False) -
 
 
 def minutes_to_close(now: Optional[datetime] = None) -> int:
-    """How many minutes until 16:00 ET? Negative after close."""
+    """How many minutes until the market closes? Handles early closes via mcal."""
     ts = now or _now_et()
-    close = datetime.combine(ts.date(), time(16, 0))
+    
+    try:
+        import pandas_market_calendars as mcal # type: ignore
+        nyse = mcal.get_calendar("NYSE")
+        sched = nyse.schedule(start_date=ts.date().isoformat(),
+                              end_date=ts.date().isoformat())
+        if sched.empty:
+            # Weekend/Holiday, return a negative value based on 16:00
+            close_time = datetime.combine(ts.date(), time(16, 0))
+        else:
+            # schedule returns UTC. Convert ts to UTC for subtraction.
+            try:
+                import pytz
+                et = pytz.timezone("US/Eastern")
+                if ts.tzinfo is None:
+                    ts_aware = et.localize(ts)
+                else:
+                    ts_aware = ts
+                utc_ts = ts_aware.astimezone(pytz.UTC)
+                close_time = sched.iloc[0]["market_close"]
+                delta = close_time - utc_ts
+                return int(delta.total_seconds() // 60)
+            except ImportError:
+                # Without pytz, fallback to simple math
+                close_time = datetime.combine(ts.date(), time(16, 0))
+    except (ImportError, Exception):
+        close_time = datetime.combine(ts.date(), time(16, 0))
+
     if hasattr(ts, "tzinfo") and ts.tzinfo is not None:
-        close = close.replace(tzinfo=ts.tzinfo)
-    delta = close - ts
+        close_time = close_time.replace(tzinfo=ts.tzinfo)
+    delta = close_time - ts
     return int(delta.total_seconds() // 60)
 
 

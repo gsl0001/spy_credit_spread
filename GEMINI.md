@@ -30,6 +30,10 @@ Any modification to `core/`, `strategies/`, or `ibkr_trading.py` requires a safe
 - **Format**: `[ MODEL: {model} | CONTEXT: {used}/{limit} ({pct}%) | TOKENS: {total} | AGENTS: {count} ]`
 - Ensure this bar is visually separated from the main content by a single newline.
 
+### 6. Communication Protocol
+- **Brevity**: Do NOT show code blocks or large snippets when writing or proposing changes. 
+- **Details**: Provide only brief, high-signal technical details of logic shifts or improvements.
+
 ## Engineering Standards
 - Maintain visual/functional integrity.
 - Prioritize idempotency, safety, and connection resilience (TIER requirements).

@@ -188,7 +188,19 @@ def finalize_filled(
     elif order.kind == "exit":
         # Close out the position using real exit proceeds.
         exit_total = avg_fill_price * 100.0 * filled_qty
-        realized = exit_total - abs(position.entry_cost) - commission
+        
+        # I4: Sum all commissions for this position to get accurate Net realized_pnl.
+        # This includes the entry order(s) and the current exit order.
+        total_commission = commission
+        try:
+            prev_orders = journal.list_orders_for_position(position.id)
+            for po in prev_orders:
+                if po.id != order.id:
+                    total_commission += (po.commission or 0.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+        realized = exit_total - abs(position.entry_cost) - total_commission
         reason = "exit_filled"
         if position.state == "closing" and position.exit_reason:
             reason = position.exit_reason
@@ -202,6 +214,7 @@ def finalize_filled(
         journal.log_event("exit_filled", subject=position.id, payload={
             "avg_fill_price": avg_fill_price, "qty": filled_qty,
             "realized_pnl": realized, "commission": commission,
+            "total_commission": total_commission,
         })
 
 

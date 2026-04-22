@@ -1,3 +1,30 @@
+# Project Updates - Tuesday, April 21, 2026
+
+## 🚀 Key Improvements & Fix-Forward Actions
+
+### 1. Connection Resilience & Market Data Fallback (TIER 2 - I7)
+- **Exponential Backoff**: Refined `IBKRTrader.ensure_connected()` with a formal exponential backoff (5s, 10s, 20s, up to 60s) and timeout protection.
+- **Data Subscription Fallback**: The system now automatically requests delayed market data (Type 3) upon connection. This resolves the `Error 10089` (missing subscriptions) identified during the April 20th paper dry-run, ensuring the scanner and monitor can still operate with delayed quotes if live ones are unavailable.
+- **Enhanced Logging**: Added explicit warnings and errors for connection drops and failures to support TIER 2 health monitoring.
+
+### 2. Precise Commission & P&L Accounting (TIER 2 - I4)
+- **Net P&L Reconciliation**: Updated `core/fill_watcher.py` to calculate `realized_pnl` as a true Net figure. It now sums commissions from both entry and exit orders associated with a position before closing it.
+- **Journal Integrity**: Finalized exit events now carry both the current order commission and the total position commission for better auditability.
+
+### 3. Smart Market Hours & Holiday Support (TIER 2 - I8)
+- **Early-Close Awareness**: Refined `core/calendar.py::minutes_to_close()` to utilize `pandas_market_calendars` schedules. The system now correctly identifies early market closes (e.g., 1:00 PM ET) instead of assuming a hard 4:00 PM ET close.
+- **Robust Fallbacks**: Maintained simple 9:30-16:00 ET fallbacks for environments where market calendar libraries or timezone data are missing.
+
+### 4. Console Control Board (Interactive)
+- **Rich Dashboard**: Rebuilt `console_live.py` using `rich.layout` and `Live` for a multi-panel terminal UI (Header, Health, Positions, Logs).
+- **Interactive Command Loop**: Added a threaded CLI listener supporting `ls`, `use`, `pos`, `orders`, `flatten`, and `scan` toggles.
+- **Dynamic Reconfiguration**: The system now supports switching scanner presets and toggling automated scanning without restarting the process.
+- **Deployment Documentation**: Added `docs/server_deployment.md` with full command reference.
+
+### 5. Verification & Baseline
+- **Test Stability**: Verified 309 passing tests after all logic shifts.
+- **Dry-Run Fixes**: Addressed major blockers from yesterday's dry-run logs, preparing the system for a cleaner 5-day paper burn-in.
+
 # Project Updates - Sunday, April 19, 2026
 
 ## 🚀 Key Improvements & New Features

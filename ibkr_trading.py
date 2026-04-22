@@ -96,19 +96,35 @@ class IBKRTrader:
     async def connect(self):
         import time as _time
         try:
-            await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
+            # Set a timeout for the connection attempt
+            await asyncio.wait_for(
+                self.ib.connectAsync(self.host, self.port, clientId=self.client_id),
+                timeout=10
+            )
             self.connected = True
             self._retry_count = 0
+            # Set default market data type to delayed (3) if subscriptions are missing
+            # Callers can override this. 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen
+            self.ib.reqMarketDataType(3) 
+            logging.info("Connected to IBKR at %s:%s (cid=%s). Market data type set to 3 (delayed).", 
+                         self.host, self.port, self.client_id)
             return {"success": True, "msg": "Connected to IBKR"}
+        except asyncio.TimeoutError:
+            self.connected = False
+            self._retry_count += 1
+            self._last_retry_time = _time.monotonic()
+            return {"success": False, "msg": "Connection timeout"}
         except Exception as e:
             self.connected = False
             self._retry_count += 1
             self._last_retry_time = _time.monotonic()
+            logging.error("IBKR Connection failed: %s", e)
             return {"success": False, "msg": str(e)}
 
     def disconnect(self):
         try:
-            self.ib.disconnect()
+            if self.ib.isConnected():
+                self.ib.disconnect()
         except Exception:
             pass
         self.connected = False
@@ -117,18 +133,20 @@ class IBKRTrader:
     def is_alive(self) -> bool:
         """Return True only when the socket is actually connected."""
         try:
-            return self.connected and self.ib.isConnected()
+            return self.ib.isConnected()
         except Exception:
-            self.connected = False
             return False
 
     async def ensure_connected(self):
         """Reconnect if the socket dropped, with exponential backoff."""
         import time as _time
         if not self.is_alive():
+            if self.connected: # It was connected but dropped
+                logging.warning("IBKR connection dropped. Attempting reconnect...")
+            
             # I7: Exponential backoff logic
             if self._retry_count > 0:
-                # Max delay 60s
+                # Max delay 60s: 5, 10, 20, 40, 60, 60...
                 delay = min(60, (2 ** (self._retry_count - 1)) * 5)
                 elapsed = _time.monotonic() - self._last_retry_time
                 if elapsed < delay:
