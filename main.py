@@ -205,22 +205,25 @@ class OptimizerRequest(BaseModel):
 
 
 class StrategyFactory:
-    STRATEGIES = {
-        "consecutive_days": ConsecutiveDaysStrategy,
-        "combo_spread": ComboSpreadStrategy,
-        "dryrun": DryRunStrategy
-    }
+    """Backtest-side strategy lookup. Delegates to core.scanner's registry
+    so adding a new strategy only requires editing one dict."""
+
+    @staticmethod
+    def _registry() -> dict:
+        from core.scanner import list_strategy_classes
+        return list_strategy_classes()
 
     @staticmethod
     def get_strategy(strategy_id: str):
-        strat_cls = StrategyFactory.STRATEGIES.get(strategy_id, ConsecutiveDaysStrategy)
+        registry = StrategyFactory._registry()
+        strat_cls = registry.get(strategy_id) or registry.get("consecutive_days") or ConsecutiveDaysStrategy
         return strat_cls()
 
     @staticmethod
     def get_all_strategies():
         return [
             {"id": k, "name": v().name, "schema": v.get_schema()}
-            for k, v in StrategyFactory.STRATEGIES.items()
+            for k, v in StrategyFactory._registry().items()
         ]
 
 
@@ -999,7 +1002,7 @@ def run_market_scan():
                     place_equity_order(creds["api_key"], creds["api_secret"],
                                        _scan_symbol,
                                        config.get("contracts_per_trade", 1) * 100, side)
-                    _now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                    _now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
                     _jnl.record_order(_Order(
                         id=str(_uuid_scan.uuid4()),
                         position_id=None,
@@ -1132,16 +1135,115 @@ def delete_preset(name: str):
 
 # ── Preset-driven scanner (use_request §4) ────────────────────────────────
 
-from core.scanner import Scanner as _Scanner, PresetRequired as _PresetRequired
+from core.scanner import (
+    Scanner as _Scanner,
+    PresetRequired as _PresetRequired,
+    resolve_strategy_class as _resolve_strategy_class,
+)
 
 
-def _preset_bars_fetcher(symbol: str):
-    """Fetcher for the preset-driven scanner (parity with scan_signal)."""
+# IBKR canonical bar-size string → yfinance interval string. Recognised
+# values are the ones declared via BaseStrategy.BAR_SIZE; anything else
+# falls back to daily.
+_YF_INTERVAL_MAP = {
+    "1 min":   "1m",
+    "5 mins":  "5m",
+    "15 mins": "15m",
+    "30 mins": "30m",
+    "1 hour":  "60m",
+    "1 day":   "1d",
+}
+
+# yfinance period caps depending on intraday granularity. yfinance
+# rejects e.g. period="1mo" with interval="1m" — these are the safe
+# defaults used when the strategy didn't declare HISTORY_PERIOD or
+# declared one that's too long for the requested interval.
+_YF_INTRADAY_CAP = {
+    "1m":  "7d",
+    "5m":  "60d",
+    "15m": "60d",
+    "30m": "60d",
+    "60m": "730d",
+}
+
+# IBKR durationStr defaults paired to bar size. IBKR enforces strict
+# (barSize, duration) pairs — these are conservative working values.
+_IB_DURATION_MAP = {
+    "1 min":   "2 D",
+    "5 mins":  "5 D",
+    "15 mins": "15 D",
+    "30 mins": "30 D",
+    "1 hour":  "30 D",
+    "1 day":   "30 D",
+}
+
+
+def _resolve_bar_spec(preset_or_strategy):
+    """Resolve (bar_size, history_period) for a preset OR a bare strategy name.
+
+    Reads the strategy class's ``BAR_SIZE`` / ``HISTORY_PERIOD`` class
+    attributes (Option B — strategy-declared). Falls back to daily if
+    the strategy can't be resolved.
+
+    Accepts either a ``ScannerPreset`` (uses ``preset.strategy_name``) or
+    a string strategy id directly — so the monitor can ask for bars
+    sized to a position's recorded strategy without needing the preset.
+    """
+    bar_size = "1 day"
+    history_period = "1mo"
+    strategy_name = None
+    if isinstance(preset_or_strategy, str):
+        strategy_name = preset_or_strategy
+    elif preset_or_strategy is not None:
+        strategy_name = getattr(preset_or_strategy, "strategy_name", None)
+    if strategy_name:
+        cls = _resolve_strategy_class(strategy_name)
+        if cls is not None:
+            bar_size = getattr(cls, "BAR_SIZE", bar_size)
+            history_period = getattr(cls, "HISTORY_PERIOD", history_period)
+    return bar_size, history_period
+
+
+def _preset_bars_fetcher(symbol: str, strategy_name: Optional[str] = None):
+    """Fetcher for the preset-driven scanner AND the live-monitor's
+    strategy-exit checks.
+
+    Honours the strategy's declared ``BAR_SIZE`` / ``HISTORY_PERIOD``
+    so intraday strategies (e.g. dryrun) get 5-minute bars while daily
+    strategies (consecutive_days, combo_spread) get daily bars.
+
+    Resolution order for the strategy:
+      1. Explicit ``strategy_name`` argument (used by the monitor — picks
+         the bar size based on the position being checked, regardless of
+         which preset is currently active in the scanner).
+      2. The currently active scanner preset's strategy.
+      3. Daily defaults.
+    """
     import yfinance as yf
     from core.settings import SETTINGS
     import asyncio
-    
-    # 1. Try to get live anchor price from IBKR
+
+    # The active preset is consulted for two things: bar-size resolution
+    # (when no explicit ``strategy_name`` is passed) and the
+    # ``fetch_only_live`` flag below.
+    p = _preset_scanner.active_preset
+    if strategy_name:
+        bar_size, history_period = _resolve_bar_spec(strategy_name)
+    else:
+        bar_size, history_period = _resolve_bar_spec(p)
+    is_intraday = bar_size != "1 day"
+
+    yf_interval = _YF_INTERVAL_MAP.get(bar_size, "1d")
+    # Cap the period for intraday intervals so yfinance doesn't reject the request.
+    if is_intraday:
+        cap = _YF_INTRADAY_CAP.get(yf_interval, "5d")
+        # Take whichever is shorter — strategy's declared period or the cap.
+        # Simple approach: trust the cap unless strategy explicitly declared shorter.
+        yf_period = history_period if history_period in {"1d", "2d", "5d", "7d"} else cap
+    else:
+        yf_period = history_period
+
+    # ── 1. Live anchor (only useful for daily bars) ────────────────────
     live_price = None
     trader = None
     try:
@@ -1149,65 +1251,75 @@ def _preset_bars_fetcher(symbol: str):
         creds = SETTINGS.ibkr.as_dict()
         key = f"{creds.get('host', '127.0.0.1')}:{creds.get('port', 7497)}:{creds.get('client_id', 1)}"
         trader = _ib_instances.get(key)
-        if trader and trader.is_alive():
+        if trader and trader.is_alive() and not is_intraday:
             loop = _MAIN_LOOP
             if loop and loop.is_running():
-                live = asyncio.run_coroutine_threadsafe(trader.get_live_price(symbol), loop).result(timeout=5)
+                live = asyncio.run_coroutine_threadsafe(
+                    trader.get_live_price(symbol), loop,
+                ).result(timeout=5)
                 live_price = live.get("last")
     except Exception:
         pass
 
-    # 1b. Fallback live price from Yahoo (if IBKR failed or no subscription)
-    if not live_price:
+    if not live_price and not is_intraday:
         try:
-            # fast_info provides the absolute latest trade price available to yfinance
             live_price = yf.Ticker(symbol).fast_info.get("lastPrice")
         except Exception:
             pass
 
-    # 2. Try Pure Live mode if preset requests it
-    p = _preset_scanner.active_preset
+    # ── 2. Pure-Live mode via IBKR historical (requires Historical Data entitlement) ──
     if p and getattr(p, "fetch_only_live", False) and trader and trader.is_alive():
         try:
             loop = _MAIN_LOOP
             if loop and loop.is_running():
+                ib_duration = _IB_DURATION_MAP.get(bar_size, "30 D")
                 df = asyncio.run_coroutine_threadsafe(
-                    trader.get_historical_bars(symbol, duration="30 D", bar_size="1 day"),
-                    loop
+                    trader.get_historical_bars(symbol, duration=ib_duration, bar_size=bar_size),
+                    loop,
                 ).result(timeout=10)
                 if df is not None and not df.empty:
-                    # On IBKR, the last bar might already be 'live' if RTH is on, 
-                    # but if we have a fresher tick from get_live_price, update it.
-                    if live_price:
+                    if live_price and not is_intraday:
                         df.loc[df.index[-1], "Close"] = live_price
                     return df
         except Exception:
             pass
 
-    # 3. Fallback to yfinance (Hybrid Mode)
-    df = yf.download(symbol, period="1mo", interval="1d", progress=False)
+    # ── 3. yfinance fallback (free, no subscription) ──────────────────
+    df = yf.download(symbol, period=yf_period, interval=yf_interval, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     if len(df) == 0:
         return df
-    
+
     df.reset_index(inplace=True)
-    if "Date" not in df.columns and "index" in df.columns:
-        df.rename(columns={"index": "Date"}, inplace=True)
+    # yfinance puts the timestamp column under different names depending on interval.
+    for cand in ("Date", "Datetime", "index"):
+        if cand in df.columns:
+            if cand != "Date":
+                df.rename(columns={cand: "Date"}, inplace=True)
+            break
+
+    # Timezone handling: intraday strategies compare ts.time() against ET
+    # wall-clock windows (e.g. 09:35), so convert to America/New_York
+    # *before* stripping the tz. Daily bars don't need this.
     if hasattr(df["Date"].dt, "tz") and df["Date"].dt.tz is not None:
+        if is_intraday:
+            try:
+                df["Date"] = df["Date"].dt.tz_convert("America/New_York")
+            except Exception:
+                pass
         df["Date"] = df["Date"].dt.tz_localize(None)
 
-    # 4. Inject live anchor for more accurate RSI/EMA scanning
-    if live_price:
-        # Check if the last bar is from today. If it is, update it. 
-        # If it's from yesterday, append a new 'pseudo-bar' for today.
+    # Mirror the index to "Date" so strategies that read either work.
+    df.set_index("Date", drop=False, inplace=True)
+
+    # ── 4. Live anchor injection (daily-bar hack only) ────────────────
+    if live_price and not is_intraday:
         last_dt = df["Date"].iloc[-1].date()
         today_dt = datetime.now().date()
-        
         if last_dt == today_dt:
             df.loc[df.index[-1], "Close"] = live_price
         else:
-            # Append today's live data
             new_row = df.iloc[-1].copy()
             new_row["Date"] = datetime.now().replace(microsecond=0)
             new_row["Open"] = live_price
@@ -1215,7 +1327,7 @@ def _preset_bars_fetcher(symbol: str):
             new_row["Low"] = live_price
             new_row["Close"] = live_price
             df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-            
+
     return df
 
 
@@ -1239,32 +1351,88 @@ def _run_preset_tick():
             # I5: Auto-execute signals if preset allows it
             p = _preset_scanner.active_preset
             if p and p.auto_execute:
-                for sig in signals:
-                    if sig.fired and sig.signal_type == "entry":
-                        # Generate idempotency key
-                        _date = datetime.now().strftime("%Y-%m-%d")
-                        _idem_key = f"scan:{_date}:{sig.symbol}:{p.name}"
-
-                        from core.journal import get_journal
-                        journal = get_journal()
-                        if journal.get_order_by_idempotency(_idem_key):
-                            log_event(_startup_log, "preset_scan_duplicate_suppressed", key=_idem_key)
+                from core.settings import SETTINGS
+                from core.journal import get_journal as _gj
+                ib_creds = SETTINGS.ibkr.as_dict()
+                if not (ib_creds.get("host") and ib_creds.get("port")):
+                    log_event(_startup_log, "preset_auto_execute_skipped",
+                              reason="no_ibkr_creds", preset=p.name)
+                else:
+                    for sig in signals:
+                        if not (sig.fired and sig.signal_type == "entry"):
                             continue
 
-                        # Execute! (For now, only IBKR is wired for real spreads in this path)
-                        # We use the ticket from the signal which has all the sizing/params
-                        from core.settings import SETTINGS
-                        ib_creds = SETTINGS.ibkr.as_dict()
-                        if ib_creds.get("host") and ib_creds.get("port"):
-                            # Build a request-like object for ibkr_execute to reuse logic
-                            # or call internal logic. Since ibkr_execute is an endpoint,
-                            # we can call it or refactor. For now, we'll log the signal.
-                            log_event(_startup_log, "preset_scan_signal_fired", 
-                                      symbol=sig.symbol, preset=p.name, key=_idem_key)
-                            
-                            # Note: Actual execution would call a shared internal version of 
-                            # ibkr_execute. Given the scope, ensuring the IDEM KEY logic 
-                            # is present completes the I5 requirement.
+                        # Per-day idempotency: same symbol + preset can only fire once/day
+                        _date = datetime.now().strftime("%Y-%m-%d")
+                        _idem_key = f"scan:{_date}:{sig.symbol}:{p.name}"
+                        if _gj().get_order_by_idempotency(_idem_key):
+                            log_event(_startup_log, "preset_scan_duplicate_suppressed",
+                                      key=_idem_key)
+                            continue
+
+                        log_event(_startup_log, "preset_scan_signal_fired",
+                                  symbol=sig.symbol, preset=p.name, key=_idem_key)
+
+                        # Build the order request from preset + signal
+                        try:
+                            order_req = IBKROrderRequest(
+                                creds=IBKRConnectRequest(
+                                    host=ib_creds["host"],
+                                    port=int(ib_creds["port"]),
+                                    client_id=int(ib_creds.get("client_id", 1)),
+                                ),
+                                symbol=sig.symbol or p.ticker,
+                                topology=p.topology,
+                                direction=p.strategy_type,
+                                contracts=int(getattr(sig, "contracts", 0) or 0),
+                                strike_width=int(p.strike_width),
+                                target_dte=int(p.target_dte),
+                                spread_cost_target=float(p.spread_cost_target),
+                                position_size_method=p.position_size_method or "",
+                                risk_percent=float(p.sizing_params.get("risk_percent", 5.0)),
+                                max_trade_cap=float(p.sizing_params.get("max_trade_cap", 0.0)),
+                                target_spread_pct=float(p.sizing_params.get("target_spread_pct", 2.0)),
+                                max_allocation_cap=float(p.sizing_params.get("max_allocation_cap", 2500.0)),
+                                stop_loss_pct=float(p.stop_loss_pct),
+                                take_profit_pct=float(p.take_profit_pct),
+                                trailing_stop_pct=float(p.trailing_stop_pct),
+                                client_order_id=_idem_key,
+                            )
+                        except Exception as e:
+                            log_event(_startup_log, "preset_auto_execute_build_failed",
+                                      error=str(e), preset=p.name)
+                            continue
+
+                        # Schedule the async order placement on the main event loop.
+                        # _run_preset_tick runs in the APScheduler thread, so we
+                        # need run_coroutine_threadsafe to cross threads safely.
+                        loop = _MAIN_LOOP
+                        if loop is None or not loop.is_running():
+                            log_event(_startup_log, "preset_auto_execute_skipped",
+                                      reason="loop_not_running", preset=p.name)
+                            continue
+                        try:
+                            future = asyncio.run_coroutine_threadsafe(
+                                _ibkr_execute_impl(order_req), loop,
+                            )
+                            result = future.result(timeout=60)
+                        except Exception as e:
+                            log_event(_startup_log, "preset_auto_execute_failed",
+                                      error=str(e), preset=p.name, key=_idem_key)
+                            continue
+
+                        if isinstance(result, dict) and result.get("error"):
+                            log_event(_startup_log, "preset_auto_execute_rejected",
+                                      preset=p.name, key=_idem_key,
+                                      error=result.get("error"),
+                                      reason=result.get("reason"))
+                        else:
+                            log_event(_startup_log, "preset_auto_execute_submitted",
+                                      preset=p.name, key=_idem_key,
+                                      order_id=result.get("order_id"),
+                                      position_id=result.get("position_id"),
+                                      contracts=result.get("contracts"),
+                                      limit=result.get("limit_price"))
     except Exception as e:
         log_event(_startup_log, "preset_tick_failed", error=str(e))
 
@@ -1398,9 +1566,15 @@ class IBKROrderRequest(BaseModel):
     client_order_id: Optional[str] = None
 
 
-@app.post("/api/ibkr/execute")
-async def ibkr_execute(req: IBKROrderRequest):
-    """Live order path — uses real chain, risk checks, journal, and fill watcher."""
+async def _ibkr_execute_impl(req: IBKROrderRequest) -> dict:
+    """Live order path — used by both /api/ibkr/execute and the preset
+    auto-execute scheduler. Performs idempotency check, chain resolution,
+    sizing, pre-trade risk gate, order submission, and journaling.
+
+    Returns a JSON-serialisable dict with either ``success: True`` (and
+    order details) or ``error: "..."`` so callers can surface the result
+    uniformly.
+    """
     import uuid as _uuid
     from core.journal import Position, Order, get_journal
     from core.risk import (
@@ -1492,6 +1666,17 @@ async def ibkr_execute(req: IBKROrderRequest):
         journal.log_event("risk_rejected", subject=req.symbol, payload={
             "reason": decision.reason, **decision.details,
         })
+        # Telegram: only buzz on risk-gate rejections; sizing_zero / chain
+        # failures are noisier (every tick of a misconfigured preset would
+        # ping the phone).
+        try:
+            from core.telegram_bot import notify_entry_rejected
+            notify_entry_rejected(
+                req.symbol, decision.reason,
+                detail=", ".join(f"{k}={v}" for k, v in (decision.details or {}).items()),
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return {"error": "risk_rejected", "reason": decision.reason, "details": decision.details}
 
     # 6. Determine order side from spread type (C5 fix — no more hardcoded BUY)
@@ -1512,7 +1697,7 @@ async def ibkr_execute(req: IBKROrderRequest):
     order_id = str(_uuid.uuid4())
     # I5: use client_order_id if provided, else fall back to position-based key
     idem_key = req.client_order_id if req.client_order_id else f"entry:{pos_id}"
-    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     try:
         res = await trader.place_combo_order(
@@ -1566,6 +1751,16 @@ async def ibkr_execute(req: IBKROrderRequest):
         "broker_order_id": broker_order_id,
     })
 
+    # Telegram: ping the operator that an order is in flight.
+    try:
+        from core.telegram_bot import notify_entry_submitted
+        notify_entry_submitted(
+            req.symbol, side, contracts, limit_price,
+            idem_key=idem_key,
+        )
+    except Exception:  # noqa: BLE001
+        pass  # best-effort; never let notify failure rollback an order
+
     return {
         "success": True,
         "position_id": pos_id,
@@ -1583,6 +1778,22 @@ async def ibkr_execute(req: IBKROrderRequest):
         "K_short": spread.meta.get("K_short"),
         "underlying_price": spread.underlying_price,
     }
+
+
+@app.post("/api/ibkr/execute")
+async def ibkr_execute(req: IBKROrderRequest):
+    """Public order endpoint — thin wrapper around _ibkr_execute_impl."""
+    return await _ibkr_execute_impl(req)
+
+
+# Haircut percentages for exit paths.
+# - Manual exit: moderate (0.05) — same as the algorithmic monitor.
+# - Flatten-all (panic button): aggressive (0.15) — user wants out NOW,
+#   accept slippage to ensure fills cross any reasonable spread.
+_EXIT_HAIRCUT_MANUAL = 0.05
+_EXIT_HAIRCUT_PANIC = 0.15
+
+
 @app.post("/api/ibkr/exit")
 async def ibkr_exit(req: dict):
     """Manual exit for a single position. JSON: { "creds": {...}, "position_id": "..." }"""
@@ -1605,19 +1816,39 @@ async def ibkr_exit(req: dict):
     try:
         legs_list = [dict(leg) for leg in pos.legs]
         mid = await trader.get_combo_midpoint(pos.symbol, legs_list)
-        if mid is None or mid <= 0:
-            mid = 0.01
+        # No quote → don't fabricate a $0.01 limit that can never fill.
+        # Tell the caller the real situation so they can retry, escalate
+        # to flatten-all (which uses a market-order fallback), or wait.
+        if mid is None or mid <= 0 or (isinstance(mid, float) and np.isnan(mid)):
+            journal.log_event("exit_no_quote", subject=pos_id, payload={
+                "symbol": pos.symbol, "reason": "manual_close",
+            })
+            return {
+                "error": "no_quote",
+                "detail": "Could not fetch a combo midpoint for this position. "
+                          "Retry once a quote is available, or use FLATTEN ALL "
+                          "to escalate to a market-order close.",
+                "position_id": pos_id,
+            }
         res = await submit_exit_order(
-            trader, pos, float(mid), "manual_close", journal, haircut_pct=0.0,
+            trader, pos, float(mid), "manual_close", journal,
+            haircut_pct=_EXIT_HAIRCUT_MANUAL,
         )
-        return {"success": True, **res}
+        # ``submit_exit_order`` never raises — surface its real outcome
+        # (ok / error) instead of an unconditional success: True.
+        return {"success": bool(res.get("ok")), **res}
     except Exception as e:
         return {"error": str(e)}
 
 
 @app.post("/api/ibkr/flatten_all")
 async def ibkr_flatten_all(req: IBKRConnectRequest):
-    """C6: Kill switch — close every open position at market mid. One-button panic."""
+    """C6: Kill switch — close every open position aggressively.
+
+    Uses a wide haircut so limit orders cross any reasonable spread, and
+    falls back to a market order when no quote is available. The user
+    clicked panic for a reason; getting filled matters more than slippage.
+    """
     from core.journal import get_journal
     from core.monitor import submit_exit_order
 
@@ -1637,17 +1868,85 @@ async def ibkr_flatten_all(req: IBKRConnectRequest):
         try:
             legs_list = [dict(leg) for leg in pos.legs]
             mid = await trader.get_combo_midpoint(pos.symbol, legs_list)
-            if mid is None or mid <= 0:
-                mid = 0.01  # market-close fallback
-            res = await submit_exit_order(
-                trader, pos, float(mid), "manual_flatten", journal, haircut_pct=0.0,
-            )
+            if mid is None or mid <= 0 or (isinstance(mid, float) and np.isnan(mid)):
+                # No quote — fall back to a market-order close so the
+                # position actually exits. ``_market_close_position`` posts
+                # the same journal entries as ``submit_exit_order`` but
+                # with ``lmtPrice=None`` so IBKR routes it as a market order.
+                res = await _market_close_position(trader, pos, journal,
+                                                    reason="manual_flatten_market")
+            else:
+                res = await submit_exit_order(
+                    trader, pos, float(mid), "manual_flatten", journal,
+                    haircut_pct=_EXIT_HAIRCUT_PANIC,
+                )
             results.append({"position_id": pos.id, **res})
         except Exception as e:
             results.append({"position_id": pos.id, "error": str(e)})
 
     journal.log_event("flatten_all", payload={"count": len(results)})
+    try:
+        from core.telegram_bot import notify_alert
+        notify_alert("critical", f"FLATTEN ALL fired — {len(results)} position(s) closing")
+    except Exception:  # noqa: BLE001
+        pass
     return {"closed": len(results), "results": results}
+
+
+async def _market_close_position(trader, pos, journal, *, reason: str) -> dict:
+    """Fallback close path used when no combo quote is available.
+
+    Submits the close as a market order (no ``lmtPrice``) so it crosses
+    any spread. Mirrors ``submit_exit_order``'s journaling so the fill
+    watcher reconciles the resulting fill the same way as a normal exit.
+    """
+    import uuid as _uuid
+    from datetime import timezone as _tz
+    from core.journal import Order
+
+    # Closing side: debit spreads (entered BUY) close SELL; credits the inverse.
+    combo_type = (pos.meta or {}).get("combo_type", "debit")
+    close_side = "SELL" if combo_type == "debit" else "BUY"
+
+    # Reverse the legs so place_combo_order interprets the close correctly
+    # when we pass side=close_side.
+    legs = []
+    for leg in pos.legs:
+        flipped = dict(leg)
+        side = leg.get("side", "long")
+        flipped["side"] = "short" if side == "long" else "long"
+        legs.append(flipped)
+    try:
+        res = await trader.place_combo_order(
+            pos.symbol, legs, int(pos.contracts), side=close_side, lmtPrice=None,
+        )
+    except Exception as e:
+        journal.log_event("exit_failed", subject=pos.id, payload={
+            "reason": reason, "error": f"{type(e).__name__}: {e}",
+        })
+        return {"ok": False, "error": str(e), "reason": reason}
+
+    broker_order_id = str(res.get("orderId", "")) if isinstance(res, dict) else ""
+    order_id = str(_uuid.uuid4())
+    journal.record_order(Order(
+        id=order_id,
+        position_id=pos.id,
+        broker=pos.broker,
+        broker_order_id=broker_order_id or None,
+        side=close_side,
+        limit_price=None,
+        status="submitted",
+        submitted_at=datetime.now(_tz.utc).isoformat(timespec="seconds"),
+        kind="exit",
+        idempotency_key=f"exit:{pos.id}:{reason}",
+    ))
+    journal.update_position(pos.id, state="closing")
+    journal.log_event("exit_submitted", subject=pos.id, payload={
+        "reason": reason, "order_type": "MARKET",
+        "broker_order_id": broker_order_id,
+    })
+    return {"ok": True, "order_id": order_id, "reason": reason,
+            "order_type": "MARKET"}
 
 
 @app.post("/api/ibkr/chain_debug")
@@ -1972,7 +2271,14 @@ _last_monitor_tick_iso: Optional[str] = None
 
 
 def _run_monitor_tick():
-    """Sync wrapper that drives the async monitor tick from APScheduler."""
+    """Sync wrapper that drives the async monitor tick from APScheduler.
+
+    Builds the ``defaults`` dict explicitly — including the strategy-aware
+    ``bars_fetcher`` — so the monitor's ``_resolve_strategy_exit`` actually
+    has bars to evaluate. Without this, only stop/profit/trailing/expiry
+    gates fire; the strategy's own ``check_exit`` (e.g. consecutive-day
+    reversal) is dead code.
+    """
     import asyncio as _aio
     from core.monitor import tick
     from core.settings import SETTINGS
@@ -1990,12 +2296,24 @@ def _run_monitor_tick():
         trader, _ = await get_ib_connection(creds)
         return trader
 
+    defaults = {
+        "stop_loss_pct": SETTINGS.risk.default_stop_loss_pct,
+        "take_profit_pct": SETTINGS.risk.default_take_profit_pct,
+        "trailing_stop_pct": SETTINGS.risk.default_trailing_stop_pct,
+        "dte_exit_at": 0,
+        "haircut_pct": SETTINGS.risk.limit_price_haircut,
+        # Wire the strategy-aware bars fetcher so check_exit() has data.
+        "bars_fetcher": _preset_bars_fetcher,
+    }
+
     global _last_monitor_tick_iso
     loop = _MAIN_LOOP
     if loop is None or not loop.is_running():
         return  # app not fully started yet
     try:
-        future = _aio.run_coroutine_threadsafe(tick(_factory), loop)
+        future = _aio.run_coroutine_threadsafe(
+            tick(_factory, defaults=defaults), loop,
+        )
         future.result(timeout=55)  # block until done; propagates exceptions
         _last_monitor_tick_iso = datetime.now(timezone.utc).isoformat(
             timespec="seconds"
@@ -2022,7 +2340,7 @@ def _run_fill_reconcile():
         creds = SETTINGS.ibkr.as_dict()
         trader, _ = await get_ib_connection(creds)
         if trader:
-            await reconcile_once(trader)
+            await reconcile_once(trader, timeout_seconds=SETTINGS.risk.fill_timeout_seconds)
 
     loop = _MAIN_LOOP
     if loop is None or not loop.is_running():
@@ -2085,8 +2403,40 @@ def start_monitor(interval: int = 15):
         replace_existing=True,
     )
 
+    # Telegram bot polling — dormant unless TELEGRAM_BOT_TOKEN + CHAT_ID
+    # are set. Stateless poll; 3s default interval is responsive enough
+    # for human commands without hammering Telegram's API.
+    try:
+        from core.telegram_bot import configured as _tg_configured
+        from core.settings import SETTINGS
+        if _tg_configured():
+            tg_secs = max(int(SETTINGS.telegram.poll_interval_seconds), 1)
+            for job in scheduler.get_jobs():
+                if job.id == "telegram_bot":
+                    job.remove()
+            scheduler.add_job(_run_telegram_poll, "interval", seconds=tg_secs,
+                              id="telegram_bot", replace_existing=True)
+            log_event(_startup_log, "telegram_bot_registered",
+                      poll_interval_seconds=tg_secs)
+    except Exception as e:  # noqa: BLE001
+        log_event(_startup_log, "telegram_bot_register_failed",
+                  level=_logging.WARNING, error=str(e))
+
     log_event(_startup_log, "monitor_started", interval_seconds=secs)
     return {"status": "started", "interval_seconds": secs, "leader": True}
+
+
+def _run_telegram_poll():
+    """APScheduler wrapper — drain pending Telegram updates and dispatch
+    any registered slash-command handlers. No-op when not configured."""
+    try:
+        from core.telegram_bot import poll_once, configured as _tg_configured
+        if not _tg_configured():
+            return
+        poll_once()
+    except Exception as e:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).warning("telegram poll failed: %s", e)
 
 
 def _run_daily_digest():
@@ -2346,6 +2696,66 @@ def trigger_digest():
     digest = build_daily_digest(journal)
     sent = send_daily_digest(journal)
     return {"sent": sent, "digest": digest}
+
+
+@app.get("/api/telegram/status")
+def telegram_status():
+    """Report whether the Telegram bot is configured and active.
+
+    Returns whether ``TELEGRAM_BOT_TOKEN`` + ``TELEGRAM_CHAT_ID`` are set,
+    the masked chat id (so the operator can verify they didn't typo it),
+    and which slash commands are registered.
+    """
+    from core.telegram_bot import configured, list_commands
+    from core.settings import SETTINGS
+    poll_job = next(
+        (j for j in scheduler.get_jobs() if j.id == "telegram_bot"), None,
+    )
+    chat_id = SETTINGS.telegram.chat_id
+    masked_chat = (chat_id[:3] + "…" + chat_id[-3:]) if chat_id and len(chat_id) > 6 else (chat_id or "")
+    return {
+        "configured": configured(),
+        "chat_id_masked": masked_chat,
+        "poll_interval_seconds": SETTINGS.telegram.poll_interval_seconds,
+        "polling_active": poll_job is not None,
+        "commands": list_commands(),
+    }
+
+
+@app.post("/api/telegram/test")
+def telegram_test_message(payload: Optional[dict] = None):
+    """Send a test message to the configured chat.
+
+    Body optional: ``{"text": "..."}`` to override the default. Used by
+    the UI to confirm the token + chat id are working.
+    """
+    from core.telegram_bot import notify, configured
+    if not configured():
+        return {
+            "sent": False,
+            "error": "telegram_not_configured",
+            "detail": "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars and restart.",
+        }
+    text = (payload or {}).get("text") or (
+        "✅ *SPY Spread Bot test message*\n"
+        "If you can read this, your Telegram bot is wired up correctly. "
+        "Send /help for the command list."
+    )
+    sent = notify(text)
+    return {"sent": sent}
+
+
+@app.post("/api/telegram/poll_once")
+def telegram_poll_once_endpoint():
+    """Force one Telegram update poll. Useful for tests + manual debugging.
+
+    Normally polling runs every few seconds via APScheduler, but this lets
+    you drain pending updates synchronously without waiting for the next tick.
+    """
+    from core.telegram_bot import poll_once, configured
+    if not configured():
+        return {"error": "telegram_not_configured", "processed": 0}
+    return {"processed": poll_once()}
 
 
 @app.post("/api/monitor/stop")

@@ -185,6 +185,14 @@ def finalize_filled(
             "avg_fill_price": avg_fill_price, "qty": filled_qty,
             "commission": commission,
         })
+        try:
+            from core.telegram_bot import notify_entry_filled
+            notify_entry_filled(
+                position.symbol, filled_qty, avg_fill_price,
+                position_id=position.id,
+            )
+        except Exception:  # noqa: BLE001
+            pass
     elif order.kind == "exit":
         # Close out the position using real exit proceeds.
         exit_total = avg_fill_price * 100.0 * filled_qty
@@ -216,6 +224,16 @@ def finalize_filled(
             "realized_pnl": realized, "commission": commission,
             "total_commission": total_commission,
         })
+        # Telegram: ping the operator with the closing P&L. Best-effort,
+        # never let a notify failure break the journal write above.
+        try:
+            from core.telegram_bot import notify_exit_filled
+            notify_exit_filled(
+                position.symbol, realized, reason,
+                position_id=position.id,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def finalize_cancelled(

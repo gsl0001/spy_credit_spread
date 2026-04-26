@@ -40,6 +40,12 @@ from core.monitor import tick as monitor_tick
 from core.fill_watcher import reconcile_once
 from core.scanner import Scanner, PresetRequired
 from core.presets import PresetStore
+from core.telegram_bot import (
+    configured as tg_configured,
+    notify as tg_notify,
+    poll_once as tg_poll_once,
+    list_commands as tg_list_commands,
+)
 
 # ── Configuration & Global State ───────────────────────────────────────────
 configure_root_logging()
@@ -81,22 +87,29 @@ def make_header(scanner: Scanner) -> Panel:
     
     # SPY Price
     spy_display = Text(f"SPY: ${_spy_price:.2f}", style="bold yellow") if _spy_price > 0 else Text("SPY: ---", style="dim")
-    
+
     # Preset
     preset_name = scanner.active_preset.name if scanner and scanner.active_preset else "None"
     now = datetime.now().strftime("%H:%M:%S")
+
+    # Telegram bot indicator
+    if tg_configured():
+        tg_text = Text("● TG", style="green")
+    else:
+        tg_text = Text("○ TG", style="dim")
 
     grid = Table.grid(expand=True)
     grid.add_column(justify="left", ratio=1)
     grid.add_column(justify="center", ratio=1)
     grid.add_column(justify="right", ratio=1)
-    
+
     grid.add_row(
-        Text.assemble(("SYSTEM ", "bold cyan"), ("v2.1 ", "dim"), ("| ", "dim"), conn_text),
+        Text.assemble(("SYSTEM ", "bold cyan"), ("v2.1 ", "dim"), ("| ", "dim"),
+                      conn_text, ("  ", ""), tg_text),
         Text(f"PRESET: {preset_name}", style="bold magenta"),
         Text.assemble((f"{now} ", "bold white"), ("| ", "dim"), l_status)
     )
-    
+
     grid.add_row(
         Text.assemble(("UPTIME: ", "dim"), (uptime_str, "white")),
         spy_display,
@@ -137,9 +150,104 @@ def make_command_ref() -> Panel:
         (" use <name> ", "bold cyan"), ("switch  ", "dim"),
         (" pos ", "bold cyan"), ("details  ", "dim"),
         (" flatten ", "bold red"), ("panic close  ", "dim"),
+        (" tg ", "bold cyan"), ("telegram  ", "dim"),
         (" exit ", "bold yellow"), ("shutdown", "dim")
     )
     return Panel(ref, title="[dim]Quick Commands[/dim]", border_style="dim", box=box.SIMPLE)
+
+
+# ── Dashboard panels ──────────────────────────────────────────────────────
+# These two functions used to be referenced by ``make_layout`` but never
+# defined — calling the dashboard would crash on first render. Adding them
+# completes the layout contract.
+
+
+def make_positions_summary(journal: Journal) -> Table:
+    """Compact active-positions table for the dashboard's right pane.
+
+    Lists every position in pending / open / closing state with its
+    direction, contract count, entry cost, current state, and an estimate
+    of unrealised P&L when ``meta['mtm']`` (mark-to-market) is available.
+    The monitor populates ``meta['mtm']`` each tick, so for healthy
+    positions the panel shows live P&L.
+    """
+    table = Table(box=box.SIMPLE, expand=True, show_header=True,
+                  header_style="bold cyan", padding=(0, 1))
+    table.add_column("Symbol", style="bold white", no_wrap=True)
+    table.add_column("Dir",    justify="left",  style="dim")
+    table.add_column("Qty",    justify="right")
+    table.add_column("Entry",  justify="right")
+    table.add_column("State",  justify="center")
+    table.add_column("P&L",    justify="right")
+
+    try:
+        positions = journal.list_open()
+    except Exception as e:
+        table.add_row(f"[red]journal error: {e}[/red]", "", "", "", "", "")
+        return table
+
+    if not positions:
+        table.add_row("[dim]— no active positions —[/dim]", "", "", "", "", "")
+        return table
+
+    for p in positions:
+        # Best-effort live P&L: prefer meta['mtm'] (set by monitor each tick)
+        # × 100 × contracts − entry_cost. Fall back to dash if unavailable.
+        pnl_str = "—"
+        pnl_style = "dim"
+        try:
+            meta = p.meta or {}
+            mtm = meta.get("mtm")
+            if mtm is not None and p.contracts:
+                pnl = (float(mtm) * 100.0 * p.contracts) - (p.entry_cost or 0.0)
+                pnl_style = "green" if pnl >= 0 else "red"
+                pnl_str = f"${pnl:+,.2f}"
+        except Exception:
+            pass
+
+        state_style = {
+            "open":    "green",
+            "pending": "yellow",
+            "closing": "yellow",
+        }.get(p.state, "white")
+
+        table.add_row(
+            p.symbol,
+            (p.direction or "—")[:10],
+            str(p.contracts),
+            f"${(p.entry_cost or 0):,.2f}",
+            f"[{state_style}]{p.state}[/{state_style}]",
+            f"[{pnl_style}]{pnl_str}[/{pnl_style}]",
+        )
+    return table
+
+
+def make_logs_panel() -> Panel:
+    """Most-recent activity log lines, freshest at the bottom.
+
+    Dashboard footer reserves ~9 visible rows after the cmd-ref slice;
+    showing the last 8 entries keeps the most relevant context on screen.
+    Lines are rendered as plain text — the timestamps in ``add_log`` use
+    ``[HH:MM:SS]`` which would otherwise look like Rich style tags and
+    error out the markup parser.
+    """
+    if not _logs:
+        return Panel(
+            Text("no logs yet", style="dim"),
+            title="[dim]Activity Log[/dim]",
+            border_style="dim", box=box.SIMPLE,
+        )
+    body = Text(no_wrap=False)
+    for i, line in enumerate(_logs[-8:]):
+        if i:
+            body.append("\n")
+        body.append(line)  # plain text — no markup interpretation
+    return Panel(
+        body,
+        title="[dim]Activity Log[/dim]",
+        border_style="dim", box=box.SIMPLE,
+    )
+
 
 def make_layout(journal: Journal, scanner: Scanner) -> Layout:
     layout = Layout()
@@ -194,13 +302,22 @@ def run_metrics_job():
                 price = 0.0
                 if connected:
                     res = await trader.get_live_price("SPY")
-                    price = res.get("last", 0.0)
+                    # ``get_live_price`` returns None for ``last`` when the
+                    # account has no SPY market-data subscription. Coerce
+                    # to 0.0 so ``make_header``'s `_spy_price > 0` check
+                    # doesn't throw TypeError.
+                    raw = res.get("last") if isinstance(res, dict) else None
+                    try:
+                        price = float(raw) if raw is not None else 0.0
+                    except (TypeError, ValueError):
+                        price = 0.0
                 return connected, price
             return False, 0.0
-        
+
         _ibkr_connected, _spy_price = loop.run_until_complete(_update())
     except Exception:
         _ibkr_connected = False
+        _spy_price = 0.0
 
 def run_monitor_job(journal: Journal):
     global _last_monitor_tick
@@ -244,6 +361,24 @@ def run_scanner_job(scanner: Scanner, journal: Journal):
     except Exception as e:
         add_log(f"Scanner Error: {e}")
 
+
+def run_telegram_poll_job():
+    """Drain pending Telegram updates and dispatch slash commands.
+
+    Runs in the background thread alongside the monitor / fill / scanner
+    jobs. No-op when the bot isn't configured. Exceptions are swallowed
+    so a Telegram outage can't take the dashboard down.
+    """
+    if not tg_configured():
+        return
+    try:
+        n = tg_poll_once()
+        if n > 0:
+            add_log(f"Telegram: dispatched {n} command(s).")
+    except Exception as e:
+        add_log(f"Telegram poll error: {e}")
+
+
 def add_log(msg: str):
     now = datetime.now().strftime("%H:%M:%S")
     _logs.append(f"[{now}] {msg}")
@@ -274,10 +409,11 @@ def cmd_pos(journal: Journal):
     for p in journal.list_all():
         if p.state in ("open", "pending", "closing"):
             pnl = p.realized_pnl or 0.0
+            entry_cost = p.entry_cost or 0.0
             color = "green" if pnl >= 0 else "red"
             table.add_row(
-                p.id[:8], p.symbol, p.direction, str(p.contracts),
-                f"${p.entry_cost:.2f}", p.state, f"[{color}]${pnl:.2f}[/{color}]"
+                p.id[:8], p.symbol, p.direction or "—", str(p.contracts),
+                f"${entry_cost:.2f}", p.state, f"[{color}]${pnl:.2f}[/{color}]"
             )
     console.print(table)
 
@@ -289,29 +425,134 @@ def cmd_orders(journal: Journal):
     table.add_column("Limit")
     table.add_column("Status")
     
-    # Need to access orders via journal
-    # For now, let's assume we can list them
     try:
         orders = journal.list_orders_by_status(("filled", "submitted", "cancelled"))
         for o in orders[:10]:
-            table.add_row(o.submitted_at[11:19], "?", o.side, f"{o.limit_price}", o.status)
-    except: pass
+            # ``submitted_at`` is "YYYY-MM-DDTHH:MM:SS+00:00" — slice the time portion.
+            t = (o.submitted_at or "")[11:19] or "—"
+            # Market orders have ``limit_price=None`` (used by the panic
+            # market-close fallback). Show "MKT" instead of "None".
+            limit = "MKT" if o.limit_price is None else f"${o.limit_price:.2f}"
+            table.add_row(t, "?", o.side or "—", limit, o.status or "—")
+    except Exception as e:
+        console.print(f"[red]orders query failed: {e}[/red]")
     console.print(table)
 
 async def cmd_flatten(journal: Journal):
-    from core.monitor import submit_exit_order
+    """Console panic close — uses the same aggressive-haircut + market-fallback
+    path as ``/api/ibkr/flatten_all`` so behaviour stays consistent across
+    the UI, the FastAPI endpoint, the Telegram bot, and this console."""
+    from core.telegram_bot import notify_alert
+
+    open_pos = journal.list_open()
+    if not open_pos:
+        console.print("[yellow]No open positions to flatten.[/yellow]")
+        return
+
     trader = await _trader_factory()
     if not trader:
         console.print("[red]Error: Could not connect to IBKR[/red]")
         return
-    
-    open_pos = journal.list_open()
+
     console.print(f"[bold red]FLATTENING {len(open_pos)} POSITIONS...[/bold red]")
+
+    # Reuse main.py's helpers so we get identical behaviour everywhere:
+    #   - ``submit_exit_order`` with the panic haircut when we have a quote
+    #   - ``_market_close_position`` (market order) when no quote is available
+    # Importing main here is a bit ugly but keeps a single source of truth
+    # for the close path; refactoring to a shared module is the next step.
+    import main as _main_app
+    from core.monitor import submit_exit_order
+
+    closed = 0
+    failed = 0
     for p in open_pos:
-        legs_list = [dict(leg) for leg in p.legs]
-        mid = await trader.get_combo_midpoint(p.symbol, legs_list)
-        await submit_exit_order(trader, p, float(mid or 0.01), "manual_flatten", journal)
-    add_log(f"Flattened {len(open_pos)} positions.")
+        try:
+            legs_list = [dict(leg) for leg in p.legs]
+            mid = await trader.get_combo_midpoint(p.symbol, legs_list)
+            if mid is None or mid <= 0 or (isinstance(mid, float) and mid != mid):
+                # NaN or no quote → market order so it actually closes.
+                res = await _main_app._market_close_position(
+                    trader, p, journal, reason="console_flatten_market",
+                )
+            else:
+                res = await submit_exit_order(
+                    trader, p, float(mid), "console_flatten", journal,
+                    haircut_pct=_main_app._EXIT_HAIRCUT_PANIC,
+                )
+            if res.get("ok"):
+                closed += 1
+            else:
+                failed += 1
+                console.print(f"  [red]✗ {p.id[:8]}: {res.get('error', 'failed')}[/red]")
+        except Exception as e:
+            failed += 1
+            console.print(f"  [red]✗ {p.id[:8]}: {e}[/red]")
+
+    add_log(f"Flattened {closed}/{len(open_pos)} positions"
+            f"{f' ({failed} failed)' if failed else ''}.")
+    # Notify Telegram so the operator sees the panic event on their phone too.
+    try:
+        notify_alert(
+            "critical",
+            f"FLATTEN ALL fired from console — {closed}/{len(open_pos)} closing"
+            f"{f' ({failed} failed)' if failed else ''}",
+        )
+    except Exception:
+        pass
+
+
+def cmd_tg(args: list[str]) -> None:
+    """Telegram bot command — show status / send a test message."""
+    sub = (args[0] if args else "status").lower()
+
+    if sub == "status":
+        if not tg_configured():
+            console.print(
+                "[yellow]Telegram bot:[/yellow] [bold]not configured[/bold]\n"
+                "Set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in your .env "
+                "and restart."
+            )
+            return
+        cmds = ", ".join(f"/{c}" for c in tg_list_commands())
+        console.print(
+            "[green]Telegram bot:[/green] [bold]active[/bold]\n"
+            f"  Polling every {SETTINGS.telegram.poll_interval_seconds}s\n"
+            f"  Registered commands: [cyan]{cmds}[/cyan]"
+        )
+        return
+
+    if sub == "test":
+        if not tg_configured():
+            console.print("[red]Telegram bot not configured.[/red]")
+            return
+        text = (
+            " ".join(args[1:]).strip()
+            or "✅ Test message from SPY console live."
+        )
+        ok = tg_notify(text)
+        console.print(
+            f"[green]✓ Sent[/green]" if ok else "[red]✗ Send failed[/red]"
+        )
+        return
+
+    if sub == "send":
+        if not tg_configured():
+            console.print("[red]Telegram bot not configured.[/red]")
+            return
+        text = " ".join(args[1:]).strip()
+        if not text:
+            console.print("[yellow]Usage: tg send <message>[/yellow]")
+            return
+        ok = tg_notify(text)
+        console.print(
+            f"[green]✓ Sent[/green]" if ok else "[red]✗ Send failed[/red]"
+        )
+        return
+
+    console.print(
+        "[yellow]Usage:[/yellow] tg [status|test|send <text>]"
+    )
 
 # ── Main Loop ─────────────────────────────────────────────────────────────
 
@@ -346,17 +587,37 @@ def main():
     scheduler.add_job(run_monitor_job, "interval", seconds=args.interval, args=[journal], id="monitor")
     scheduler.add_job(run_fill_job, "interval", seconds=args.interval, args=[journal], id="fills")
     scheduler.add_job(run_metrics_job, "interval", seconds=5, id="metrics")
-    
+
+    # Telegram bot polling — dormant unless TELEGRAM_BOT_TOKEN+CHAT_ID are set.
+    # Lets the operator control + monitor the console session from their phone.
+    if tg_configured():
+        scheduler.add_job(
+            run_telegram_poll_job, "interval",
+            seconds=max(int(SETTINGS.telegram.poll_interval_seconds), 1),
+            id="telegram_poll",
+        )
+        add_log(f"Telegram bot active — {len(tg_list_commands())} commands registered.")
+
     def register_scanner():
         if scanner.is_active:
             p = scanner.active_preset
             if p.timing_mode == "interval":
                 scheduler.add_job(run_scanner_job, "interval", seconds=p.timing_value, args=[scanner, journal], id="scanner")
-    
+
     register_scanner()
     scheduler.start()
-    
+
     add_log("System Online.")
+    # Telegram: announce console-mode startup.
+    if tg_configured():
+        try:
+            preset_msg = (
+                f" · preset `{scanner.active_preset.name}`"
+                if scanner.is_active else ""
+            )
+            tg_notify(f"📟 *Console Live started*{preset_msg}")
+        except Exception:
+            pass
 
     # Dashboard Thread
     def dashboard_loop():
@@ -382,7 +643,20 @@ def main():
             if cmd in ("exit", "quit"):
                 break
             elif cmd == "help":
-                console.print("\n[bold]Commands:[/bold]\n  ls           List presets\n  use <name>   Switch preset\n  pos          Show positions\n  orders       Show orders\n  flatten      Panic close all\n  scan on/off  Toggle scanner\n  clear        Clear logs\n  exit         Shutdown\n")
+                console.print(
+                    "\n[bold]Commands:[/bold]\n"
+                    "  ls               List presets\n"
+                    "  use <name>       Switch preset\n"
+                    "  pos              Show positions\n"
+                    "  orders           Show orders\n"
+                    "  flatten          Panic close all (notifies Telegram)\n"
+                    "  scan on/off      Toggle scanner\n"
+                    "  tg [status]      Telegram bot state + commands\n"
+                    "  tg test [text]   Send a test message\n"
+                    "  tg send <text>   Push an arbitrary message\n"
+                    "  clear            Clear logs\n"
+                    "  exit             Shutdown\n"
+                )
             elif cmd == "ls":
                 cmd_ls(store)
             elif cmd == "pos":
@@ -396,6 +670,11 @@ def main():
                     if scheduler.get_job("scanner"): scheduler.remove_job("scanner")
                     register_scanner()
                     add_log(f"Switched to {p_name}")
+                    if tg_configured():
+                        try:
+                            tg_notify(f"📟 Console preset switched to `{p_name}`")
+                        except Exception:
+                            pass
                 except:
                     console.print(f"[red]Preset {p_name} not found.[/red]")
             elif cmd == "flatten":
@@ -406,11 +685,15 @@ def main():
             elif cmd == "scan on":
                 register_scanner()
                 add_log("Scanner enabled.")
+            elif cmd.startswith("tg"):
+                # Tokenise: "tg test hello world" → ["test", "hello", "world"]
+                tg_args = cmd.split()[1:]
+                cmd_tg(tg_args)
             elif cmd == "clear":
                 _logs.clear()
             else:
                 console.print(f"[yellow]Unknown command: {cmd}[/yellow]")
-            
+
             time.sleep(0.5)
 
     except KeyboardInterrupt:
@@ -419,6 +702,12 @@ def main():
         _stop_event.set()
         scheduler.shutdown()
         release_leadership()
+        # Telegram: announce graceful shutdown.
+        if tg_configured():
+            try:
+                tg_notify("🛑 *Console Live stopped*")
+            except Exception:
+                pass
         console.print("[bold yellow]Shutting down... Goodbye![/bold yellow]")
 
 if __name__ == "__main__":

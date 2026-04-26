@@ -28,6 +28,37 @@ from core.presets import PresetStore, ScannerPreset
 logger = logging.getLogger(__name__)
 
 
+def list_strategy_classes() -> dict:
+    """Return ``{strategy_id: cls}`` for every known strategy.
+
+    Single source of truth — Scanner, monitor's strategy-exit resolver,
+    main's StrategyFactory, and the bars fetcher all read this. Adding
+    a new strategy means editing one dict, not four.
+    """
+    try:
+        from strategies.consecutive_days import ConsecutiveDaysStrategy
+        from strategies.combo_spread import ComboSpreadStrategy
+        from strategies.dryrun import DryRunStrategy
+    except Exception:  # noqa: BLE001
+        return {}
+    return {
+        "consecutive_days": ConsecutiveDaysStrategy,
+        "combo_spread": ComboSpreadStrategy,
+        "dryrun": DryRunStrategy,
+    }
+
+
+def resolve_strategy_class(name: str):
+    """Module-level strategy resolver shared by Scanner and the bars fetcher.
+
+    Returns the strategy class for ``name`` (e.g. "dryrun"), or ``None`` if
+    the name is unknown or the strategies package failed to import.
+    Callers can read ``cls.BAR_SIZE`` / ``cls.HISTORY_PERIOD`` to pick the
+    right historical-data request without instantiating the strategy.
+    """
+    return list_strategy_classes().get(name)
+
+
 class PresetRequired(RuntimeError):
     """Raised when the scanner ticks without an active preset."""
 
@@ -264,17 +295,7 @@ class Scanner:
 
     @staticmethod
     def _default_strategy_resolver(name: str):
-        try:
-            from strategies.consecutive_days import ConsecutiveDaysStrategy
-            from strategies.combo_spread import ComboSpreadStrategy
-            from strategies.dryrun import DryRunStrategy
-        except Exception:  # noqa: BLE001
-            return None
-        return {
-            "consecutive_days": ConsecutiveDaysStrategy,
-            "combo_spread": ComboSpreadStrategy,
-            "dryrun": DryRunStrategy,
-        }.get(name)
+        return resolve_strategy_class(name)
 
 
 class _ParamShim:

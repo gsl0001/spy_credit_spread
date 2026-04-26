@@ -58,9 +58,9 @@ export function JournalView() {
                   <td><span className="mono">{o.id}</span><div className="muted" style={{ fontSize: 10.5 }}>→ {o.pos || '—'}</div></td>
                   <td><Badge variant={o.kind === 'entry' ? 'info' : 'neutral'}>{o.kind}</Badge></td>
                   <td><Badge variant={o.side === 'BUY' ? 'pos' : 'neg'} dot>{o.side}</Badge></td>
-                  <td className="num">{o.qty}</td>
-                  <td className="num">${o.lmt.toFixed(2)}</td>
-                  <td className="num">{o.fill ? `$${o.fill.toFixed(2)}` : '—'}</td>
+                  <td className="num">{o.qty ?? 0}</td>
+                  <td className="num">${(o.lmt ?? 0).toFixed(2)}</td>
+                  <td className="num">{o.fill != null ? `$${o.fill.toFixed(2)}` : '—'}</td>
                   <td><Badge variant={o.status === 'filled' ? 'pos' : o.status === 'pending' ? 'warn' : 'neutral'}>{o.status}</Badge></td>
                   <td><span className="mono" style={{ fontSize: 11, color: 'var(--text-3)' }}>{o.idem}</span></td>
                   <td className="muted mono" style={{ fontSize: 11 }}>{fmtTimeAgo(o.submitted)}</td>
@@ -81,9 +81,9 @@ export function JournalView() {
                 <tr key={c.id}>
                   <td><span className="mono">{c.id}</span></td>
                   <td><span className="mono">{c.legs}</span></td>
-                  <td className="num">{c.contracts}</td>
-                  <td className="num">${c.entry.toFixed(2)}</td>
-                  <td className="num">${c.exit.toFixed(2)}</td>
+                  <td className="num">{c.contracts ?? 0}</td>
+                  <td className="num">${(c.entry ?? 0).toFixed(2)}</td>
+                  <td className="num">${(c.exit ?? 0).toFixed(2)}</td>
                   <td className="num" style={{ color: c.pnl >= 0 ? 'var(--pos)' : 'var(--neg)', fontWeight: 600 }}>
                     {fmtUsd(c.pnl, true)} <span className="muted" style={{ fontSize: 11 }}>({fmtPct(c.pnl_pct)})</span>
                   </td>
@@ -107,9 +107,9 @@ export function JournalView() {
                 <tr key={o.id}>
                   <td className="mono">{o.fill_id || '—'}</td>
                   <td className="mono">{o.id}</td>
-                  <td className="num">{o.qty}</td>
-                  <td className="num">${o.fill.toFixed(2)}</td>
-                  <td className="num">${o.commission.toFixed(2)}</td>
+                  <td className="num">{o.qty ?? 0}</td>
+                  <td className="num">${(o.fill ?? 0).toFixed(2)}</td>
+                  <td className="num">${(o.commission ?? 0).toFixed(2)}</td>
                   <td className="mono muted" style={{ fontSize: 11 }}>{o.exec_id || '—'}</td>
                   <td className="muted mono" style={{ fontSize: 11 }}>{fmtTimeAgo(o.submitted)}</td>
                 </tr>

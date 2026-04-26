@@ -1,7 +1,10 @@
 import { Ico } from './icons.jsx';
 
-export function TweaksPanel({ open, onClose, tweaks, setTweaks }) {
-  if (!open) return null;
+// NOTE: visibility is controlled by the parent (App.jsx renders this only
+// when `tweaksOpen` is true). The previous `if (!open) return null` guard
+// expected an `open` prop the parent never passed, so the panel never
+// rendered. Mount/unmount stays the parent's responsibility.
+export function TweaksPanel({ onClose, tweaks, setTweaks }) {
   const set = (k, v) => setTweaks(prev => ({ ...prev, [k]: v }));
 
   return (

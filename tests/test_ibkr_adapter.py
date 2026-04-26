@@ -85,6 +85,7 @@ def _make_trader(ib: MagicMock | None = None):
         trader.ib = ib
         trader._retry_count = 0
         trader._last_retry_time = 0
+        trader._no_mktdata_subs = set()
     return trader
 
 

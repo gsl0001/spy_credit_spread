@@ -11,6 +11,8 @@ import { PaperView } from './views/PaperView.jsx';
 import { Ico } from './icons.jsx';
 import { fmtTimeAgo, Btn } from './primitives.jsx';
 import { useData } from './useBackendData.jsx';
+import { Statusbar } from './statusbar.jsx';
+import { api } from './api.js';
 
 const STORAGE_VIEW = 'spy_ui_view';
 
@@ -38,7 +40,29 @@ export default function App() {
   const [tweaksOpen, setTweaksOpen] = useState(false);
   const [bellOpen, setBellOpen] = useState(false);
   const [panicOpen, setPanicOpen] = useState(false);
+  const [panicBusy, setPanicBusy] = useState(false);
+  const [panicMsg, setPanicMsg] = useState('');
   const backend = useData();
+
+  const confirmFlattenAll = async () => {
+    if (panicBusy) return;
+    setPanicBusy(true);
+    setPanicMsg('Submitting…');
+    try {
+      const res = await api.flatten();
+      if (res?.error) {
+        setPanicMsg(`Error: ${res.error}`);
+      } else {
+        setPanicMsg(`✓ ${res?.closed ?? 0} position(s) closing`);
+        // Auto-close the dialog on success after a brief confirmation pause.
+        setTimeout(() => { setPanicOpen(false); setPanicMsg(''); }, 1800);
+      }
+    } catch (e) {
+      setPanicMsg(`Error: ${e.message}`);
+    } finally {
+      setPanicBusy(false);
+    }
+  };
 
   useEffect(() => { localStorage.setItem(STORAGE_VIEW, view); }, [view]);
 
@@ -111,7 +135,7 @@ export default function App() {
 
       {panicOpen && (
         <div style={{ position: 'fixed', inset: 0, zIndex: 300, background: 'rgba(0,0,0,.6)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-          onClick={() => setPanicOpen(false)}>
+          onClick={() => { if (!panicBusy) { setPanicOpen(false); setPanicMsg(''); } }}>
           <div style={{
             background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 12,
             padding: '32px 40px', width: 420, textAlign: 'center',
@@ -121,12 +145,22 @@ export default function App() {
               <Ico name="alert-triangle" size={28} stroke={2} />
             </div>
             <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 8 }}>Flatten All Positions?</div>
-            <div style={{ color: 'var(--text-2)', fontSize: 13, marginBottom: 24, lineHeight: 1.5 }}>
+            <div style={{ color: 'var(--text-2)', fontSize: 13, marginBottom: 16, lineHeight: 1.5 }}>
               This will immediately submit market orders to close all {backend.positions.length} open spread(s). Action cannot be undone.
             </div>
+            {panicMsg && (
+              <div style={{
+                fontSize: 12, marginBottom: 16,
+                color: panicMsg.startsWith('Error') ? 'var(--neg)' : panicMsg.startsWith('✓') ? 'var(--pos)' : 'var(--text-2)',
+              }}>
+                {panicMsg}
+              </div>
+            )}
             <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
-              <Btn variant="ghost" onClick={() => setPanicOpen(false)}>Cancel</Btn>
-              <Btn variant="danger" icon="zap" onClick={() => setPanicOpen(false)}>Confirm Flatten All</Btn>
+              <Btn variant="ghost" disabled={panicBusy} onClick={() => { setPanicOpen(false); setPanicMsg(''); }}>Cancel</Btn>
+              <Btn variant="danger" icon="zap" disabled={panicBusy} onClick={confirmFlattenAll}>
+                {panicBusy ? 'Submitting…' : 'Confirm Flatten All'}
+              </Btn>
             </div>
           </div>
         </div>
@@ -135,6 +169,14 @@ export default function App() {
       {tweaksOpen && (
         <TweaksPanel tweaks={tweaks} setTweaks={setTweaks} onClose={() => setTweaksOpen(false)} />
       )}
+
+      <Statusbar
+        online={backend.__online}
+        ibkr={backend.__ibkr}
+        mkt={{ open: backend.risk.market_open, next: backend.risk.next_close || '—' }}
+        openPositions={backend.positions.length}
+        dailyPnl={backend.account.daily_pnl}
+      />
     </div>
   );
 }

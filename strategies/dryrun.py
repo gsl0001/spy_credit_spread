@@ -6,17 +6,23 @@ from strategies.base import BaseStrategy
 class DryRunStrategy(BaseStrategy):
     """
     Test strategy for 'dry run' verification.
-    
+
     Logic:
     - Opens a trade exactly at specific times after market open.
     - Closes each trade exactly 5 minutes later.
     - Executes 3 times per day.
-    
+
     Times (ET):
     1. Open 09:35, Close 09:40
     2. Open 12:00, Close 12:05
     3. Open 14:30, Close 14:35
     """
+
+    # Intraday strategy — needs 5-minute ET-localised bars so that
+    # ``ts.time()`` lines up with the entry/exit windows below.
+    # 5d of yfinance 5-minute history is plenty of warm-up.
+    BAR_SIZE: str = "5 mins"
+    HISTORY_PERIOD: str = "5d"
 
     @property
     def name(self) -> str:

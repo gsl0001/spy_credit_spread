@@ -82,6 +82,10 @@ export const api = {
   presetScannerTick:   ()      => post('/api/scanner/preset/tick'),
   presetScannerStop:   ()      => post('/api/scanner/preset/stop'),
   presetScannerStatus: ()      => get('/api/scanner/preset/status'),
+
+  // Telegram bot
+  telegramStatus: ()       => get('/api/telegram/status'),
+  telegramTest:   (text)   => post('/api/telegram/test', text ? { text } : {}),
 };
 
 export async function safe(fn, fallback = null) {

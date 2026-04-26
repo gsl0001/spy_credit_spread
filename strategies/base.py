@@ -2,7 +2,25 @@ import pandas as pd
 from abc import ABC, abstractmethod
 import numpy as np
 
+
 class BaseStrategy(ABC):
+    # ── Bar-size contract ────────────────────────────────────────────────
+    # These class attributes declare the bar resolution and lookback the
+    # strategy needs. The scanner's bars-fetcher reads them via
+    # ``cls.BAR_SIZE`` / ``cls.HISTORY_PERIOD`` and translates to the
+    # appropriate yfinance interval/period or IBKR
+    # barSizeSetting/durationStr — keeping cadence and bar size aligned
+    # is an invariant of the strategy class, not a runtime config.
+    #
+    # ``BAR_SIZE`` uses the IBKR canonical form so it round-trips to
+    # ``reqHistoricalDataAsync`` directly. Recognised values:
+    #   "1 min", "5 mins", "15 mins", "30 mins", "1 hour", "1 day"
+    #
+    # ``HISTORY_PERIOD`` is yfinance period notation:
+    #   "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"
+    BAR_SIZE: str = "1 day"
+    HISTORY_PERIOD: str = "1mo"
+
     @property
     @abstractmethod
     def name(self) -> str:

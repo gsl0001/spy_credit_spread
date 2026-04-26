@@ -132,10 +132,41 @@ class RiskSettings:
 
 
 @dataclass(frozen=True)
+class TelegramSettings:
+    """Telegram bot configuration.
+
+    The bot is dormant unless ``bot_token`` AND ``chat_id`` are both set.
+    Only messages from ``chat_id`` are accepted — this is the entire
+    authorization model, so set this carefully (it's effectively a
+    write-key for your trading account).
+
+    Get a token from @BotFather; get your chat_id from @userinfobot
+    after sending a message.
+    """
+    bot_token: str = field(default_factory=lambda: _env("TELEGRAM_BOT_TOKEN"))
+    chat_id: str = field(default_factory=lambda: _env("TELEGRAM_CHAT_ID"))
+    poll_interval_seconds: int = field(
+        default_factory=lambda: _env_int("TELEGRAM_POLL_INTERVAL_SECONDS", 3)
+    )
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.bot_token and self.chat_id)
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        masked = lambda s: (s[:6] + "…" + s[-4:]) if s and len(s) > 12 else ("set" if s else "")
+        return (
+            f"TelegramSettings(bot_token={masked(self.bot_token)!r}, "
+            f"chat_id={masked(self.chat_id)!r})"
+        )
+
+
+@dataclass(frozen=True)
 class Settings:
     ibkr: IBKRSettings = field(default_factory=IBKRSettings)
     alpaca: AlpacaSettings = field(default_factory=AlpacaSettings)
     risk: RiskSettings = field(default_factory=RiskSettings)
+    telegram: TelegramSettings = field(default_factory=TelegramSettings)
     journal_db_path: str = field(
         default_factory=lambda: _env("JOURNAL_DB_PATH", "data/trades.db")
     )

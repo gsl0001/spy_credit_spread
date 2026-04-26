@@ -70,7 +70,7 @@ export function ScannerView() {
         const key = localStorage.getItem('alpaca_key') || '';
         const secret = localStorage.getItem('alpaca_secret') || '';
         const res = await api.paperScan({ api_key: key, api_secret: secret, config: cfg });
-        setStatus(res?.signal ? `SIGNAL · price $${res.price?.toFixed(2)} · RSI ${res.rsi?.toFixed(1)}` : 'No signal');
+        setStatus(res?.signal ? `SIGNAL · price $${(res.price ?? 0).toFixed(2)} · RSI ${(res.rsi ?? 0).toFixed(1)}` : 'No signal');
       } else {
         setStatus('Manual scan via IBKR not yet supported; use Start');
       }
@@ -106,8 +106,8 @@ export function ScannerView() {
               <div key={i} className="scan-row">
                 <span className="t">{l.t}</span>
                 <span className={`dot ${l.signal ? 'hit' : ''}`} />
-                <span className="mono">${l.price.toFixed(2)}</span>
-                <span className="mono" style={{ color: l.rsi_ok ? 'var(--pos)' : 'var(--text-3)' }}>{l.rsi.toFixed(1)}</span>
+                <span className="mono">${(l.price ?? 0).toFixed(2)}</span>
+                <span className="mono" style={{ color: l.rsi_ok ? 'var(--pos)' : 'var(--text-3)' }}>{(l.rsi ?? 0).toFixed(1)}</span>
                 <span style={{ color: l.signal ? 'var(--pos)' : 'var(--text-2)', fontWeight: l.signal ? 600 : 400 }}>{l.msg}</span>
                 <span style={{ display: 'flex', gap: 3 }}>
                   <Chip ok={l.rsi_ok}>RSI</Chip>
@@ -133,8 +133,8 @@ export function ScannerView() {
               </div>
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, fontSize: 12 }}>
-              <div><div className="muted" style={{ fontSize: 10, textTransform: 'uppercase' }}>Price</div><div className="mono" style={{ fontWeight: 600 }}>${s.last_signal.price.toFixed(2)}</div></div>
-              <div><div className="muted" style={{ fontSize: 10, textTransform: 'uppercase' }}>RSI</div><div className="mono" style={{ fontWeight: 600 }}>{s.last_signal.rsi.toFixed(1)}</div></div>
+              <div><div className="muted" style={{ fontSize: 10, textTransform: 'uppercase' }}>Price</div><div className="mono" style={{ fontWeight: 600 }}>${(s.last_signal.price ?? 0).toFixed(2)}</div></div>
+              <div><div className="muted" style={{ fontSize: 10, textTransform: 'uppercase' }}>RSI</div><div className="mono" style={{ fontWeight: 600 }}>{(s.last_signal.rsi ?? 0).toFixed(1)}</div></div>
             </div>
             <hr className="sep" />
             <div className="muted" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6, fontWeight: 600 }}>Filter parity</div>

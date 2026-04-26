@@ -300,7 +300,14 @@ def _resolve_strategy_exit(
         cls = registry.get(strat_name)
         if cls is None:
             return None
-        df = fetcher(pos.symbol)
+        # Strategy-aware fetcher path: pass the position's strategy so the
+        # fetcher picks the right BAR_SIZE (e.g. dryrun → 5 mins, daily
+        # strategies → 1 day). Fall back to single-arg invocation for
+        # legacy fetchers (tests, custom injections).
+        try:
+            df = fetcher(pos.symbol, strat_name)
+        except TypeError:
+            df = fetcher(pos.symbol)
         if df is None or len(df) == 0:
             return None
         strat = cls()
@@ -333,24 +340,16 @@ def _resolve_expiration_close(
 
 
 def _default_strategy_registry() -> dict[str, Any]:
-    """Lazy import of strategies; safe if module imports fail."""
-    out: dict[str, Any] = {}
+    """Lazy import of strategies via the shared resolver in core.scanner.
+
+    Single source of truth for the strategy-id → class mapping; previously
+    duplicated in three places, which made adding a strategy a footgun.
+    """
     try:
-        from strategies.consecutive_days import ConsecutiveDaysStrategy
-        out["consecutive_days"] = ConsecutiveDaysStrategy
+        from core.scanner import list_strategy_classes
     except Exception:  # noqa: BLE001
-        pass
-    try:
-        from strategies.combo_spread import ComboSpreadStrategy
-        out["combo_spread"] = ComboSpreadStrategy
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        from strategies.dryrun import DryRunStrategy
-        out["dryrun"] = DryRunStrategy
-    except Exception:  # noqa: BLE001
-        pass
-    return out
+        return {}
+    return list_strategy_classes()
 
 
 class _RequestShim:
