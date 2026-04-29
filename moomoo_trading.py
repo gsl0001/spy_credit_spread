@@ -9,6 +9,10 @@ Legged spread execution note:
     - Long leg fill timeout → cancel long → return error
     - Short leg fill timeout → cancel short → market-sell long leg (flatten) → return error
   All outcomes are journaled.
+
+trd_env note:
+  0 = simulate (paper trading) — unlock_trade not required, uses TrdEnv.SIMULATE
+  1 = real trading            — unlock_trade required,     uses TrdEnv.REAL
 """
 from __future__ import annotations
 
@@ -34,14 +38,18 @@ class MoomooTrader:
         host: str = "127.0.0.1",
         port: int = 11111,
         trade_password: str = "",
+        trd_env: int = 0,
     ) -> None:
         self._host = host
         self._port = port
         self._trade_password = trade_password
+        self._trd_env_int = trd_env   # 0=simulate, 1=real
         self._acc_id: int | None = None
         self._quote_ctx = None
         self._trd_ctx = None
         self._connected = False
+        # resolved after import — set in connect()
+        self._ft_trd_env = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -54,6 +62,8 @@ class MoomooTrader:
                 "moomoo-api is not installed. Run: pip install moomoo-api"
             ) from exc
 
+        trd_env_obj = ft.TrdEnv.REAL if self._trd_env_int == 1 else ft.TrdEnv.SIMULATE
+        self._ft_trd_env = trd_env_obj
         loop = asyncio.get_event_loop()
 
         def _do_connect():
@@ -63,19 +73,39 @@ class MoomooTrader:
                 host=self._host,
                 port=self._port,
                 security_firm=ft.SecurityFirm.FUTUINC,
+                trd_env=trd_env_obj,
             )
-            ret, data = trd_ctx.unlock_trade(password=self._trade_password)
-            if ret != ft.RET_OK:
-                trd_ctx.close()
-                quote_ctx.close()
-                raise RuntimeError(f"unlock_trade failed: {data}")
+
+            # unlock_trade is only required (and valid) for real trading
+            if self._trd_env_int == 1:
+                ret, data = trd_ctx.unlock_trade(password=self._trade_password)
+                if ret != ft.RET_OK:
+                    trd_ctx.close()
+                    quote_ctx.close()
+                    raise RuntimeError(f"unlock_trade failed: {data}")
+
             ret, acc_data = trd_ctx.get_acc_list()
             if ret != ft.RET_OK:
                 trd_ctx.close()
                 quote_ctx.close()
                 raise RuntimeError(f"get_acc_list failed: {acc_data}")
-            acc_id = int(acc_data[acc_data["trd_market"] == "US"].iloc[0]["acc_id"])
-            ret, summary = trd_ctx.accinfo_query(acc_id=acc_id, trd_mkt=ft.TrdMarket.US)
+
+            # Filter by matching trd_env, then pick first US-market account
+            env_label = "REAL" if self._trd_env_int == 1 else "SIMULATE"
+            filtered = acc_data[acc_data["trd_env"] == env_label] if "trd_env" in acc_data.columns else acc_data
+            us_rows = filtered[filtered["trd_market"] == "US"] if not filtered.empty else filtered
+            if us_rows.empty:
+                us_rows = filtered  # fall back: take first account regardless of market
+            if us_rows.empty:
+                trd_ctx.close()
+                quote_ctx.close()
+                raise RuntimeError(
+                    f"No {env_label} US account found in OpenD. "
+                    "Check that moomoo is logged in and the correct trd_env is selected."
+                )
+
+            acc_id = int(us_rows.iloc[0]["acc_id"])
+            ret, summary = trd_ctx.accinfo_query(acc_id=acc_id, trd_mkt=ft.TrdMarket.US, trd_env=trd_env_obj)
             if ret != ft.RET_OK:
                 trd_ctx.close()
                 quote_ctx.close()
@@ -87,10 +117,12 @@ class MoomooTrader:
         self._trd_ctx = trd_ctx
         self._acc_id = acc_id
         self._connected = True
-        logger.info("MoomooTrader connected. acc_id=%s", acc_id)
+        env_label = "REAL" if self._trd_env_int == 1 else "SIMULATE"
+        logger.info("MoomooTrader connected. acc_id=%s env=%s", acc_id, env_label)
         return {
             "connected": True,
             "acc_id": acc_id,
+            "trd_env": env_label,
             "account": self._map_account(raw_summary),
         }
 
@@ -135,7 +167,7 @@ class MoomooTrader:
 
         def _fetch():
             ret, data = self._trd_ctx.accinfo_query(
-                acc_id=self._acc_id, trd_mkt=ft.TrdMarket.US
+                acc_id=self._acc_id, trd_mkt=ft.TrdMarket.US, trd_env=self._ft_trd_env
             )
             if ret != ft.RET_OK:
                 raise RuntimeError(f"accinfo_query: {data}")
@@ -153,7 +185,7 @@ class MoomooTrader:
 
         def _fetch():
             ret, data = self._trd_ctx.position_list_query(
-                acc_id=self._acc_id, trd_mkt=ft.TrdMarket.US
+                acc_id=self._acc_id, trd_mkt=ft.TrdMarket.US, trd_env=self._ft_trd_env
             )
             if ret != ft.RET_OK:
                 raise RuntimeError(f"position_list_query: {data}")
@@ -299,13 +331,12 @@ class MoomooTrader:
             ret, data = self._trd_ctx.order_list_query(
                 order_id=order_id,
                 acc_id=self._acc_id,
-                trd_env=ft.TrdEnv.REAL,
+                trd_env=self._ft_trd_env,
             )
             if ret != ft.RET_OK or data.empty:
                 return None
             row = data.iloc[0]
             raw_status = str(row.get("order_status", ""))
-            # Map moomoo status to fill_watcher's expected keys
             status = "filled" if raw_status == "FILLED_ALL" else (
                 "cancelled" if "CANCEL" in raw_status else (
                     "submitted" if raw_status in ("SUBMITTING", "SUBMITTED") else raw_status
@@ -316,7 +347,7 @@ class MoomooTrader:
                 "filled": int(float(row.get("dealt_qty", 0) or 0)),
                 "remaining": int(float(row.get("qty", 0) or 0)) - int(float(row.get("dealt_qty", 0) or 0)),
                 "avgFillPrice": float(row.get("dealt_avg_price", 0) or 0),
-                "commission": 0.0,  # moomoo doesn't expose commission per-order in this call
+                "commission": 0.0,
             }
 
         try:
@@ -401,7 +432,7 @@ class MoomooTrader:
                 code=code,
                 trd_side=trd_side,
                 order_type=ft.OrderType.NORMAL,
-                trd_env=ft.TrdEnv.REAL,
+                trd_env=self._ft_trd_env,
                 acc_id=self._acc_id,
                 remark=client_ref,
             )
@@ -422,7 +453,7 @@ class MoomooTrader:
                 ret, data = self._trd_ctx.order_list_query(
                     order_id=order_id,
                     acc_id=self._acc_id,
-                    trd_env=ft.TrdEnv.REAL,
+                    trd_env=self._ft_trd_env,
                 )
                 if ret != ft.RET_OK:
                     return None
@@ -444,7 +475,7 @@ class MoomooTrader:
                 qty=0,
                 price=0,
                 acc_id=self._acc_id,
-                trd_env=ft.TrdEnv.REAL,
+                trd_env=self._ft_trd_env,
             )
 
         try:
@@ -465,7 +496,7 @@ class MoomooTrader:
                 code=code,
                 trd_side=trd_side,
                 order_type=ft.OrderType.MARKET,
-                trd_env=ft.TrdEnv.REAL,
+                trd_env=self._ft_trd_env,
                 acc_id=self._acc_id,
                 remark="flatten",
             )

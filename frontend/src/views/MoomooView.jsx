@@ -75,6 +75,7 @@ export function MoomooView() {
   const [host, setHost] = useState(() => localStorage.getItem('moomoo_host') || '127.0.0.1');
   const [port, setPort] = useState(() => localStorage.getItem('moomoo_port') || '11111');
   const [tradePwd, setTradePwd] = useState(() => localStorage.getItem('moomoo_pwd') || '');
+  const [trdEnv, setTrdEnv] = useState(() => Number(localStorage.getItem('moomoo_trd_env') ?? 0));
   const [connected, setConnected] = useState(false);
   const [accId, setAccId] = useState('');
   const [connBusy, setConnBusy] = useState(false);
@@ -103,6 +104,7 @@ export function MoomooView() {
     localStorage.setItem('moomoo_host', host);
     localStorage.setItem('moomoo_port', port);
     localStorage.setItem('moomoo_pwd', tradePwd);
+    localStorage.setItem('moomoo_trd_env', String(trdEnv));
   };
 
   const doConnect = useCallback(async () => {
@@ -111,7 +113,7 @@ export function MoomooView() {
     setConnBusy(true);
     setConnMsg('Connecting…');
     try {
-      const res = await api.moomoo.connect({ host, port: Number(port), trade_password: tradePwd });
+      const res = await api.moomoo.connect({ host, port: Number(port), trade_password: tradePwd, trd_env: trdEnv });
       if (res?.connected) {
         setConnected(true);
         setAccId(res.acc_id ?? '');
@@ -125,7 +127,7 @@ export function MoomooView() {
     } finally {
       setConnBusy(false);
     }
-  }, [connBusy, host, port, tradePwd]);
+  }, [connBusy, host, port, tradePwd, trdEnv]);
 
   const doDisconnect = useCallback(async () => {
     try {
@@ -237,7 +239,20 @@ export function MoomooView() {
               </div>
               <div style={{ flex: '1 1 140px' }}>
                 <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Trade Password</div>
-                <input {...inp(tradePwd, setTradePwd, 'password')} placeholder="PIN / trade password" />
+                <input {...inp(tradePwd, setTradePwd, 'password')} placeholder="PIN (real only)" />
+              </div>
+              <div style={{ flexShrink: 0 }}>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Mode</div>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  {[{ label: 'Simulate', val: 0 }, { label: 'Real', val: 1 }].map(({ label, val }) => (
+                    <button key={val} disabled={connected} onClick={() => setTrdEnv(val)} style={{
+                      padding: '5px 10px', fontSize: 12, borderRadius: 6, cursor: connected ? 'default' : 'pointer',
+                      border: `1px solid ${trdEnv === val ? C.accent : 'rgba(100,100,100,.3)'}`,
+                      background: trdEnv === val ? 'rgba(249,115,22,.15)' : 'transparent',
+                      color: trdEnv === val ? C.accent : 'var(--text-3)',
+                    }}>{label}</button>
+                  ))}
+                </div>
               </div>
               <OBtn onClick={connected ? doDisconnect : doConnect} disabled={connBusy} danger={connected}>
                 {connBusy ? '…' : connected ? 'Disconnect' : 'Connect'}
