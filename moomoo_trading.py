@@ -73,7 +73,6 @@ class MoomooTrader:
                 host=self._host,
                 port=self._port,
                 security_firm=ft.SecurityFirm.FUTUINC,
-                trd_env=trd_env_obj,
             )
 
             # unlock_trade is only required (and valid) for real trading
@@ -105,7 +104,7 @@ class MoomooTrader:
                 )
 
             acc_id = int(us_rows.iloc[0]["acc_id"])
-            ret, summary = trd_ctx.accinfo_query(acc_id=acc_id, trd_mkt=ft.TrdMarket.US, trd_env=trd_env_obj)
+            ret, summary = trd_ctx.accinfo_query(trd_env=trd_env_obj, acc_id=acc_id)
             if ret != ft.RET_OK:
                 trd_ctx.close()
                 quote_ctx.close()
@@ -167,7 +166,7 @@ class MoomooTrader:
 
         def _fetch():
             ret, data = self._trd_ctx.accinfo_query(
-                acc_id=self._acc_id, trd_mkt=ft.TrdMarket.US, trd_env=self._ft_trd_env
+                trd_env=self._ft_trd_env, acc_id=self._acc_id
             )
             if ret != ft.RET_OK:
                 raise RuntimeError(f"accinfo_query: {data}")
@@ -185,7 +184,7 @@ class MoomooTrader:
 
         def _fetch():
             ret, data = self._trd_ctx.position_list_query(
-                acc_id=self._acc_id, trd_mkt=ft.TrdMarket.US, trd_env=self._ft_trd_env
+                trd_env=self._ft_trd_env, acc_id=self._acc_id
             )
             if ret != ft.RET_OK:
                 raise RuntimeError(f"position_list_query: {data}")
