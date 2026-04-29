@@ -86,6 +86,18 @@ export const api = {
   // Telegram bot
   telegramStatus: ()       => get('/api/telegram/status'),
   telegramTest:   (text)   => post('/api/telegram/test', text ? { text } : {}),
+
+  // Moomoo
+  moomoo: {
+    connect:    (body)         => post('/api/moomoo/connect', body),
+    disconnect: ()             => post('/api/moomoo/disconnect'),
+    account:    ()             => get('/api/moomoo/account'),
+    positions:  ()             => get('/api/moomoo/positions'),
+    chain:      (sym, date)    => get(`/api/moomoo/chain?symbol=${sym}&date=${date}`),
+    execute:    (body)         => post('/api/moomoo/execute', body, 60000),
+    exit:       (body)         => post('/api/moomoo/exit', body, 60000),
+    cancel:     (body)         => post('/api/moomoo/cancel', body),
+  },
 };
 
 export async function safe(fn, fallback = null) {

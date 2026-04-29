@@ -37,6 +37,7 @@ class ScannerPreset:
     notes: str = ""
     auto_execute: bool = False
     fetch_only_live: bool = False
+    broker: str = "ibkr"  # "ibkr" | "moomoo"
 
     # Options trading parameters (parity with BacktestRequest)
     topology: str = "vertical_spread"
@@ -69,6 +70,7 @@ class ScannerPreset:
             notes=str(data.get("notes", "")),
             auto_execute=bool(data.get("auto_execute", False)),
             fetch_only_live=bool(data.get("fetch_only_live", False)),
+            broker=str(data.get("broker", "ibkr")),
             topology=str(data.get("topology", "vertical_spread")),
             direction=str(data.get("direction", "bull")),
             strategy_type=str(data.get("strategy_type", "bull_call")),

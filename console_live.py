@@ -65,6 +65,10 @@ _spy_price = 0.0
 _ibkr_connected = False
 _market_status = "Unknown"
 
+# Broker selector — "ibkr" | "moomoo"
+_broker: str = "ibkr"
+_moomoo_connected = False
+
 # ── Dashboard Rendering ────────────────────────────────────────────────────
 
 def make_header(scanner: Scanner) -> Panel:
@@ -98,6 +102,12 @@ def make_header(scanner: Scanner) -> Panel:
     else:
         tg_text = Text("○ TG", style="dim")
 
+    # Broker indicator
+    if _broker == "moomoo":
+        broker_text = Text("● Moomoo", style="bold orange1" if _moomoo_connected else "orange1")
+    else:
+        broker_text = conn_text  # reuse IBKR conn_text
+
     grid = Table.grid(expand=True)
     grid.add_column(justify="left", ratio=1)
     grid.add_column(justify="center", ratio=1)
@@ -105,7 +115,7 @@ def make_header(scanner: Scanner) -> Panel:
 
     grid.add_row(
         Text.assemble(("SYSTEM ", "bold cyan"), ("v2.1 ", "dim"), ("| ", "dim"),
-                      conn_text, ("  ", ""), tg_text),
+                      broker_text, ("  ", ""), tg_text),
         Text(f"PRESET: {preset_name}", style="bold magenta"),
         Text.assemble((f"{now} ", "bold white"), ("| ", "dim"), l_status)
     )
@@ -502,6 +512,71 @@ async def cmd_flatten(journal: Journal):
         pass
 
 
+def cmd_broker(args: list[str]) -> None:
+    """Switch active broker or show current broker status.
+
+    Usage:
+      broker           Show current broker + connection status
+      broker ibkr      Switch to IBKR
+      broker moomoo    Switch to moomoo (prompts for OpenD creds if needed)
+    """
+    global _broker, _moomoo_connected
+
+    sub = (args[0] if args else "").lower()
+
+    if not sub:
+        if _broker == "moomoo":
+            state = "connected" if _moomoo_connected else "disconnected"
+            console.print(f"[orange1]Active broker: moomoo ({state})[/orange1]")
+        else:
+            state = "connected" if _ibkr_connected else "disconnected"
+            console.print(f"[green]Active broker: IBKR ({state})[/green]")
+        return
+
+    if sub == "ibkr":
+        _broker = "ibkr"
+        add_log("Broker switched to IBKR.")
+        console.print("[green]Broker → IBKR[/green]")
+        return
+
+    if sub == "moomoo":
+        from core.broker import broker_is_connected
+        if broker_is_connected("moomoo"):
+            _broker = "moomoo"
+            _moomoo_connected = True
+            add_log("Broker switched to moomoo (already connected).")
+            console.print("[orange1]Broker → moomoo (connected)[/orange1]")
+        else:
+            # Prompt for credentials and attempt connection
+            console.print("[bold orange1]moomoo OpenD credentials[/bold orange1]")
+            host = console.input("  Host [127.0.0.1]: ").strip() or "127.0.0.1"
+            port_s = console.input("  Port [11111]: ").strip() or "11111"
+            pwd = console.input("  Trade password: ").strip()
+            console.print("  Connecting to moomoo OpenD…")
+            try:
+                from moomoo_trading import MoomooTrader
+                from core.broker import register_broker
+
+                async def _connect():
+                    trader = MoomooTrader(host=host, port=int(port_s), trade_password=pwd)
+                    return await trader.connect(), trader
+
+                result, trader = asyncio.run(_connect())
+                if result.get("connected"):
+                    register_broker("moomoo", trader)
+                    _broker = "moomoo"
+                    _moomoo_connected = True
+                    add_log(f"moomoo connected (acc {result.get('acc_id', '?')}). Broker switched.")
+                    console.print(f"[green]✓ moomoo connected (acc {result.get('acc_id', '?')}). Broker → moomoo[/green]")
+                else:
+                    console.print(f"[red]✗ moomoo connect failed: {result.get('error', '?')}[/red]")
+            except Exception as e:
+                console.print(f"[red]✗ moomoo connect error: {e}[/red]")
+        return
+
+    console.print("[yellow]Usage: broker [ibkr|moomoo][/yellow]")
+
+
 def cmd_tg(args: list[str]) -> None:
     """Telegram bot command — show status / send a test message."""
     sub = (args[0] if args else "status").lower()
@@ -651,6 +726,9 @@ def main():
                     "  orders           Show orders\n"
                     "  flatten          Panic close all (notifies Telegram)\n"
                     "  scan on/off      Toggle scanner\n"
+                    "  broker           Show current broker\n"
+                    "  broker ibkr      Switch to IBKR\n"
+                    "  broker moomoo    Switch to moomoo (prompts if not connected)\n"
                     "  tg [status]      Telegram bot state + commands\n"
                     "  tg test [text]   Send a test message\n"
                     "  tg send <text>   Push an arbitrary message\n"
@@ -685,6 +763,9 @@ def main():
             elif cmd == "scan on":
                 register_scanner()
                 add_log("Scanner enabled.")
+            elif cmd.startswith("broker"):
+                broker_args = cmd.split()[1:]
+                cmd_broker(broker_args)
             elif cmd.startswith("tg"):
                 # Tokenise: "tg test hello world" → ["test", "hello", "world"]
                 tg_args = cmd.split()[1:]

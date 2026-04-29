@@ -8,6 +8,7 @@ import { ScannerView } from './views/ScannerView.jsx';
 import { RiskView } from './views/RiskView.jsx';
 import { BacktestView } from './views/BacktestView.jsx';
 import { PaperView } from './views/PaperView.jsx';
+import { MoomooView } from './views/MoomooView.jsx';
 import { Ico } from './icons.jsx';
 import { fmtTimeAgo, Btn } from './primitives.jsx';
 import { useData } from './useBackendData.jsx';
@@ -19,6 +20,7 @@ const STORAGE_VIEW = 'spy_ui_view';
 const VIEWS = {
   live: LiveView,
   paper: PaperView,
+  moomoo: MoomooView,
   backtest: BacktestView,
   journal: JournalView,
   risk: RiskView,
@@ -28,6 +30,7 @@ const VIEWS = {
 const VIEW_TITLES = {
   live: { title: 'Live Trading', sub: 'IBKR TWS · SPY credit spreads' },
   paper: { title: 'Paper Trading', sub: 'Alpaca · equity surrogate' },
+  moomoo: { title: 'Moomoo Trading', sub: 'moomoo OpenD · legged spreads · CA' },
   backtest: { title: 'Backtest Engine', sub: 'historical simulation' },
   journal: { title: 'Trade Journal', sub: 'orders · fills · events' },
   risk: { title: 'Risk & Guardrails', sub: 'pre-trade gates · sizing · events' },

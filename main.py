@@ -794,26 +794,9 @@ def live_chain(ticker: str = "SPY"):
 
 
 # ── Optimizer endpoint ─────────────────────────────────────────────────────
-@app.get("/api/strategies")
-def list_strategies():
-    """Return all registered strategies and their parameter schemas."""
-    out = []
-    for sid, cls in StrategyFactory.STRATEGIES.items():
-        try:
-            schema = cls.get_schema()
-        except Exception:  # noqa: BLE001
-            schema = {}
-        out.append({
-            "id": sid,
-            "name": getattr(cls(), "name", sid),
-            "schema": schema,
-        })
-    return {"strategies": out}
-
-
 @app.get("/api/strategies/{strategy_id}/schema")
 def get_strategy_schema(strategy_id: str):
-    cls = StrategyFactory.STRATEGIES.get(strategy_id)
+    cls = StrategyFactory._registry().get(strategy_id)
     if cls is None:
         return {"error": "unknown_strategy", "strategy_id": strategy_id}
     try:
@@ -1353,27 +1336,55 @@ def _run_preset_tick():
             if p and p.auto_execute:
                 from core.settings import SETTINGS
                 from core.journal import get_journal as _gj
-                ib_creds = SETTINGS.ibkr.as_dict()
-                if not (ib_creds.get("host") and ib_creds.get("port")):
-                    log_event(_startup_log, "preset_auto_execute_skipped",
-                              reason="no_ibkr_creds", preset=p.name)
-                else:
-                    for sig in signals:
-                        if not (sig.fired and sig.signal_type == "entry"):
+                for sig in signals:
+                    if not (sig.fired and sig.signal_type == "entry"):
+                        continue
+
+                    # Per-day idempotency: same symbol + preset can only fire once/day
+                    _date = datetime.now().strftime("%Y-%m-%d")
+                    _idem_key = f"scan:{_date}:{sig.symbol}:{p.name}"
+                    if _gj().get_order_by_idempotency(_idem_key):
+                        log_event(_startup_log, "preset_scan_duplicate_suppressed",
+                                  key=_idem_key)
+                        continue
+
+                    log_event(_startup_log, "preset_scan_signal_fired",
+                              symbol=sig.symbol, preset=p.name, key=_idem_key,
+                              broker=p.broker)
+
+                    broker_name = getattr(p, "broker", "ibkr")
+
+                    if broker_name == "moomoo":
+                        # Moomoo path: build MoomooOrderRequest and route to moomoo impl
+                        try:
+                            order_req = MoomooOrderRequest(
+                                symbol=sig.symbol or p.ticker,
+                                direction=p.strategy_type,
+                                contracts=int(getattr(sig, "contracts", 0) or 0),
+                                strike_width=int(p.strike_width),
+                                target_dte=int(p.target_dte),
+                                spread_cost_target=float(p.spread_cost_target),
+                                position_size_method=p.position_size_method or "fixed",
+                                risk_percent=float(p.sizing_params.get("risk_percent", 1.0)),
+                                max_allocation_cap=float(p.sizing_params.get("max_allocation_cap", 500.0)),
+                                stop_loss_pct=float(p.stop_loss_pct),
+                                take_profit_pct=float(p.take_profit_pct),
+                                trailing_stop_pct=float(p.trailing_stop_pct),
+                                otm_offset=float(p.strategy_params.get("offset", 0.0)),
+                                client_order_id=_idem_key,
+                            )
+                        except Exception as e:
+                            log_event(_startup_log, "preset_auto_execute_build_failed",
+                                      error=str(e), preset=p.name)
                             continue
-
-                        # Per-day idempotency: same symbol + preset can only fire once/day
-                        _date = datetime.now().strftime("%Y-%m-%d")
-                        _idem_key = f"scan:{_date}:{sig.symbol}:{p.name}"
-                        if _gj().get_order_by_idempotency(_idem_key):
-                            log_event(_startup_log, "preset_scan_duplicate_suppressed",
-                                      key=_idem_key)
+                        coro = _moomoo_execute_impl(order_req)
+                    else:
+                        # IBKR path (default)
+                        ib_creds = SETTINGS.ibkr.as_dict()
+                        if not (ib_creds.get("host") and ib_creds.get("port")):
+                            log_event(_startup_log, "preset_auto_execute_skipped",
+                                      reason="no_ibkr_creds", preset=p.name)
                             continue
-
-                        log_event(_startup_log, "preset_scan_signal_fired",
-                                  symbol=sig.symbol, preset=p.name, key=_idem_key)
-
-                        # Build the order request from preset + signal
                         try:
                             order_req = IBKROrderRequest(
                                 creds=IBKRConnectRequest(
@@ -1396,43 +1407,43 @@ def _run_preset_tick():
                                 stop_loss_pct=float(p.stop_loss_pct),
                                 take_profit_pct=float(p.take_profit_pct),
                                 trailing_stop_pct=float(p.trailing_stop_pct),
+                                otm_offset=float(p.strategy_params.get("offset", 0.0)),
                                 client_order_id=_idem_key,
                             )
                         except Exception as e:
                             log_event(_startup_log, "preset_auto_execute_build_failed",
                                       error=str(e), preset=p.name)
                             continue
+                        coro = _ibkr_execute_impl(order_req)
 
-                        # Schedule the async order placement on the main event loop.
-                        # _run_preset_tick runs in the APScheduler thread, so we
-                        # need run_coroutine_threadsafe to cross threads safely.
-                        loop = _MAIN_LOOP
-                        if loop is None or not loop.is_running():
-                            log_event(_startup_log, "preset_auto_execute_skipped",
-                                      reason="loop_not_running", preset=p.name)
-                            continue
-                        try:
-                            future = asyncio.run_coroutine_threadsafe(
-                                _ibkr_execute_impl(order_req), loop,
-                            )
-                            result = future.result(timeout=60)
-                        except Exception as e:
-                            log_event(_startup_log, "preset_auto_execute_failed",
-                                      error=str(e), preset=p.name, key=_idem_key)
-                            continue
+                    # Schedule the async order placement on the main event loop.
+                    # _run_preset_tick runs in the APScheduler thread, so we
+                    # need run_coroutine_threadsafe to cross threads safely.
+                    loop = _MAIN_LOOP
+                    if loop is None or not loop.is_running():
+                        log_event(_startup_log, "preset_auto_execute_skipped",
+                                  reason="loop_not_running", preset=p.name)
+                        continue
+                    try:
+                        future = asyncio.run_coroutine_threadsafe(coro, loop)
+                        result = future.result(timeout=60)
+                    except Exception as e:
+                        log_event(_startup_log, "preset_auto_execute_failed",
+                                  error=str(e), preset=p.name, key=_idem_key)
+                        continue
 
-                        if isinstance(result, dict) and result.get("error"):
-                            log_event(_startup_log, "preset_auto_execute_rejected",
-                                      preset=p.name, key=_idem_key,
-                                      error=result.get("error"),
-                                      reason=result.get("reason"))
-                        else:
-                            log_event(_startup_log, "preset_auto_execute_submitted",
-                                      preset=p.name, key=_idem_key,
-                                      order_id=result.get("order_id"),
-                                      position_id=result.get("position_id"),
-                                      contracts=result.get("contracts"),
-                                      limit=result.get("limit_price"))
+                    if isinstance(result, dict) and result.get("error"):
+                        log_event(_startup_log, "preset_auto_execute_rejected",
+                                  preset=p.name, key=_idem_key,
+                                  error=result.get("error"),
+                                  reason=result.get("reason"))
+                    else:
+                        log_event(_startup_log, "preset_auto_execute_submitted",
+                                  preset=p.name, key=_idem_key,
+                                  order_id=result.get("order_id"),
+                                  position_id=result.get("position_id"),
+                                  contracts=result.get("contracts"),
+                                  limit=result.get("limit_price"))
     except Exception as e:
         log_event(_startup_log, "preset_tick_failed", error=str(e))
 
@@ -1562,6 +1573,8 @@ class IBKROrderRequest(BaseModel):
     stop_loss_pct: float = 50.0
     take_profit_pct: float = 50.0
     trailing_stop_pct: float = 0.0
+    # Strike offset: points above underlying for K_long (SSRN 6355218: 0.96–2.00, default 1.50)
+    otm_offset: float = 0.0
     # I5: optional client-provided ID for idempotency
     client_order_id: Optional[str] = None
 
@@ -1623,6 +1636,7 @@ async def _ibkr_execute_impl(req: IBKROrderRequest) -> dict:
     spread = await resolve_bull_call_spread(
         trader, req.symbol, req.target_dte, req.spread_cost_target,
         max_width=req.strike_width + 35,
+        otm_offset=req.otm_offset,
     )
     if spread is None:
         journal.log_event("chain_resolve_failed", subject=req.symbol)
@@ -2210,6 +2224,310 @@ async def ibkr_reconnect(req: IBKRConnectRequest):
         summary = await trader.get_account_summary()
         return {"connected": True, "summary": summary}
     return {"connected": False, "error": msg}
+
+
+# ── Moomoo API endpoints ──────────────────────────────────────────────────
+
+
+class MoomooConnectRequest(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 11111
+    trade_password: str = ""
+
+
+class MoomooOrderRequest(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 11111
+    trade_password: str = ""
+    symbol: str = "SPY"
+    direction: str = "bull_call"        # "bull_call" | "bear_put"
+    contracts: int = 1
+    strike_width: int = 5
+    target_dte: int = 0
+    spread_cost_target: float = 250.0
+    otm_offset: float = 0.0
+    position_size_method: str = "fixed"
+    risk_percent: float = 1.0
+    max_allocation_cap: float = 500.0
+    stop_loss_pct: float = 50.0
+    take_profit_pct: float = 50.0
+    trailing_stop_pct: float = 0.0
+    client_order_id: Optional[str] = None
+
+
+_moomoo_trader = None
+
+
+@app.post("/api/moomoo/connect")
+async def moomoo_connect(req: MoomooConnectRequest):
+    global _moomoo_trader
+    from moomoo_trading import MoomooTrader
+    from core.broker import register_broker
+    trader = MoomooTrader(host=req.host, port=req.port, trade_password=req.trade_password)
+    try:
+        result = await trader.connect()
+        _moomoo_trader = trader
+        register_broker("moomoo", trader)
+        return result
+    except Exception as exc:
+        return {"connected": False, "error": str(exc)}
+
+
+@app.post("/api/moomoo/disconnect")
+async def moomoo_disconnect():
+    global _moomoo_trader
+    from core.broker import unregister_broker
+    if _moomoo_trader:
+        _moomoo_trader.disconnect()
+        _moomoo_trader = None
+    unregister_broker("moomoo")
+    return {"status": "disconnected"}
+
+
+@app.get("/api/moomoo/account")
+async def moomoo_account():
+    from core.broker import get_broker, BrokerNotConnected
+    try:
+        broker = get_broker("moomoo")
+        return await broker.get_account_summary()
+    except BrokerNotConnected as exc:
+        return {"error": str(exc)}
+
+
+@app.get("/api/moomoo/positions")
+async def moomoo_positions():
+    from core.broker import get_broker, BrokerNotConnected
+    try:
+        broker = get_broker("moomoo")
+        return {"positions": await broker.get_positions()}
+    except BrokerNotConnected as exc:
+        return {"error": str(exc)}
+
+
+@app.get("/api/moomoo/chain")
+async def moomoo_chain(symbol: str = "SPY", date: str = ""):
+    from core.broker import get_broker, BrokerNotConnected
+    if not date:
+        from datetime import date as _date
+        date = _date.today().strftime("%Y-%m-%d")
+    try:
+        broker = get_broker("moomoo")
+        df = await broker.get_option_chain(symbol, date)
+        return {"chain": df.to_dict(orient="records") if hasattr(df, "to_dict") else []}
+    except BrokerNotConnected as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@app.post("/api/moomoo/execute")
+async def moomoo_execute(req: MoomooOrderRequest):
+    return await _moomoo_execute_impl(req)
+
+
+@app.post("/api/moomoo/exit")
+async def moomoo_exit(payload: dict):
+    position_id = (payload or {}).get("position_id")
+    if not position_id:
+        return {"error": "missing_position_id"}
+    from core.journal import get_journal
+    from core.broker import get_broker, BrokerNotConnected
+    journal = get_journal()
+    pos = journal.get_position(position_id)
+    if not pos:
+        return {"error": "position_not_found"}
+    try:
+        broker = get_broker("moomoo")
+        result = await broker.close_position(position_id, list(pos.legs))
+        journal.close_position(position_id, exit_cost=0.0, exit_reason="manual_exit")
+        return result
+    except BrokerNotConnected as exc:
+        return {"error": str(exc)}
+
+
+@app.post("/api/moomoo/cancel")
+async def moomoo_cancel(payload: dict):
+    order_id = (payload or {}).get("order_id")
+    if not order_id:
+        return {"error": "missing_order_id"}
+    from core.broker import get_broker, BrokerNotConnected
+    try:
+        broker = get_broker("moomoo")
+        return await broker.cancel_order(order_id)
+    except BrokerNotConnected as exc:
+        return {"error": str(exc)}
+
+
+async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
+    """Live moomoo order path — mirrors _ibkr_execute_impl.
+
+    Steps: idempotency → connect check → account snapshot → chain resolution
+    → strike picking → sizing → risk gate → place_spread → journal → notify.
+    """
+    from core.broker import get_broker, BrokerNotConnected
+    from core.journal import get_journal
+    from core.risk import evaluate_pre_trade, AccountSnapshot
+    from core.chain import pick_bull_call_strikes, pick_nearest_expiry
+    from core.settings import SETTINGS
+    from core.broker import LegSpec, SpreadRequest
+    import uuid
+
+    client_id = req.client_order_id or str(uuid.uuid4())
+
+    # Idempotency guard
+    journal = get_journal()
+    if journal.get_order_by_idempotency(client_id):
+        return {"error": "duplicate", "reason": "idempotency_key_exists", "client_order_id": client_id}
+
+    # Broker check
+    try:
+        broker = get_broker("moomoo")
+    except BrokerNotConnected as exc:
+        return {"error": "broker_not_connected", "reason": str(exc)}
+
+    if not broker.is_alive():
+        return {"error": "broker_not_connected", "reason": "moomoo trader reports not alive"}
+
+    # Account snapshot
+    try:
+        acct = await broker.get_account_summary()
+    except Exception as exc:
+        return {"error": "account_fetch_failed", "reason": str(exc)}
+
+    snapshot = AccountSnapshot(
+        equity=acct.get("equity", 0.0),
+        buying_power=acct.get("buying_power", 0.0),
+        excess_liquidity=acct.get("excess_liquidity", 0.0),
+        unrealized_pnl=acct.get("unrealized_pnl", 0.0),
+        realized_pnl=acct.get("realized_pnl", 0.0),
+    )
+
+    # Live price
+    try:
+        price_data = await broker.get_live_price(req.symbol)
+        underlying = float(price_data.get("last", 0))
+        if underlying <= 0:
+            return {"error": "bad_price", "reason": "live price <= 0"}
+    except Exception as exc:
+        return {"error": "price_fetch_failed", "reason": str(exc)}
+
+    # Option chain
+    from datetime import date as _date, timedelta
+    target_date = _date.today() + timedelta(days=req.target_dte)
+    expiry_str = target_date.strftime("%Y-%m-%d")
+    try:
+        chain_df = await broker.get_option_chain(req.symbol, expiry_str)
+    except Exception as exc:
+        return {"error": "chain_fetch_failed", "reason": str(exc)}
+
+    right = "C" if "bull" in req.direction else "P"
+    chain_sub = chain_df[chain_df["option_type"] == ("CALL" if right == "C" else "PUT")]
+    strike_grid = sorted(chain_sub["strike_price"].unique().tolist())
+    call_prices = {
+        float(row["strike_price"]): (float(row["bid_price"]), float(row["ask_price"]))
+        for _, row in chain_sub.iterrows()
+    }
+
+    # Strike selection
+    spread = pick_bull_call_strikes(
+        strike_grid=strike_grid,
+        underlying=underlying,
+        call_prices=call_prices,
+        target_debit=req.spread_cost_target,
+        otm_offset=req.otm_offset,
+    )
+    if not spread:
+        return {"error": "no_spread_found", "reason": "pick_bull_call_strikes returned None"}
+
+    # Position sizing
+    from core.risk import size_position
+    contracts = size_position(
+        snapshot=snapshot,
+        method=req.position_size_method,
+        spread_cost=spread["debit_per_contract"] * 100,
+        max_allocation_cap=req.max_allocation_cap,
+    ) if req.contracts == 0 else req.contracts
+
+    if contracts <= 0:
+        return {"error": "sizing_zero", "reason": "position sizer returned 0 contracts"}
+
+    # Pre-trade risk gate
+    risk_result = evaluate_pre_trade(snapshot, contracts, spread["debit_per_contract"] * 100)
+    if not risk_result.approved:
+        return {"error": "risk_gate_blocked", "reason": risk_result.reason}
+
+    # Build spread request
+    expiry_ymd = target_date.strftime("%Y%m%d")
+    spread_req = SpreadRequest(
+        symbol=req.symbol,
+        long_leg=LegSpec(expiry=expiry_ymd, strike=spread["K_long"], right=right,
+                         price=round(spread["long_ask"], 2)),
+        short_leg=LegSpec(expiry=expiry_ymd, strike=spread["K_short"], right=right,
+                          price=round(spread["short_bid"], 2)),
+        qty=contracts,
+        net_debit_limit=round(spread["debit_per_contract"] * 100 * contracts, 2),
+        position_id=client_id,
+        client_order_id=client_id,
+    )
+
+    # Execute
+    try:
+        order_result = await broker.place_spread(spread_req)
+    except Exception as exc:
+        return {"error": "order_failed", "reason": str(exc)}
+
+    if order_result.get("status") != "ok":
+        return {"error": "order_rejected", **order_result}
+
+    # Journal
+    from core.journal import PositionState
+    legs = [
+        {"expiry": expiry_ymd, "strike": spread["K_long"], "right": right,
+         "side": "long", "qty": contracts},
+        {"expiry": expiry_ymd, "strike": spread["K_short"], "right": right,
+         "side": "short", "qty": contracts},
+    ]
+    pos_id = journal.open_position(
+        symbol=req.symbol,
+        topology="vertical_spread",
+        direction=req.direction,
+        contracts=contracts,
+        entry_cost=spread["debit_per_contract"] * 100,
+        expiry=expiry_ymd,
+        legs=legs,
+        broker="moomoo",
+        broker_order_id=order_result.get("leg1_order_id", ""),
+        stop_loss_pct=req.stop_loss_pct,
+        take_profit_pct=req.take_profit_pct,
+        trailing_stop_pct=req.trailing_stop_pct,
+        idempotency_key=client_id,
+        meta={"broker": "moomoo", "legs": legs, **order_result},
+    )
+
+    # Notify
+    try:
+        from core.notifier import send_trade_alert
+        send_trade_alert(
+            symbol=req.symbol,
+            direction=req.direction,
+            contracts=contracts,
+            entry_cost=spread["debit_per_contract"] * 100,
+            broker="moomoo",
+        )
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "position_id": pos_id,
+        "contracts": contracts,
+        "K_long": spread["K_long"],
+        "K_short": spread["K_short"],
+        "debit_per_contract": spread["debit_per_contract"],
+        "leg1_order_id": order_result.get("leg1_order_id"),
+        "leg2_order_id": order_result.get("leg2_order_id"),
+        "client_order_id": client_id,
+    }
 
 
 # ── Journal API endpoints ─────────────────────────────────────────────────

@@ -364,6 +364,108 @@ class _RequestShim:
         raise AttributeError(name)
 
 
+# ── Moomoo-specific monitor helpers ──────────────────────────────────────
+
+async def _submit_exit_order_moomoo(
+    broker,
+    pos: Position,
+    mid: float,
+    reason: str,
+    journal: Journal,
+) -> dict[str, Any]:
+    """Fire a moomoo close_position and journal the exit. Never raises."""
+    try:
+        legs_list = [dict(leg) for leg in pos.legs]
+        result = await broker.close_position(pos.id, legs_list)
+        order_id = str(uuid.uuid4())
+        journal.record_order(Order(
+            id=order_id,
+            position_id=pos.id,
+            broker="moomoo",
+            broker_order_id=result.get("close_orders", [{}])[0].get("order_id"),
+            side="SELL",
+            limit_price=mid,
+            status="submitted",
+            submitted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            kind="exit",
+            idempotency_key=f"exit:{pos.id}:{reason}",
+        ))
+        journal.update_position(pos.id, state="closing")
+        journal.log_event("exit_submitted", subject=pos.id, payload={
+            "reason": reason, "mid": mid, "broker": "moomoo",
+        })
+        return {"ok": True, "order_id": order_id, "reason": reason, "mid": mid}
+    except Exception as e:  # noqa: BLE001
+        journal.log_event("exit_failed", subject=pos.id, payload={
+            "reason": reason, "error": f"{type(e).__name__}: {e}", "broker": "moomoo",
+        })
+        return {"ok": False, "error": str(e), "reason": reason}
+
+
+async def _process_position_moomoo(
+    pos: Position,
+    journal: Journal,
+    defaults: dict[str, Any],
+    today: Optional[date] = None,
+) -> dict[str, Any]:
+    """Monitor tick for a moomoo-brokered position.
+
+    Uses get_spread_mid() for mark-to-market and close_position() for exits.
+    """
+    from core.broker import get_broker, BrokerNotConnected
+    try:
+        broker = get_broker("moomoo")
+    except BrokerNotConnected as exc:
+        journal.log_event("quote_failed", subject=pos.id, payload={
+            "error": str(exc), "broker": "moomoo",
+        })
+        return {"position_id": pos.id, "error": "moomoo_not_connected"}
+
+    try:
+        legs_list = [dict(leg) for leg in pos.legs]
+        mid = await broker.get_spread_mid(legs_list)
+    except Exception as e:  # noqa: BLE001
+        journal.log_event("quote_failed", subject=pos.id, payload={
+            "error": f"{type(e).__name__}: {e}", "broker": "moomoo",
+        })
+        return {"position_id": pos.id, "error": "quote_failed"}
+
+    if mid is None or (isinstance(mid, float) and math.isnan(mid)) or mid <= 0:
+        return {"position_id": pos.id, "error": "no_quote"}
+
+    prev_hwm = pos.high_water_mark if pos.high_water_mark is not None else 0.0
+    new_hwm = max(prev_hwm, float(mid))
+    if new_hwm > prev_hwm:
+        journal.update_position(pos.id, high_water_mark=new_hwm)
+
+    cfg = exit_config_for(pos, defaults)
+    strategy_exit = _resolve_strategy_exit(pos, defaults)
+    is_expiration_close = _resolve_expiration_close(
+        pos, today=today,
+        buffer_minutes=int(cfg.get("expiration_close_buffer_minutes", 15)),
+    )
+    decision = evaluate_exit(
+        pos, float(mid),
+        stop_loss_pct=float(cfg.get("stop_loss_pct", 50.0)),
+        take_profit_pct=float(cfg.get("take_profit_pct", 50.0)),
+        trailing_stop_pct=float(cfg.get("trailing_stop_pct", 0.0)),
+        dte_exit_at=int(cfg.get("dte_exit_at", 0)),
+        force_exit=bool(cfg.get("force_exit", False)),
+        high_water_mark=new_hwm,
+        today=today,
+        strategy_exit=strategy_exit,
+        is_expiration_close=is_expiration_close,
+    )
+    if not decision.should_exit:
+        return {"position_id": pos.id, "mid": float(mid), "status": "holding",
+                "details": decision.details}
+
+    result = await _submit_exit_order_moomoo(broker, pos, float(mid), decision.reason, journal)
+    return {"position_id": pos.id, "mid": float(mid),
+            "exit_reason": decision.reason,
+            "submitted": result.get("ok", False), "details": result}
+
+
 # ── Per-position tick ─────────────────────────────────────────────────────
 
 async def _process_position(
@@ -377,6 +479,11 @@ async def _process_position(
     if pos.state not in ("open",):
         # Pending / closing / closed — not our job.
         return {"position_id": pos.id, "skipped": True, "state": pos.state}
+
+    broker_name = (pos.meta or {}).get("broker", pos.broker or "ibkr")
+    if broker_name == "moomoo":
+        return await _process_position_moomoo(pos, journal, defaults, today=today)
+
     try:
         legs_list = [dict(leg) for leg in pos.legs]
         mid = await trader.get_combo_midpoint(pos.symbol, legs_list)

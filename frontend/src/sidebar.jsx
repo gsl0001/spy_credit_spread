@@ -4,6 +4,7 @@ export function Sidebar({ view, setView, alertCount }) {
   const items = [
     { id: 'live',     icon: 'dashboard', label: 'Live Trading' },
     { id: 'paper',    icon: 'radar',     label: 'Paper (Alpaca)' },
+    { id: 'moomoo',   icon: 'zap',       label: 'Moomoo',        orange: true },
     { id: 'backtest', icon: 'activity',  label: 'Backtest' },
     { id: 'journal',  icon: 'book',      label: 'Journal' },
     { id: 'risk',     icon: 'shield',    label: 'Risk & Guardrails' },
@@ -19,8 +20,9 @@ export function Sidebar({ view, setView, alertCount }) {
             className="rail__btn"
             aria-current={view === it.id ? 'page' : null}
             onClick={() => setView(it.id)}
+            style={it.orange && view === it.id ? { color: '#f97316' } : undefined}
           >
-            <Ico name={it.icon} size={18} />
+            <Ico name={it.icon} size={18} style={it.orange ? { color: '#f97316' } : undefined} />
             {it.id === 'live' && alertCount > 0 && <span className="rail__badge" />}
             <span className="rail__tip">{it.label}</span>
           </button>

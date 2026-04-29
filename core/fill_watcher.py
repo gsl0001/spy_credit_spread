@@ -334,8 +334,9 @@ async def reconcile_once(
     results: list[dict] = []
     for order in open_orders:
         try:
+            effective_trader = _resolve_trader_for_order(order, trader)
             result = await _reconcile_order(
-                order, trader, j, timeout_seconds=timeout_seconds, now=ts_now,
+                order, effective_trader, j, timeout_seconds=timeout_seconds, now=ts_now,
             )
         except Exception as e:  # noqa: BLE001
             j.log_event("fill_watcher_error", subject=order.id, payload={
@@ -344,6 +345,23 @@ async def reconcile_once(
             result = {"order_id": order.id, "error": str(e)}
         results.append(result)
     return results
+
+
+def _resolve_trader_for_order(order: "Order", default_trader):
+    """Return the appropriate trader for an order based on order.broker.
+
+    For moomoo orders, returns the registered MoomooTrader (which exposes
+    get_order_status and cancel_order in the same interface shape as IBKRTrader).
+    Falls back to default_trader if moomoo is not connected.
+    """
+    broker_name = order.broker or "ibkr"
+    if broker_name == "moomoo":
+        try:
+            from core.broker import get_broker
+            return get_broker("moomoo")
+        except Exception:
+            pass
+    return default_trader
 
 
 async def _reconcile_order(
