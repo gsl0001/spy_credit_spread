@@ -39,12 +39,14 @@ def list_strategy_classes() -> dict:
         from strategies.consecutive_days import ConsecutiveDaysStrategy
         from strategies.combo_spread import ComboSpreadStrategy
         from strategies.dryrun import DryRunStrategy
+        from strategies.orb import OrbStrategy
     except Exception:  # noqa: BLE001
         return {}
     return {
         "consecutive_days": ConsecutiveDaysStrategy,
         "combo_spread": ComboSpreadStrategy,
         "dryrun": DryRunStrategy,
+        "orb": OrbStrategy,
     }
 
 

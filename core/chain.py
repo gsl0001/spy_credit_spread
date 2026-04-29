@@ -101,10 +101,11 @@ def pick_bull_call_strikes(
     call_prices: dict[float, tuple[float, float]],  # strike -> (bid, ask)
     target_debit: float,
     max_width: int = 40,
+    otm_offset: float = 0.0,
 ) -> Optional[dict]:
     """
     Pick (K_long, K_short) for a bull call where
-        K_long  ≈ ATM (nearest strike)
+        K_long  ≈ ATM + otm_offset (nearest whole-dollar strike to underlying + offset)
         K_short > K_long, chosen so that (mid_long - mid_short) ~= target_debit/100
 
     Parameters
@@ -114,6 +115,7 @@ def pick_bull_call_strikes(
     call_prices : dict mapping strike → (bid, ask)
     target_debit : user-requested debit in dollars (e.g. 250.0 = $2.50/contract)
     max_width : search range in strike units
+    otm_offset : points above underlying to target for K_long (e.g. 1.50 per SSRN 6355218)
 
     Returns
     -------
@@ -124,8 +126,9 @@ def pick_bull_call_strikes(
     if not strike_grid:
         return None
 
-    # ATM: the strike nearest the underlying
-    k_long = min(strike_grid, key=lambda k: abs(k - underlying))
+    # Target strike = underlying + offset; nearest whole-dollar strike wins.
+    target_k_long = underlying + otm_offset
+    k_long = min(strike_grid, key=lambda k: abs(k - target_k_long))
     long_quote = call_prices.get(k_long)
     if not long_quote or long_quote[0] <= 0 or long_quote[1] <= 0:
         return None
@@ -179,6 +182,7 @@ async def resolve_bull_call_spread(
     target_cost: float,
     max_width: int = 40,
     quote_wait: float = 3.0,
+    otm_offset: float = 0.0,
 ) -> Optional[SpreadSpec]:
     """Build a bull-call spread from live IBKR chain data.
 
@@ -279,6 +283,7 @@ async def resolve_bull_call_spread(
         call_prices,
         target_cost,
         max_width=max_width,
+        otm_offset=otm_offset,
     )
     if pick is None:
         return None
@@ -319,6 +324,7 @@ async def resolve_bull_call_spread_with_diagnostics(
     target_cost: float,
     max_width: int = 40,
     quote_wait: float = 3.0,
+    otm_offset: float = 0.0,
 ) -> tuple[Optional[SpreadSpec], dict]:
     """Same as ``resolve_bull_call_spread`` but also returns a diagnostics dict
     that pinpoints which step failed.  Useful for dry-run / troubleshooting.
@@ -432,7 +438,8 @@ async def resolve_bull_call_spread_with_diagnostics(
             return None, diag
 
         pick = pick_bull_call_strikes(
-            list(call_prices.keys()), underlying, call_prices, target_cost, max_width=max_width
+            list(call_prices.keys()), underlying, call_prices, target_cost,
+            max_width=max_width, otm_offset=otm_offset,
         )
         diag["pick"] = pick
         if pick is None:
