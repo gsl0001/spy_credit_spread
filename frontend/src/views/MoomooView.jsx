@@ -101,6 +101,10 @@ export function MoomooView() {
   // Order log
   const [orderLog, setOrderLog] = useState([]);
 
+  // Probed account list (diagnostic)
+  const [probedAccounts, setProbedAccounts] = useState(null);
+  const [probeBusy, setProbeBusy] = useState(false);
+
   const persistConn = () => {
     localStorage.setItem('moomoo_host', host);
     localStorage.setItem('moomoo_port', port);
@@ -115,14 +119,26 @@ export function MoomooView() {
     setConnBusy(true);
     setConnMsg('Connecting…');
     try {
-      const res = await api.moomoo.connect({ host, port: Number(port), trade_password: tradePwd, trd_env: trdEnv, security_firm: secFirm });
+      const res = await api.moomoo.connect({
+        host, port: Number(port),
+        trade_password: tradePwd,
+        trd_env: trdEnv,
+        security_firm: secFirm,
+        filter_trdmarket: 'NONE',
+      });
       if (res?.connected) {
         setConnected(true);
         setAccId(res.acc_id ?? '');
         setAccount(res.account ?? null);
-        setConnMsg(`✓ Connected (acc ${res.acc_id})`);
+        if (res.all_accounts) setProbedAccounts(res.all_accounts);
+        setConnMsg(`✓ Connected (acc ${res.acc_id} · ${res.trd_env || ''})`);
       } else {
         setConnMsg(`✗ ${res?.error || 'connect failed'}`);
+        // Auto-probe on failure to help the user diagnose
+        try {
+          const p = await api.moomoo.probe({ host, port: Number(port) });
+          if (p?.ok) setProbedAccounts(p.accounts || []);
+        } catch (_) {}
       }
     } catch (e) {
       setConnMsg(`✗ ${e.message}`);
@@ -140,6 +156,26 @@ export function MoomooView() {
     setAccount(null);
     setConnMsg('Disconnected');
   }, []);
+
+  const doProbe = useCallback(async () => {
+    if (probeBusy) return;
+    setProbeBusy(true);
+    setConnMsg('Probing OpenD…');
+    try {
+      const res = await api.moomoo.probe({ host, port: Number(port) });
+      if (res?.ok) {
+        setProbedAccounts(res.accounts || []);
+        setConnMsg(`✓ Found ${res.count} account(s)`);
+      } else {
+        setProbedAccounts([]);
+        setConnMsg(`✗ Probe failed: ${res?.error || 'unknown'}`);
+      }
+    } catch (e) {
+      setConnMsg(`✗ Probe error: ${e.message}`);
+    } finally {
+      setProbeBusy(false);
+    }
+  }, [probeBusy, host, port]);
 
   const refreshAccount = useCallback(async () => {
     if (!connected) return;
@@ -273,8 +309,11 @@ export function MoomooView() {
               <OBtn onClick={connected ? doDisconnect : doConnect} disabled={connBusy} danger={connected}>
                 {connBusy ? '…' : connected ? 'Disconnect' : 'Connect'}
               </OBtn>
+              <OBtn onClick={doProbe} disabled={probeBusy || connected}>
+                {probeBusy ? '…' : 'Probe'}
+              </OBtn>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
               <StatusPill connected={connected} accId={accId} />
               {connMsg && (
                 <span style={{ fontSize: 12, color: connMsg.startsWith('✓') ? C.pos : connMsg.startsWith('✗') ? C.neg : 'var(--text-3)' }}>
@@ -282,6 +321,64 @@ export function MoomooView() {
                 </span>
               )}
             </div>
+
+            {/* Account picker — populated by Probe or auto-fill on connect failure */}
+            {Array.isArray(probedAccounts) && probedAccounts.length > 0 && (
+              <div style={{
+                marginTop: 12,
+                background: 'rgba(0,0,0,.18)', border: '1px solid rgba(255,255,255,.06)',
+                borderRadius: 8, padding: '10px 12px',
+              }}>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                  Available accounts in OpenD ({probedAccounts.length})
+                </div>
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ color: 'var(--text-3)', textAlign: 'left', borderBottom: '1px solid rgba(255,255,255,.08)' }}>
+                        <th style={{ padding: '4px 8px' }}>acc_id</th>
+                        <th style={{ padding: '4px 8px' }}>Mode</th>
+                        <th style={{ padding: '4px 8px' }}>Firm</th>
+                        <th style={{ padding: '4px 8px' }}>Markets</th>
+                        <th style={{ padding: '4px 8px' }}>Type</th>
+                        <th style={{ padding: '4px 8px' }}>Status</th>
+                        <th style={{ padding: '4px 8px' }}></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {probedAccounts.map((a, i) => {
+                        const auth = Array.isArray(a.trdmarket_auth) ? a.trdmarket_auth.join(',') : String(a.trdmarket_auth || '');
+                        const isReal = a.trd_env === 'REAL';
+                        const firm = a.security_firm && a.security_firm !== 'N/A' ? a.security_firm : '—';
+                        return (
+                          <tr key={i} style={{ borderBottom: '1px solid rgba(255,255,255,.04)' }}>
+                            <td style={{ padding: '4px 8px', fontFamily: 'monospace' }}>{String(a.acc_id)}</td>
+                            <td style={{ padding: '4px 8px', color: isReal ? '#fb923c' : '#94a3b8' }}>{a.trd_env}</td>
+                            <td style={{ padding: '4px 8px' }}>{firm}</td>
+                            <td style={{ padding: '4px 8px' }}>{auth}</td>
+                            <td style={{ padding: '4px 8px' }}>{a.acc_type}</td>
+                            <td style={{ padding: '4px 8px' }}>{a.acc_status}</td>
+                            <td style={{ padding: '4px 8px' }}>
+                              {!connected && (
+                                <button onClick={() => {
+                                  setTrdEnv(isReal ? 1 : 0);
+                                  setSecFirm(firm !== '—' ? firm : 'NONE');
+                                  setConnMsg(`Selected ${a.trd_env} / ${firm} — click Connect`);
+                                }} style={{
+                                  fontSize: 11, padding: '3px 8px', borderRadius: 4,
+                                  border: `1px solid ${C.cardBorder}`,
+                                  background: 'rgba(249,115,22,.1)', color: C.accent, cursor: 'pointer',
+                                }}>Use</button>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </OCard>
 
           {/* ── Legged execution warning ── */}

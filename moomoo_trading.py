@@ -10,9 +10,18 @@ Legged spread execution note:
     - Short leg fill timeout → cancel short → market-sell long leg (flatten) → return error
   All outcomes are journaled.
 
+Connect flow:
+  1. Open OpenSecTradeContext with whatever filter the user picked (default NONE
+     for both market and firm — OpenD shows every account it has).
+  2. Call get_acc_list() so we can see exactly which accounts OpenD has.
+  3. Pick the first account whose trd_env matches and whose trdmarket_auth list
+     contains 'US' (so US options can be traded).
+  4. For REAL trading only, call unlock_trade(password) to enable order placement.
+  5. Query account info to confirm and return summary.
+
 trd_env note:
-  0 = simulate (paper trading) — unlock_trade not required, uses TrdEnv.SIMULATE
-  1 = real trading            — unlock_trade required,     uses TrdEnv.REAL
+  0 = simulate (paper trading) — unlock_trade not required
+  1 = real trading            — unlock_trade required
 """
 from __future__ import annotations
 
@@ -30,6 +39,31 @@ _POLL_INTERVAL_S = 0.5
 _LEG_TIMEOUT_S = 30.0
 
 
+def _accounts_to_dicts(acc_data) -> list[dict[str, Any]]:
+    """Normalise acc_list DataFrame rows to plain dicts (lists JSON-friendly)."""
+    rows: list[dict[str, Any]] = []
+    if acc_data is None or len(acc_data) == 0:
+        return rows
+    for _, row in acc_data.iterrows():
+        d = {col: row[col] for col in acc_data.columns}
+        # trdmarket_auth is a list — leave it; everything else stringify if exotic
+        for k, v in list(d.items()):
+            if hasattr(v, "tolist"):
+                d[k] = v.tolist()
+        rows.append(d)
+    return rows
+
+
+def _account_can_trade_us(row: dict[str, Any]) -> bool:
+    """True if this account row has 'US' in its trdmarket_auth list."""
+    auth = row.get("trdmarket_auth")
+    if isinstance(auth, (list, tuple, set)):
+        return "US" in auth
+    if isinstance(auth, str):
+        return "US" in auth  # string fallback: contains 'US'
+    return False
+
+
 class MoomooTrader:
     """Implements BrokerProtocol against moomoo OpenD."""
 
@@ -40,12 +74,14 @@ class MoomooTrader:
         trade_password: str = "",
         trd_env: int = 0,
         security_firm: str = "NONE",
+        filter_trdmarket: str = "NONE",
     ) -> None:
         self._host = host
         self._port = port
         self._trade_password = trade_password
         self._trd_env_int = trd_env   # 0=simulate, 1=real
         self._security_firm_str = security_firm
+        self._filter_trdmarket_str = filter_trdmarket
         self._acc_id: int | None = None
         self._quote_ctx = None
         self._trd_ctx = None
@@ -53,10 +89,51 @@ class MoomooTrader:
         # resolved after import — set in connect()
         self._ft_trd_env = None
 
+    # ── Diagnostics ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def probe(host: str = "127.0.0.1", port: int = 11111) -> dict[str, Any]:
+        """Open a permissive context, list every account, close.  Pure diagnostic.
+
+        Used by /api/moomoo/probe so the UI can show the user what's actually
+        available before they pick a Mode/Firm/Market.
+        """
+        try:
+            import moomoo as ft
+        except ImportError as exc:
+            return {"ok": False, "error": "moomoo-api not installed", "detail": str(exc)}
+
+        loop = asyncio.get_event_loop()
+
+        def _do_probe():
+            trd_ctx = None
+            try:
+                trd_ctx = ft.OpenSecTradeContext(
+                    filter_trdmarket=ft.TrdMarket.NONE,
+                    host=host,
+                    port=port,
+                    security_firm=ft.SecurityFirm.NONE,
+                )
+                ret, acc_data = trd_ctx.get_acc_list()
+                if ret != ft.RET_OK:
+                    return {"ok": False, "error": f"get_acc_list failed: {acc_data}"}
+                accounts = _accounts_to_dicts(acc_data)
+                return {"ok": True, "accounts": accounts, "count": len(accounts)}
+            except Exception as exc:
+                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            finally:
+                if trd_ctx is not None:
+                    try:
+                        trd_ctx.close()
+                    except Exception:
+                        pass
+
+        return await loop.run_in_executor(None, _do_probe)
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def connect(self) -> dict[str, Any]:
-        """Open quote + trade contexts and unlock trading."""
+        """Open quote + trade contexts, pick correct account, unlock if real."""
         try:
             import moomoo as ft
         except ImportError as exc:
@@ -66,66 +143,127 @@ class MoomooTrader:
 
         trd_env_obj = ft.TrdEnv.REAL if self._trd_env_int == 1 else ft.TrdEnv.SIMULATE
         self._ft_trd_env = trd_env_obj
+        env_label = "REAL" if self._trd_env_int == 1 else "SIMULATE"
         loop = asyncio.get_event_loop()
 
         def _do_connect():
-            quote_ctx = ft.OpenQuoteContext(host=self._host, port=self._port)
-            security_firm = getattr(ft.SecurityFirm, self._security_firm_str, ft.SecurityFirm.NONE)
-            trd_ctx = ft.OpenSecTradeContext(
-                filter_trdmarket=ft.TrdMarket.US,
-                host=self._host,
-                port=self._port,
-                security_firm=security_firm,
-            )
+            quote_ctx = None
+            trd_ctx = None
+            try:
+                quote_ctx = ft.OpenQuoteContext(host=self._host, port=self._port)
 
-            # unlock_trade is only required (and valid) for real trading
-            if self._trd_env_int == 1:
-                ret, data = trd_ctx.unlock_trade(password=self._trade_password)
-                if ret != ft.RET_OK:
-                    trd_ctx.close()
-                    quote_ctx.close()
-                    raise RuntimeError(f"unlock_trade failed: {data}")
-
-            ret, acc_data = trd_ctx.get_acc_list()
-            if ret != ft.RET_OK:
-                trd_ctx.close()
-                quote_ctx.close()
-                raise RuntimeError(f"get_acc_list failed: {acc_data}")
-
-            # Filter by matching trd_env, then pick first US-market account
-            env_label = "REAL" if self._trd_env_int == 1 else "SIMULATE"
-            filtered = acc_data[acc_data["trd_env"] == env_label] if "trd_env" in acc_data.columns else acc_data
-            us_rows = filtered[filtered["trd_market"] == "US"] if not filtered.empty else filtered
-            if us_rows.empty:
-                us_rows = filtered  # fall back: take first account regardless of market
-            if us_rows.empty:
-                trd_ctx.close()
-                quote_ctx.close()
-                raise RuntimeError(
-                    f"No {env_label} US account found in OpenD. "
-                    "Check that moomoo is logged in and the correct trd_env is selected."
+                security_firm = getattr(
+                    ft.SecurityFirm, self._security_firm_str, ft.SecurityFirm.NONE,
+                )
+                filter_market = getattr(
+                    ft.TrdMarket, self._filter_trdmarket_str, ft.TrdMarket.NONE,
+                )
+                trd_ctx = ft.OpenSecTradeContext(
+                    filter_trdmarket=filter_market,
+                    host=self._host,
+                    port=self._port,
+                    security_firm=security_firm,
                 )
 
-            acc_id = int(us_rows.iloc[0]["acc_id"])
-            ret, summary = trd_ctx.accinfo_query(trd_env=trd_env_obj, acc_id=acc_id)
-            if ret != ft.RET_OK:
-                trd_ctx.close()
-                quote_ctx.close()
-                raise RuntimeError(f"accinfo_query failed: {summary}")
-            return quote_ctx, trd_ctx, acc_id, summary.iloc[0].to_dict()
+                # Step 1: enumerate accounts BEFORE unlock_trade so we get a
+                # diagnostic if the user's filter combination hides everything.
+                ret, acc_data = trd_ctx.get_acc_list()
+                if ret != ft.RET_OK:
+                    raise RuntimeError(f"get_acc_list failed: {acc_data}")
+                all_accounts = _accounts_to_dicts(acc_data)
+                if not all_accounts:
+                    raise RuntimeError(
+                        "OpenD returned zero accounts. Check that the moomoo "
+                        "desktop app is logged in with at least one account "
+                        "(real or paper) provisioned for US options."
+                    )
 
-        quote_ctx, trd_ctx, acc_id, raw_summary = await loop.run_in_executor(None, _do_connect)
+                # Step 2: pick an account matching the requested env + US auth.
+                env_matches = [a for a in all_accounts if a.get("trd_env") == env_label]
+                if not env_matches:
+                    available_envs = sorted({a.get("trd_env") for a in all_accounts})
+                    raise RuntimeError(
+                        f"No {env_label} account found. OpenD has: {available_envs}. "
+                        f"Switch Mode in the UI or enable a {env_label.lower()} "
+                        f"account in moomoo. Visible accounts:\n"
+                        + _format_accounts(all_accounts)
+                    )
+
+                us_capable = [a for a in env_matches if _account_can_trade_us(a)]
+                chosen = us_capable[0] if us_capable else env_matches[0]
+                acc_id = int(chosen["acc_id"])
+                if not us_capable:
+                    logger.warning(
+                        "No US-options-capable %s account found — using acc_id=%s "
+                        "(trdmarket_auth=%s).  US option orders will likely be "
+                        "rejected by the broker.",
+                        env_label, acc_id, chosen.get("trdmarket_auth"),
+                    )
+
+                # Step 3: unlock_trade for REAL only.
+                #
+                # Two OpenD modes:
+                # - GUI: API unlock is disabled; user must click the "Unlock"
+                #   button in the OpenD desktop app.  We try unlock_trade and
+                #   silently treat the GUI-mode error as "already unlocked
+                #   externally" so the user just needs to do it once at OpenD
+                #   startup.  If they haven't, place_order will fail later with
+                #   a clear "trade not unlocked" error.
+                # - Headless: PIN via API works.
+                if self._trd_env_int == 1:
+                    pin = self._trade_password
+                    if pin:
+                        ret, data = trd_ctx.unlock_trade(password=pin)
+                        if ret != ft.RET_OK:
+                            msg = str(data)
+                            if "Unlock button" in msg or "GUI version" in msg:
+                                logger.info(
+                                    "OpenD GUI mode detected — trusting "
+                                    "user-side unlock via OpenD UI."
+                                )
+                            else:
+                                raise RuntimeError(
+                                    f"unlock_trade failed: {data}. "
+                                    "Check that the PIN matches your moomoo "
+                                    "trade PIN exactly."
+                                )
+                    else:
+                        logger.info(
+                            "No PIN provided — assuming OpenD GUI is already "
+                            "unlocked via the desktop app."
+                        )
+
+                # Step 4: confirm by querying account info.
+                # currency='USD' — default is HKD which fails for non-HK accounts
+                # (e.g. FUTUCA: "This account does not support converting to
+                # this currency").  USD works for US-trading-capable accounts.
+                ret, summary = trd_ctx.accinfo_query(
+                    trd_env=trd_env_obj, acc_id=acc_id, currency="USD",
+                )
+                if ret != ft.RET_OK:
+                    raise RuntimeError(f"accinfo_query failed: {summary}")
+                return quote_ctx, trd_ctx, acc_id, summary.iloc[0].to_dict(), all_accounts
+            except Exception:
+                if trd_ctx is not None:
+                    try: trd_ctx.close()
+                    except Exception: pass
+                if quote_ctx is not None:
+                    try: quote_ctx.close()
+                    except Exception: pass
+                raise
+
+        quote_ctx, trd_ctx, acc_id, raw_summary, all_accounts = await loop.run_in_executor(None, _do_connect)
         self._quote_ctx = quote_ctx
         self._trd_ctx = trd_ctx
         self._acc_id = acc_id
         self._connected = True
-        env_label = "REAL" if self._trd_env_int == 1 else "SIMULATE"
         logger.info("MoomooTrader connected. acc_id=%s env=%s", acc_id, env_label)
         return {
             "connected": True,
             "acc_id": acc_id,
             "trd_env": env_label,
             "account": self._map_account(raw_summary),
+            "all_accounts": all_accounts,
         }
 
     def disconnect(self) -> None:
@@ -151,15 +289,31 @@ class MoomooTrader:
     # ── Account ───────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _map_account(raw: dict) -> dict[str, Any]:
-        """Normalise moomoo account fields to project standard names."""
+    def _safe_float(v: Any, default: float = 0.0) -> float:
+        """Coerce moomoo field to float; many fields are 'N/A' on simulate."""
+        if v is None:
+            return default
+        if isinstance(v, str) and (v == "N/A" or v.strip() == ""):
+            return default
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _map_account(cls, raw: dict) -> dict[str, Any]:
+        """Normalise moomoo account fields to project standard names.
+
+        Simulate accounts return 'N/A' for many fields — coerce safely.
+        """
+        f = cls._safe_float
         return {
-            "equity":           float(raw.get("total_assets", 0)),
-            "buying_power":     float(raw.get("power", 0)),
-            "excess_liquidity": float(raw.get("net_cash_power", 0)),
-            "unrealized_pnl":   float(raw.get("unrealized_pl", 0)),
-            "realized_pnl":     float(raw.get("realized_pl", 0)),
-            "cash":             float(raw.get("cash", 0)),
+            "equity":           f(raw.get("total_assets")),
+            "buying_power":     f(raw.get("power")),
+            "excess_liquidity": f(raw.get("net_cash_power")),
+            "unrealized_pnl":   f(raw.get("unrealized_pl")),
+            "realized_pnl":     f(raw.get("realized_pl")),
+            "cash":             f(raw.get("cash")),
         }
 
     async def get_account_summary(self) -> dict[str, Any]:
@@ -169,7 +323,7 @@ class MoomooTrader:
 
         def _fetch():
             ret, data = self._trd_ctx.accinfo_query(
-                trd_env=self._ft_trd_env, acc_id=self._acc_id
+                trd_env=self._ft_trd_env, acc_id=self._acc_id, currency="USD",
             )
             if ret != ft.RET_OK:
                 raise RuntimeError(f"accinfo_query: {data}")
@@ -332,8 +486,8 @@ class MoomooTrader:
         def _fetch():
             ret, data = self._trd_ctx.order_list_query(
                 order_id=order_id,
-                acc_id=self._acc_id,
                 trd_env=self._ft_trd_env,
+                acc_id=self._acc_id,
             )
             if ret != ft.RET_OK or data.empty:
                 return None
@@ -454,8 +608,8 @@ class MoomooTrader:
             def _check():
                 ret, data = self._trd_ctx.order_list_query(
                     order_id=order_id,
-                    acc_id=self._acc_id,
                     trd_env=self._ft_trd_env,
+                    acc_id=self._acc_id,
                 )
                 if ret != ft.RET_OK:
                     return None
@@ -476,8 +630,8 @@ class MoomooTrader:
                 order_id=order_id,
                 qty=0,
                 price=0,
-                acc_id=self._acc_id,
                 trd_env=self._ft_trd_env,
+                acc_id=self._acc_id,
             )
 
         try:
@@ -507,3 +661,19 @@ class MoomooTrader:
             return str(data["order_id"].iloc[0])
 
         return await loop.run_in_executor(None, _place)
+
+
+def _format_accounts(accounts: list[dict[str, Any]]) -> str:
+    """Pretty-print account list for diagnostic error messages."""
+    if not accounts:
+        return "  (none)"
+    lines = []
+    for a in accounts:
+        lines.append(
+            f"  acc_id={a.get('acc_id')} "
+            f"env={a.get('trd_env')} "
+            f"firm={a.get('security_firm')} "
+            f"auth={a.get('trdmarket_auth')} "
+            f"status={a.get('acc_status')}"
+        )
+    return "\n".join(lines)

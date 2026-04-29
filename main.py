@@ -2233,8 +2233,14 @@ class MoomooConnectRequest(BaseModel):
     host: str = "127.0.0.1"
     port: int = 11111
     trade_password: str = ""
-    trd_env: int = 0             # 0=simulate, 1=real
-    security_firm: str = "NONE"  # NONE=auto, FUTUINC=US, FUTUSECURITIES=HK, etc.
+    trd_env: int = 0                  # 0=simulate, 1=real
+    security_firm: str = "NONE"       # NONE=auto, FUTUINC=US, FUTUCA=Canada, FUTUSECURITIES=HK
+    filter_trdmarket: str = "NONE"    # NONE=auto (recommended), US, HK, CA, etc.
+
+
+class MoomooProbeRequest(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 11111
 
 
 class MoomooOrderRequest(BaseModel):
@@ -2265,7 +2271,14 @@ async def moomoo_connect(req: MoomooConnectRequest):
     global _moomoo_trader
     from moomoo_trading import MoomooTrader
     from core.broker import register_broker
-    trader = MoomooTrader(host=req.host, port=req.port, trade_password=req.trade_password, trd_env=req.trd_env, security_firm=req.security_firm)
+    trader = MoomooTrader(
+        host=req.host,
+        port=req.port,
+        trade_password=req.trade_password,
+        trd_env=req.trd_env,
+        security_firm=req.security_firm,
+        filter_trdmarket=req.filter_trdmarket,
+    )
     try:
         result = await trader.connect()
         _moomoo_trader = trader
@@ -2273,6 +2286,18 @@ async def moomoo_connect(req: MoomooConnectRequest):
         return result
     except Exception as exc:
         return {"connected": False, "error": str(exc)}
+
+
+@app.post("/api/moomoo/probe")
+async def moomoo_probe(req: MoomooProbeRequest):
+    """Diagnostic: list every account OpenD has, regardless of filters.
+
+    Lets the UI show the user which accounts are visible and what trd_env /
+    security_firm / trdmarket_auth values they have, so they can pick the
+    right combo before calling /connect.
+    """
+    from moomoo_trading import MoomooTrader
+    return await MoomooTrader.probe(host=req.host, port=req.port)
 
 
 @app.post("/api/moomoo/disconnect")

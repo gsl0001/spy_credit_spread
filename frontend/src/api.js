@@ -90,6 +90,7 @@ export const api = {
   // Moomoo
   moomoo: {
     connect:    (body)         => post('/api/moomoo/connect', body),
+    probe:      (body)         => post('/api/moomoo/probe', body || {}),
     disconnect: ()             => post('/api/moomoo/disconnect'),
     account:    ()             => get('/api/moomoo/account'),
     positions:  ()             => get('/api/moomoo/positions'),
