@@ -2233,7 +2233,8 @@ class MoomooConnectRequest(BaseModel):
     host: str = "127.0.0.1"
     port: int = 11111
     trade_password: str = ""
-    trd_env: int = 0   # 0=simulate, 1=real
+    trd_env: int = 0             # 0=simulate, 1=real
+    security_firm: str = "NONE"  # NONE=auto, FUTUINC=US, FUTUSECURITIES=HK, etc.
 
 
 class MoomooOrderRequest(BaseModel):
@@ -2264,7 +2265,7 @@ async def moomoo_connect(req: MoomooConnectRequest):
     global _moomoo_trader
     from moomoo_trading import MoomooTrader
     from core.broker import register_broker
-    trader = MoomooTrader(host=req.host, port=req.port, trade_password=req.trade_password, trd_env=req.trd_env)
+    trader = MoomooTrader(host=req.host, port=req.port, trade_password=req.trade_password, trd_env=req.trd_env, security_firm=req.security_firm)
     try:
         result = await trader.connect()
         _moomoo_trader = trader

@@ -76,6 +76,7 @@ export function MoomooView() {
   const [port, setPort] = useState(() => localStorage.getItem('moomoo_port') || '11111');
   const [tradePwd, setTradePwd] = useState(() => localStorage.getItem('moomoo_pwd') || '');
   const [trdEnv, setTrdEnv] = useState(() => Number(localStorage.getItem('moomoo_trd_env') ?? 0));
+  const [secFirm, setSecFirm] = useState(() => localStorage.getItem('moomoo_sec_firm') || 'NONE');
   const [connected, setConnected] = useState(false);
   const [accId, setAccId] = useState('');
   const [connBusy, setConnBusy] = useState(false);
@@ -105,6 +106,7 @@ export function MoomooView() {
     localStorage.setItem('moomoo_port', port);
     localStorage.setItem('moomoo_pwd', tradePwd);
     localStorage.setItem('moomoo_trd_env', String(trdEnv));
+    localStorage.setItem('moomoo_sec_firm', secFirm);
   };
 
   const doConnect = useCallback(async () => {
@@ -113,7 +115,7 @@ export function MoomooView() {
     setConnBusy(true);
     setConnMsg('Connecting…');
     try {
-      const res = await api.moomoo.connect({ host, port: Number(port), trade_password: tradePwd, trd_env: trdEnv });
+      const res = await api.moomoo.connect({ host, port: Number(port), trade_password: tradePwd, trd_env: trdEnv, security_firm: secFirm });
       if (res?.connected) {
         setConnected(true);
         setAccId(res.acc_id ?? '');
@@ -127,7 +129,7 @@ export function MoomooView() {
     } finally {
       setConnBusy(false);
     }
-  }, [connBusy, host, port, tradePwd, trdEnv]);
+  }, [connBusy, host, port, tradePwd, trdEnv, secFirm]);
 
   const doDisconnect = useCallback(async () => {
     try {
@@ -253,6 +255,20 @@ export function MoomooView() {
                     }}>{label}</button>
                   ))}
                 </div>
+              </div>
+              <div style={{ flexShrink: 0 }}>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Firm</div>
+                <select disabled={connected} value={secFirm} onChange={e => setSecFirm(e.target.value)} style={{
+                  padding: '5px 8px', fontSize: 12, borderRadius: 6, border: '1px solid rgba(100,100,100,.3)',
+                  background: 'var(--bg-card)', color: 'var(--text-1)', cursor: connected ? 'default' : 'pointer',
+                }}>
+                  <option value="NONE">Auto (NONE)</option>
+                  <option value="FUTUINC">Futu Inc (US)</option>
+                  <option value="FUTUSECURITIES">Futu Securities (HK)</option>
+                  <option value="FUTUSG">Futu SG</option>
+                  <option value="FUTUCA">Futu CA</option>
+                  <option value="FUTUAU">Futu AU</option>
+                </select>
               </div>
               <OBtn onClick={connected ? doDisconnect : doConnect} disabled={connBusy} danger={connected}>
                 {connBusy ? '…' : connected ? 'Disconnect' : 'Connect'}

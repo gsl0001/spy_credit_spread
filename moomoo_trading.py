@@ -39,11 +39,13 @@ class MoomooTrader:
         port: int = 11111,
         trade_password: str = "",
         trd_env: int = 0,
+        security_firm: str = "NONE",
     ) -> None:
         self._host = host
         self._port = port
         self._trade_password = trade_password
         self._trd_env_int = trd_env   # 0=simulate, 1=real
+        self._security_firm_str = security_firm
         self._acc_id: int | None = None
         self._quote_ctx = None
         self._trd_ctx = None
@@ -68,11 +70,12 @@ class MoomooTrader:
 
         def _do_connect():
             quote_ctx = ft.OpenQuoteContext(host=self._host, port=self._port)
+            security_firm = getattr(ft.SecurityFirm, self._security_firm_str, ft.SecurityFirm.NONE)
             trd_ctx = ft.OpenSecTradeContext(
                 filter_trdmarket=ft.TrdMarket.US,
                 host=self._host,
                 port=self._port,
-                security_firm=ft.SecurityFirm.FUTUINC,
+                security_firm=security_firm,
             )
 
             # unlock_trade is only required (and valid) for real trading
