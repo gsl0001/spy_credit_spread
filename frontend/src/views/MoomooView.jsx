@@ -85,8 +85,10 @@ export function MoomooView() {
   // Account
   const [account, setAccount] = useState(null);
 
-  // Positions
+  // Positions — journal-backed (so we have real position_id for Close)
   const [positions, setPositions] = useState([]);
+  const [exitBusy, setExitBusy] = useState({});  // {position_id: bool}
+  const [exitMsg, setExitMsg] = useState('');
 
   // Order ticket
   const [ticketDir, setTicketDir] = useState('bull_call');
@@ -273,17 +275,21 @@ export function MoomooView() {
   }, [connected]);
 
   const refreshPositions = useCallback(async () => {
-    if (!connected) return;
+    // Pull from journal so we have position_id + legs for Close.
+    // Filter to moomoo so we don't show IBKR positions in the moomoo view.
     try {
-      const res = await api.moomoo.positions();
-      if (res?.positions) setPositions(res.positions);
+      const res = await api.openPositions();
+      const all = res?.positions || [];
+      setPositions(all.filter(p => (p.broker || 'ibkr') === 'moomoo'));
     } catch (_) {}
-  }, [connected]);
+  }, []);
 
   useEffect(() => {
+    // Always poll journal positions (so user sees what was opened even if
+    // they reload before reconnecting).  Account refresh requires connect.
+    refreshPositions();
     if (!connected) return;
     refreshAccount();
-    refreshPositions();
     const id = setInterval(() => { refreshAccount(); refreshPositions(); }, 15000);
     return () => clearInterval(id);
   }, [connected, refreshAccount, refreshPositions]);
@@ -327,12 +333,31 @@ export function MoomooView() {
   }, [execBusy, connected, host, port, tradePwd, ticketDir, ticketOffset, ticketWidth, ticketQty, ticketDebit, refreshPositions]);
 
   const doExit = useCallback(async (posId) => {
+    if (!posId) {
+      setExitMsg('✗ no position_id');
+      return;
+    }
+    if (!connected) {
+      setExitMsg('✗ moomoo not connected — connect first');
+      return;
+    }
+    setExitBusy(b => ({ ...b, [posId]: true }));
+    setExitMsg(`Closing ${posId.slice(0, 12)}…`);
     try {
       const res = await api.moomoo.exit({ position_id: posId });
+      if (res?.error) {
+        setExitMsg(`✗ ${res.error}`);
+      } else {
+        const n = (res?.close_orders || []).length;
+        setExitMsg(`✓ Closed ${posId.slice(0, 12)} · ${n} leg order(s) sent`);
+      }
       await refreshPositions();
-      return res;
-    } catch (_) {}
-  }, [refreshPositions]);
+    } catch (e) {
+      setExitMsg(`✗ ${e.message}`);
+    } finally {
+      setExitBusy(b => ({ ...b, [posId]: false }));
+    }
+  }, [connected, refreshPositions]);
 
   const inp = (val, set, type = 'text') => ({
     type, value: val, onChange: e => set(e.target.value),
@@ -613,38 +638,71 @@ export function MoomooView() {
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
 
-          {/* ── Positions table ── */}
-          <OCard title="Positions" subtitle="moomoo account" flush>
+          {/* ── Positions table (journal-backed) ── */}
+          <OCard
+            title="Positions"
+            subtitle={`moomoo · ${positions.length} open spread${positions.length === 1 ? '' : 's'}`}
+            flush
+          >
             <table className="tbl">
               <thead>
                 <tr>
-                  <th>Code</th><th>Side</th><th className="num">Qty</th>
-                  <th className="num">Cost</th><th className="num">Mkt Val</th>
-                  <th className="num">P&L</th><th></th>
+                  <th>ID</th>
+                  <th>Symbol</th>
+                  <th>Direction</th>
+                  <th className="num">Qty</th>
+                  <th className="num">Entry $</th>
+                  <th>Legs</th>
+                  <th>Expiry</th>
+                  <th>State</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
                 {positions.length === 0 && (
-                  <tr><td colSpan="7" style={{ textAlign: 'center', padding: 24, color: 'var(--text-3)' }}>No positions</td></tr>
+                  <tr><td colSpan="9" style={{ textAlign: 'center', padding: 24, color: 'var(--text-3)' }}>No moomoo positions</td></tr>
                 )}
-                {positions.map((p, i) => {
-                  const pnl = Number(p.pl_val ?? 0);
+                {positions.map(p => {
+                  const dirLabel = p.direction === 'bull' ? 'BULL' : p.direction === 'bear' ? 'BEAR' : (p.direction || '—').toUpperCase();
+                  const dirVar = p.direction === 'bull' ? 'pos' : p.direction === 'bear' ? 'neg' : 'default';
+                  const legs = Array.isArray(p.legs) ? p.legs : [];
+                  const legSummary = legs.length === 0 ? '—'
+                    : legs.map(l => {
+                        const r = (l.right || '').toUpperCase();
+                        const side = l.side === 'long' ? '+' : l.side === 'short' ? '−' : '';
+                        return `${side}${l.strike}${r}`;
+                      }).join(' / ');
+                  const busy = !!exitBusy[p.id];
                   return (
-                    <tr key={i}>
-                      <td style={{ fontFamily: 'monospace', fontSize: 12 }}>{p.code ?? '—'}</td>
-                      <td><Badge variant={p.position_side === 'LONG' ? 'pos' : 'neg'} dot>{p.position_side ?? '—'}</Badge></td>
-                      <td className="num">{Number(p.qty ?? 0)}</td>
-                      <td className="num">{fmtUsd(p.cost_price ?? 0)}</td>
-                      <td className="num">{fmtUsd(p.market_val ?? 0)}</td>
-                      <td className="num" style={{ color: pnl >= 0 ? C.pos : C.neg }}>{fmtUsd(pnl, true)}</td>
+                    <tr key={p.id}>
+                      <td style={{ fontFamily: 'monospace', fontSize: 11 }}>{(p.id || '').slice(0, 12)}</td>
+                      <td>{p.symbol ?? '—'}</td>
+                      <td><Badge variant={dirVar} dot>{dirLabel}</Badge></td>
+                      <td className="num">{Number(p.contracts ?? 0)}</td>
+                      <td className="num">{fmtUsd(p.entry_cost ?? 0)}</td>
+                      <td style={{ fontFamily: 'monospace', fontSize: 11 }}>{legSummary}</td>
+                      <td style={{ fontSize: 11 }}>{p.expiry ?? '—'}</td>
+                      <td><Badge variant={p.state === 'open' ? 'pos' : 'default'}>{p.state ?? '—'}</Badge></td>
                       <td>
-                        <OBtn small danger onClick={() => doExit(p.position_id)}>Close</OBtn>
+                        <OBtn small danger disabled={busy || !connected} onClick={() => doExit(p.id)}>
+                          {busy ? '…' : 'Close'}
+                        </OBtn>
                       </td>
                     </tr>
                   );
                 })}
               </tbody>
             </table>
+            {(exitMsg || !connected) && (
+              <div style={{
+                padding: '8px 12px', borderTop: '1px solid rgba(255,255,255,.06)', fontSize: 12,
+                color: exitMsg.startsWith('✓') ? C.pos : exitMsg.startsWith('✗') ? C.neg : 'var(--text-3)',
+              }}>
+                {!connected
+                  ? 'Connect to moomoo to enable Close.'
+                  : exitMsg}
+              </div>
+            )}
           </OCard>
 
           {/* ── Order log ── */}

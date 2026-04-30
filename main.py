@@ -2363,13 +2363,27 @@ async def moomoo_exit(payload: dict):
     pos = journal.get_position(position_id)
     if not pos:
         return {"error": "position_not_found"}
+    if pos.broker != "moomoo":
+        return {"error": f"position broker is '{pos.broker}', not 'moomoo'"}
+    if pos.state != "open":
+        return {"error": f"position state is '{pos.state}', not 'open'"}
     try:
         broker = get_broker("moomoo")
-        result = await broker.close_position(position_id, list(pos.legs))
-        journal.close_position(position_id, exit_cost=0.0, exit_reason="manual_exit")
-        return result
     except BrokerNotConnected as exc:
-        return {"error": str(exc)}
+        return {"error": f"moomoo not connected: {exc}"}
+    try:
+        result = await broker.close_position(position_id, list(pos.legs))
+    except Exception as exc:
+        journal.log_event("exit_failed", subject=position_id, payload={
+            "error": str(exc), "broker": "moomoo",
+        })
+        return {"error": f"close_position failed: {exc}"}
+    # Mark journal closed only after broker accepted the close orders.
+    journal.close_position(position_id, exit_cost=0.0, exit_reason="manual_exit")
+    journal.log_event("exit_submitted", subject=position_id, payload={
+        "broker": "moomoo", "result": result,
+    })
+    return result
 
 
 @app.post("/api/moomoo/cancel")
