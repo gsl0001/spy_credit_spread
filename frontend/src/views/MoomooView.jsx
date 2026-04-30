@@ -105,6 +105,14 @@ export function MoomooView() {
   const [probedAccounts, setProbedAccounts] = useState(null);
   const [probeBusy, setProbeBusy] = useState(false);
 
+  // Strategy scanner state (so user can launch ORB-on-moomoo from this view)
+  const [moomooPresets, setMoomooPresets] = useState([]);
+  const [selectedPreset, setSelectedPreset] = useState(() => localStorage.getItem('moomoo_preset') || 'orb-5m-moomoo');
+  const [scannerActive, setScannerActive] = useState(false);
+  const [scannerPreset, setScannerPreset] = useState(null);
+  const [scannerBusy, setScannerBusy] = useState(false);
+  const [scannerMsg, setScannerMsg] = useState('');
+
   const persistConn = () => {
     localStorage.setItem('moomoo_host', host);
     localStorage.setItem('moomoo_port', port);
@@ -177,6 +185,83 @@ export function MoomooView() {
     }
   }, [probeBusy, host, port]);
 
+  // ── Strategy scanner (ORB-on-moomoo) ──────────────────────────────────────
+
+  const loadPresets = useCallback(async () => {
+    try {
+      const list = await api.presetsList();
+      const moomooOnly = (list || []).filter(p => (p?.broker || 'ibkr') === 'moomoo');
+      setMoomooPresets(moomooOnly);
+      // If selected preset isn't in the list, fall back to first
+      if (moomooOnly.length && !moomooOnly.find(p => p.name === selectedPreset)) {
+        setSelectedPreset(moomooOnly[0].name);
+      }
+    } catch (_) {}
+  }, [selectedPreset]);
+
+  const refreshScannerStatus = useCallback(async () => {
+    try {
+      const s = await api.presetScannerStatus();
+      setScannerActive(!!s?.active);
+      setScannerPreset(s?.preset || null);
+    } catch (_) {}
+  }, []);
+
+  const doScannerStart = useCallback(async () => {
+    if (scannerBusy || !selectedPreset) return;
+    setScannerBusy(true);
+    setScannerMsg('Starting scanner…');
+    try {
+      const res = await api.presetScannerStart(selectedPreset);
+      if (res?.error) {
+        setScannerMsg(`✗ ${res.error}: ${res.detail || ''}`);
+      } else {
+        setScannerActive(true);
+        setScannerPreset(res.preset);
+        localStorage.setItem('moomoo_preset', selectedPreset);
+        setScannerMsg(`✓ Scanning '${selectedPreset}' every ${res.preset?.timing_value}${res.preset?.timing_mode === 'interval' ? 's' : ' (cron)'}`);
+      }
+    } catch (e) {
+      setScannerMsg(`✗ ${e.message}`);
+    } finally {
+      setScannerBusy(false);
+    }
+  }, [scannerBusy, selectedPreset]);
+
+  const doScannerStop = useCallback(async () => {
+    if (scannerBusy) return;
+    setScannerBusy(true);
+    try {
+      await api.presetScannerStop();
+      setScannerActive(false);
+      setScannerPreset(null);
+      setScannerMsg('Stopped');
+    } catch (e) {
+      setScannerMsg(`✗ ${e.message}`);
+    } finally {
+      setScannerBusy(false);
+    }
+  }, [scannerBusy]);
+
+  const doScannerTickNow = useCallback(async () => {
+    if (scannerBusy) return;
+    setScannerBusy(true);
+    setScannerMsg('Running one tick…');
+    try {
+      const res = await api.presetScannerTick();
+      if (res?.error) {
+        setScannerMsg(`✗ ${res.error}: ${res.detail || ''}`);
+      } else {
+        const fired = (res.signals || []).filter(s => s.fired).length;
+        setScannerMsg(`✓ Tick complete · ${res.signals?.length || 0} signals · ${fired} fired`);
+      }
+    } catch (e) {
+      setScannerMsg(`✗ ${e.message}`);
+    } finally {
+      setScannerBusy(false);
+    }
+  }, [scannerBusy]);
+
   const refreshAccount = useCallback(async () => {
     if (!connected) return;
     try {
@@ -200,6 +285,14 @@ export function MoomooView() {
     const id = setInterval(() => { refreshAccount(); refreshPositions(); }, 15000);
     return () => clearInterval(id);
   }, [connected, refreshAccount, refreshPositions]);
+
+  // Load presets list + scanner status on mount; refresh status every 10s
+  useEffect(() => {
+    loadPresets();
+    refreshScannerStatus();
+    const id = setInterval(refreshScannerStatus, 10000);
+    return () => clearInterval(id);
+  }, [loadPresets, refreshScannerStatus]);
 
   const doExecute = useCallback(async () => {
     if (execBusy || !connected) return;
@@ -379,6 +472,69 @@ export function MoomooView() {
                 </div>
               </div>
             )}
+          </OCard>
+
+          {/* ── Strategy Scanner (auto-trading) ── */}
+          <OCard title="Strategy Scanner" subtitle="ORB-on-moomoo · auto-execute on signal">
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end', marginBottom: 10 }}>
+              <div style={{ flex: '1 1 200px', minWidth: 200 }}>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Preset</div>
+                <select
+                  value={selectedPreset}
+                  onChange={e => setSelectedPreset(e.target.value)}
+                  disabled={scannerActive || scannerBusy}
+                  style={{
+                    width: '100%', padding: '6px 8px', fontSize: 13, borderRadius: 6,
+                    border: '1px solid rgba(100,100,100,.3)',
+                    background: 'var(--bg-card)', color: 'var(--text-1)',
+                  }}
+                >
+                  {moomooPresets.length === 0 && <option value="">(no moomoo presets)</option>}
+                  {moomooPresets.map(p => (
+                    <option key={p.name} value={p.name}>
+                      {p.name} · {p.strategy_name} · {p.timing_mode}={p.timing_value}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {!scannerActive ? (
+                <OBtn onClick={doScannerStart} disabled={!connected || scannerBusy || !selectedPreset}>
+                  {scannerBusy ? '…' : 'Start'}
+                </OBtn>
+              ) : (
+                <OBtn onClick={doScannerStop} disabled={scannerBusy} danger>
+                  {scannerBusy ? '…' : 'Stop'}
+                </OBtn>
+              )}
+              <OBtn onClick={doScannerTickNow} disabled={!scannerActive || scannerBusy}>
+                Tick Now
+              </OBtn>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 12, flexWrap: 'wrap' }}>
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                background: scannerActive ? 'rgba(34,197,94,.15)' : 'rgba(100,100,100,.15)',
+                border: `1px solid ${scannerActive ? 'rgba(34,197,94,.4)' : 'rgba(100,100,100,.3)'}`,
+                borderRadius: 20, padding: '3px 10px', fontWeight: 600,
+                color: scannerActive ? '#22c55e' : 'var(--text-3)',
+              }}>
+                <span style={{ width: 7, height: 7, borderRadius: '50%', background: scannerActive ? '#22c55e' : '#6b7280' }} />
+                {scannerActive ? `Scanning ${scannerPreset?.name || ''}` : 'Scanner idle'}
+              </span>
+              {scannerMsg && (
+                <span style={{ color: scannerMsg.startsWith('✓') ? C.pos : scannerMsg.startsWith('✗') ? C.neg : 'var(--text-3)' }}>
+                  {scannerMsg}
+                </span>
+              )}
+              {!connected && (
+                <span style={{ color: C.neg }}>Connect to moomoo first.</span>
+              )}
+            </div>
+            <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-3)', lineHeight: 1.5 }}>
+              ORB strategy trades only on Mon/Wed/Fri when VIX is 15-25, the OR range
+              ≥ 0.05% of price, and the day is not a scheduled high-impact news day
+              (FOMC, NFP, CPI). Today (2026-04-29) is FOMC and will be skipped.
+            </div>
           </OCard>
 
           {/* ── Legged execution warning ── */}

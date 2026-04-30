@@ -2596,6 +2596,41 @@ def journal_reconciliation(date: Optional[str] = None):
     return _safe_json(get_journal().daily_reconciliation_report(date))
 
 
+@app.post("/api/orders/cleanup-stale")
+def cleanup_stale_orders(max_age_hours: int = 24):
+    """Mark orders stuck in 'submitted' state older than ``max_age_hours`` as cancelled.
+
+    Useful when IBKR/moomoo was disconnected during a fill, leaving the order
+    permanently in 'submitted' so the fill_watcher keeps polling a dead broker.
+    Returns the list of orders that were updated.
+    """
+    from core.journal import get_journal
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat(timespec="seconds")
+    j = get_journal()
+    with j._lock:
+        cur = j._conn.cursor()
+        cur.execute(
+            "SELECT id, broker, broker_order_id, position_id, submitted_at FROM orders "
+            "WHERE status IN ('submitted','submitting','pending') AND submitted_at < ?",
+            (cutoff,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        if rows:
+            j._conn.execute("BEGIN")
+            try:
+                for r in rows:
+                    j._conn.execute(
+                        "UPDATE orders SET status='cancelled' WHERE id=?",
+                        (r["id"],),
+                    )
+                j._conn.execute("COMMIT")
+            except Exception:
+                j._conn.execute("ROLLBACK")
+                raise
+    return {"cleaned": len(rows), "orders": rows, "cutoff": cutoff}
+
+
 def _pos_to_dict(p) -> dict:
     return {
         "id": p.id, "symbol": p.symbol, "topology": p.topology,
@@ -2613,6 +2648,34 @@ def _pos_to_dict(p) -> dict:
 
 # I10: track last successful monitor tick for heartbeat staleness alerts.
 _last_monitor_tick_iso: Optional[str] = None
+
+
+def _has_ibkr_work() -> bool:
+    """True if the journal has any IBKR position open or order pending.
+
+    Used by monitor/fill_watcher schedulers to skip the IBKR connection
+    attempt when only moomoo work exists — avoids flooding the log with
+    'Connection refused' errors when TWS isn't running.
+    """
+    try:
+        from core.journal import get_journal
+        j = get_journal()
+        # Check for any open IBKR position or pending IBKR order.
+        with j._lock:
+            cur = j._conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM positions WHERE state='open' AND broker='ibkr' LIMIT 1"
+            )
+            if cur.fetchone():
+                return True
+            cur.execute(
+                "SELECT 1 FROM orders WHERE broker='ibkr' "
+                "AND status IN ('submitted','submitting','pending') LIMIT 1"
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        # If we can't query, fall back to "yes, try" so we don't lose orders.
+        return True
 
 
 def _run_monitor_tick():
@@ -2633,10 +2696,13 @@ def _run_monitor_tick():
     if not is_leader():
         return
 
-    # User request: Pull data at all hours, ignoring standard RTH checks.
-    # Note: IBKR TWS still needs to be open and connected.
+    # Skip IBKR connection entirely when no IBKR work is queued.  Monitor
+    # still runs (so moomoo positions are evaluated) but with a None trader.
+    skip_ibkr = not _has_ibkr_work()
 
     async def _factory():
+        if skip_ibkr:
+            return None
         creds = SETTINGS.ibkr.as_dict()
         trader, _ = await get_ib_connection(creds)
         return trader
@@ -2679,7 +2745,24 @@ def _run_fill_reconcile():
     if not is_leader():
         return
 
-    # User request: Reconcile fills even outside standard market hours.
+    # Skip entirely when no broker reconciliation work is pending.
+    # fill_watcher routes per-order to the right broker registry so a None
+    # IBKR trader is fine — moomoo orders still reconcile via register_broker.
+    if not _has_ibkr_work():
+        # Still call reconcile_once with a None trader so any moomoo orders
+        # in the queue get reconciled via the broker registry path.
+        async def _go():
+            await reconcile_once(None, timeout_seconds=SETTINGS.risk.fill_timeout_seconds)
+        loop = _MAIN_LOOP
+        if loop is None or not loop.is_running():
+            return
+        try:
+            future = _aio.run_coroutine_threadsafe(_go(), loop)
+            future.result(timeout=55)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("fill reconcile (moomoo-only) failed: %s", e)
+        return
 
     async def _go():
         creds = SETTINGS.ibkr.as_dict()
