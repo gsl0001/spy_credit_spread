@@ -189,8 +189,10 @@ export function MoomooView() {
 
   const loadPresets = useCallback(async () => {
     try {
-      const list = await api.presetsList();
-      const moomooOnly = (list || []).filter(p => (p?.broker || 'ibkr') === 'moomoo');
+      const res = await api.presetsList();
+      // /api/presets returns { presets: [...] }
+      const list = Array.isArray(res) ? res : (res?.presets || []);
+      const moomooOnly = list.filter(p => (p?.broker || 'ibkr') === 'moomoo');
       setMoomooPresets(moomooOnly);
       // If selected preset isn't in the list, fall back to first
       if (moomooOnly.length && !moomooOnly.find(p => p.name === selectedPreset)) {
