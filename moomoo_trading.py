@@ -373,7 +373,13 @@ class MoomooTrader:
     # ── Option chain ──────────────────────────────────────────────────────────
 
     async def get_option_chain(self, symbol: str, expiry_date: str):
-        """Return DataFrame with strike, right, bid, ask, iv, delta, volume, open_interest.
+        """Return chain DataFrame enriched with bid/ask from market snapshots.
+
+        moomoo's get_option_chain only returns contract metadata (code, strike,
+        option_type, expiry).  Quote data (bid/ask) requires a separate
+        get_market_snapshot call per code.  We do that here and merge so
+        callers get a single DataFrame with strike_price, option_type,
+        bid_price, ask_price, last_price, volume, open_interest.
 
         expiry_date: 'YYYY-MM-DD'
         """
@@ -381,7 +387,7 @@ class MoomooTrader:
         loop = asyncio.get_event_loop()
         code = f"US.{symbol}"
 
-        def _fetch():
+        def _fetch_chain():
             ret, data = self._quote_ctx.get_option_chain(
                 code=code,
                 start=expiry_date,
@@ -391,7 +397,45 @@ class MoomooTrader:
                 raise RuntimeError(f"get_option_chain: {data}")
             return data
 
-        return await loop.run_in_executor(None, _fetch)
+        chain = await loop.run_in_executor(None, _fetch_chain)
+        if chain is None or len(chain) == 0:
+            return chain
+
+        # moomoo OpenD caps get_market_snapshot at ~200 codes per call.
+        codes = [str(c) for c in chain["code"].tolist() if c]
+
+        def _fetch_snapshots(codes_subset):
+            ret, data = self._quote_ctx.get_market_snapshot(codes_subset)
+            if ret != 0:
+                logger.warning("get_market_snapshot failed: %s", data)
+                return None
+            return data
+
+        snapshot_rows: dict[str, dict[str, Any]] = {}
+        for i in range(0, len(codes), 200):
+            batch = codes[i:i + 200]
+            df = await loop.run_in_executor(None, _fetch_snapshots, batch)
+            if df is None or len(df) == 0:
+                continue
+            for _, row in df.iterrows():
+                snapshot_rows[str(row["code"])] = {
+                    "bid_price": float(row.get("bid_price", 0) or 0),
+                    "ask_price": float(row.get("ask_price", 0) or 0),
+                    "last_price": float(row.get("last_price", 0) or 0),
+                    "volume": int(row.get("volume", 0) or 0),
+                    "open_interest": int(row.get("option_open_interest", 0) or 0),
+                }
+
+        # Merge quotes into chain — set 0 for any code we couldn't snapshot.
+        chain = chain.copy()
+        for col, default in (
+            ("bid_price", 0.0), ("ask_price", 0.0), ("last_price", 0.0),
+            ("volume", 0), ("open_interest", 0),
+        ):
+            chain[col] = chain["code"].map(
+                lambda c, _col=col, _def=default: snapshot_rows.get(str(c), {}).get(_col, _def)
+            )
+        return chain
 
     # ── Spread execution ──────────────────────────────────────────────────────
 

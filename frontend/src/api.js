@@ -95,8 +95,10 @@ export const api = {
     account:    ()             => get('/api/moomoo/account'),
     positions:  ()             => get('/api/moomoo/positions'),
     chain:      (sym, date)    => get(`/api/moomoo/chain?symbol=${sym}&date=${date}`),
-    execute:    (body)         => post('/api/moomoo/execute', body, 60000),
-    exit:       (body)         => post('/api/moomoo/exit', body, 60000),
+    // Legged execution: leg1 fill (≤30s) + leg2 fill (≤30s) + chain/risk
+    // overhead ≈ 65s worst case.  Give the client 90s before aborting.
+    execute:    (body)         => post('/api/moomoo/execute', body, 90000),
+    exit:       (body)         => post('/api/moomoo/exit', body, 90000),
     cancel:     (body)         => post('/api/moomoo/cancel', body),
   },
 };

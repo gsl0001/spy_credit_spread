@@ -303,7 +303,20 @@ export function MoomooView() {
   }, [loadPresets, refreshScannerStatus]);
 
   const doExecute = useCallback(async () => {
-    if (execBusy || !connected) return;
+    if (execBusy) return;
+    if (!connected) {
+      setExecMsg('✗ Connect to moomoo first');
+      return;
+    }
+    const qty = Number(ticketQty);
+    const debit = Number(ticketDebit);
+    const width = Number(ticketWidth);
+    const offset = Number(ticketOffset);
+    if (!Number.isFinite(qty) || qty <= 0) { setExecMsg('✗ Qty must be > 0'); return; }
+    if (!Number.isFinite(debit) || debit <= 0) { setExecMsg('✗ Spread cost target must be > 0'); return; }
+    if (!Number.isFinite(width) || width <= 0) { setExecMsg('✗ Strike width must be > 0'); return; }
+    if (!Number.isFinite(offset)) { setExecMsg('✗ Offset must be a number'); return; }
+
     setExecBusy(true);
     setExecMsg('Placing order…');
     setExecResult(null);
@@ -311,11 +324,11 @@ export function MoomooView() {
       const res = await api.moomoo.execute({
         host, port: Number(port), trade_password: tradePwd,
         direction: ticketDir,
-        contracts: Number(ticketQty),
-        strike_width: Number(ticketWidth),
+        contracts: qty,
+        strike_width: width,
         target_dte: 0,
-        spread_cost_target: Number(ticketDebit),
-        otm_offset: Number(ticketOffset),
+        spread_cost_target: debit,
+        otm_offset: offset,
       });
       if (res?.success) {
         setExecMsg(`✓ Placed · K_long ${res.K_long} / K_short ${res.K_short} · ${res.contracts}c`);
@@ -323,12 +336,29 @@ export function MoomooView() {
         setOrderLog(prev => [{ time: new Date().toLocaleTimeString(), ...res, status: 'filled' }, ...prev.slice(0, 19)]);
         await refreshPositions();
       } else {
-        setExecMsg(`✗ ${res?.reason || res?.error || 'order rejected'}`);
+        // Server returned a structured error (HTTP 200 + {error, reason})
+        const err = res?.error || 'order rejected';
+        const why = res?.reason ? ` — ${res.reason}` : '';
+        setExecMsg(`✗ ${err}${why}`);
       }
     } catch (e) {
-      setExecMsg(`✗ ${e.message}`);
+      // Distinguish fetch-level failures from server-side errors
+      const m = e?.message || '';
+      let pretty;
+      if (e?.name === 'TimeoutError' || /aborted|timed out|timeout/i.test(m)) {
+        pretty = 'Request timed out (>90s). Leg fills may still be in flight — check Positions.';
+      } else if (e?.name === 'TypeError' || /load failed|failed to fetch|network/i.test(m)) {
+        pretty = 'Network error — backend unreachable or restarted mid-request. Try again.';
+      } else if (/→ 5\d\d/.test(m)) {
+        pretty = `Server error (${m.match(/→ (\d+)/)?.[1] || '5xx'}). Check the FastAPI logs.`;
+      } else {
+        pretty = m || 'unknown error';
+      }
+      setExecMsg(`✗ ${pretty}`);
     } finally {
       setExecBusy(false);
+      // Always refresh positions so any partial fill is visible.
+      refreshPositions();
     }
   }, [execBusy, connected, host, port, tradePwd, ticketDir, ticketOffset, ticketWidth, ticketQty, ticketDebit, refreshPositions]);
 

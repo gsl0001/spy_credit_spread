@@ -2349,7 +2349,24 @@ async def moomoo_chain(symbol: str = "SPY", date: str = ""):
 
 @app.post("/api/moomoo/execute")
 async def moomoo_execute(req: MoomooOrderRequest):
-    return await _moomoo_execute_impl(req)
+    """Public moomoo order entry point.  Wraps the impl with a catch-all so
+    unexpected exceptions surface as JSON instead of HTTP 500 — the UI can't
+    show a useful error from a plain 'Internal Server Error' string body.
+    """
+    try:
+        return await _moomoo_execute_impl(req)
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        from core.journal import get_journal
+        tb = traceback.format_exc()
+        try:
+            get_journal().log_event(
+                "moomoo_execute_unhandled",
+                payload={"error": str(exc), "type": type(exc).__name__, "traceback": tb[:4000]},
+            )
+        except Exception:
+            pass
+        return {"error": "unhandled_exception", "reason": f"{type(exc).__name__}: {exc}"}
 
 
 @app.post("/api/moomoo/exit")
@@ -2439,8 +2456,7 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
         equity=acct.get("equity", 0.0),
         buying_power=acct.get("buying_power", 0.0),
         excess_liquidity=acct.get("excess_liquidity", 0.0),
-        unrealized_pnl=acct.get("unrealized_pnl", 0.0),
-        realized_pnl=acct.get("realized_pnl", 0.0),
+        daily_pnl=acct.get("realized_pnl", 0.0),
     )
 
     # Live price
@@ -2480,22 +2496,52 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
     if not spread:
         return {"error": "no_spread_found", "reason": "pick_bull_call_strikes returned None"}
 
-    # Position sizing
-    from core.risk import size_position
-    contracts = size_position(
-        snapshot=snapshot,
-        method=req.position_size_method,
-        spread_cost=spread["debit_per_contract"] * 100,
-        max_allocation_cap=req.max_allocation_cap,
-    ) if req.contracts == 0 else req.contracts
+    # Position sizing — debit-per-contract is in $ (mid-leg dollars * 100).
+    from core.risk import size_position, RiskContext, RiskLimits
+    debit_per_contract_dollars = float(spread["debit_per_contract"]) * 100.0
+    margin_per_contract_dollars = debit_per_contract_dollars  # debit spread: max loss = debit
+    if req.contracts > 0:
+        contracts = req.contracts
+    else:
+        contracts = size_position(
+            equity=snapshot.equity,
+            debit_per_contract=debit_per_contract_dollars,
+            margin_per_contract=margin_per_contract_dollars,
+            mode=req.position_size_method or "fixed",
+            fixed_contracts=1,
+            risk_percent=req.risk_percent,
+            max_allocation_cap=req.max_allocation_cap,
+            excess_liquidity=snapshot.excess_liquidity,
+        )
 
     if contracts <= 0:
         return {"error": "sizing_zero", "reason": "position sizer returned 0 contracts"}
 
-    # Pre-trade risk gate
-    risk_result = evaluate_pre_trade(snapshot, contracts, spread["debit_per_contract"] * 100)
-    if not risk_result.approved:
-        return {"error": "risk_gate_blocked", "reason": risk_result.reason}
+    # Pre-trade risk gate.  Disable market-hours check for moomoo simulate
+    # accounts (they accept orders 24/7) but keep all other gates active.
+    from core.calendar import load_event_calendar
+    is_simulate = getattr(broker, "_trd_env_int", 1) == 0
+    limits = RiskLimits.from_settings()
+    if is_simulate:
+        from dataclasses import replace
+        limits = replace(limits, require_market_open=False)
+    ctx = RiskContext(
+        account=snapshot,
+        open_positions=len(journal.list_open()),
+        today_realized_pnl=journal.today_realized_pnl(),
+        debit_per_contract=debit_per_contract_dollars,
+        margin_per_contract=margin_per_contract_dollars,
+        contracts=contracts,
+        target_dte=req.target_dte,
+        limits=limits,
+        events=load_event_calendar(),
+    )
+    decision = evaluate_pre_trade(ctx)
+    if not decision.allowed:
+        journal.log_event("risk_rejected", subject=req.symbol, payload={
+            "reason": decision.reason, "broker": "moomoo", **decision.details,
+        })
+        return {"error": "risk_gate_blocked", "reason": decision.reason, **decision.details}
 
     # Build spread request
     expiry_ymd = target_date.strftime("%Y%m%d")
@@ -2612,11 +2658,15 @@ def journal_reconciliation(date: Optional[str] = None):
 
 @app.post("/api/orders/cleanup-stale")
 def cleanup_stale_orders(max_age_hours: int = 24):
-    """Mark orders stuck in 'submitted' state older than ``max_age_hours`` as cancelled.
+    """Mark stale orders + their positions as cancelled.
 
-    Useful when IBKR/moomoo was disconnected during a fill, leaving the order
-    permanently in 'submitted' so the fill_watcher keeps polling a dead broker.
-    Returns the list of orders that were updated.
+    Cleans:
+    - orders stuck in submitted/submitting/pending older than max_age_hours → cancelled
+    - positions in 'pending' state with no live order older than max_age_hours → closed
+
+    Useful when IBKR/moomoo was disconnected mid-fill, leaving rows that block
+    fresh trades (fill_watcher keeps polling, max_concurrent_positions blocks
+    new entries).
     """
     from core.journal import get_journal
     from datetime import datetime, timezone, timedelta
@@ -2624,25 +2674,50 @@ def cleanup_stale_orders(max_age_hours: int = 24):
     j = get_journal()
     with j._lock:
         cur = j._conn.cursor()
+
+        # Stale orders
         cur.execute(
             "SELECT id, broker, broker_order_id, position_id, submitted_at FROM orders "
             "WHERE status IN ('submitted','submitting','pending') AND submitted_at < ?",
             (cutoff,),
         )
-        rows = [dict(r) for r in cur.fetchall()]
-        if rows:
+        stale_orders = [dict(r) for r in cur.fetchall()]
+
+        # Stale pending/closing positions
+        cur.execute(
+            "SELECT id, symbol, broker, state, entry_time FROM positions "
+            "WHERE state IN ('pending','closing') AND entry_time < ?",
+            (cutoff,),
+        )
+        stale_positions = [dict(r) for r in cur.fetchall()]
+
+        if stale_orders or stale_positions:
             j._conn.execute("BEGIN")
             try:
-                for r in rows:
+                for r in stale_orders:
                     j._conn.execute(
                         "UPDATE orders SET status='cancelled' WHERE id=?",
                         (r["id"],),
+                    )
+                for r in stale_positions:
+                    j._conn.execute(
+                        "UPDATE positions SET state='closed', "
+                        "exit_reason=COALESCE(exit_reason,'stale_cleanup'), "
+                        "exit_time=COALESCE(exit_time, ?) "
+                        "WHERE id=?",
+                        (datetime.now(timezone.utc).isoformat(timespec="seconds"), r["id"]),
                     )
                 j._conn.execute("COMMIT")
             except Exception:
                 j._conn.execute("ROLLBACK")
                 raise
-    return {"cleaned": len(rows), "orders": rows, "cutoff": cutoff}
+    return {
+        "cleaned_orders": len(stale_orders),
+        "cleaned_positions": len(stale_positions),
+        "orders": stale_orders,
+        "positions": stale_positions,
+        "cutoff": cutoff,
+    }
 
 
 def _pos_to_dict(p) -> dict:
