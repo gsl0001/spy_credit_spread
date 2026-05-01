@@ -194,35 +194,78 @@ def finalize_filled(
         except Exception:  # noqa: BLE001
             pass
     elif order.kind == "exit":
-        # Close out the position using real exit proceeds.
-        exit_total = avg_fill_price * 100.0 * filled_qty
-        
-        # I4: Sum all commissions for this position to get accurate Net realized_pnl.
-        # This includes the entry order(s) and the current exit order.
-        total_commission = commission
+        # Aggregate ALL exit-order fills for this position before closing.
+        # Multi-leg spread exits (moomoo) fire one order per leg — closing
+        # on the first fill would lose the second leg's proceeds and
+        # produce a wildly wrong realized_pnl.
         try:
-            prev_orders = journal.list_orders_for_position(position.id)
-            for po in prev_orders:
-                if po.id != order.id:
-                    total_commission += (po.commission or 0.0)
+            all_orders = journal.list_orders_for_position(position.id)
         except Exception:  # noqa: BLE001
-            pass
+            all_orders = [order]
 
-        realized = exit_total - abs(position.entry_cost) - total_commission
+        exit_orders = [o for o in all_orders if o.kind == "exit"]
+        # Include the order we just filled (in case the journal read above
+        # raced and missed our own update).
+        if not any(o.id == order.id for o in exit_orders):
+            exit_orders.append(order)
+
+        # Are all exit orders for this position now in a terminal state?
+        unfinished = [
+            o for o in exit_orders
+            if (o.status or "") not in ("filled", "cancelled")
+        ]
+        if unfinished:
+            # Wait for the other leg(s).  Just record the fill row above
+            # and emit a leg-fill event so the user sees progress.
+            journal.log_event("exit_leg_filled", subject=position.id, payload={
+                "order_id": order.id, "broker_order_id": order.broker_order_id,
+                "avg_fill_price": avg_fill_price, "qty": filled_qty,
+                "remaining_legs": [o.id for o in unfinished],
+            })
+            return
+
+        # All exit orders done — aggregate net cash and close.
+        # For long legs: SELL fill → +cash * qty * 100
+        # For short legs: BUY-to-close fill → -cash * qty * 100
+        # Cancelled orders contribute zero cash.
+        exit_total_net = 0.0
+        for o in exit_orders:
+            if (o.status or "") != "filled":
+                continue
+            fill_price = float(o.fill_price or 0.0)
+            qty = 0
+            try:
+                fills = journal.list_fills(o.id)
+                qty = sum(f.qty for f in fills) or 0
+            except Exception:  # noqa: BLE001
+                pass
+            if qty == 0:
+                qty = filled_qty if o.id == order.id else 0
+            cash = fill_price * 100.0 * qty
+            sign = +1 if (o.side or "").upper() == "SELL" else -1
+            exit_total_net += sign * cash
+
+        # Sum every commission paid on this position (entry + exits).
+        total_commission = sum(o.commission or 0.0 for o in all_orders) + (
+            commission if not any(o.id == order.id and o.commission for o in all_orders) else 0.0
+        )
+
+        realized = exit_total_net - abs(position.entry_cost) - total_commission
         reason = "exit_filled"
         if position.state == "closing" and position.exit_reason:
             reason = position.exit_reason
         journal.close_position(
             position.id,
-            exit_cost=exit_total,
+            exit_cost=exit_total_net,
             reason=reason,
             realized_pnl=realized,
             time=t,
         )
         journal.log_event("exit_filled", subject=position.id, payload={
-            "avg_fill_price": avg_fill_price, "qty": filled_qty,
-            "realized_pnl": realized, "commission": commission,
+            "exit_total_net": exit_total_net,
+            "realized_pnl": realized,
             "total_commission": total_commission,
+            "leg_count": len(exit_orders),
         })
         # Telegram: ping the operator with the closing P&L. Best-effort,
         # never let a notify failure break the journal write above.

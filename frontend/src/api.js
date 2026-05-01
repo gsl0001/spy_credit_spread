@@ -100,6 +100,7 @@ export const api = {
     execute:    (body)         => post('/api/moomoo/execute', body, 90000),
     exit:       (body)         => post('/api/moomoo/exit', body, 90000),
     cancel:     (body)         => post('/api/moomoo/cancel', body),
+    flattenAll: ()             => post('/api/moomoo/flatten_all', {}, 90000),
   },
 };
 

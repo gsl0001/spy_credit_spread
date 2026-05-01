@@ -2095,6 +2095,10 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
         "monitor_seconds_since_tick": None,
         "monitor_stalled": False,
         "ibkr_dropped": False,
+        "moomoo_connected": False,
+        "moomoo_last_healthy_iso": None,
+        "moomoo_seconds_since_healthy": None,
+        "moomoo_stalled": False,
         "alerts": [],
     }
 
@@ -2173,6 +2177,33 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
             "code": "monitor_never_ticked",
             "message": "Monitor registered but has not ticked yet",
         })
+
+    # Moomoo OpenD health.  Surface connection state + staleness so
+    # heartbeat consumers (UI, /api/health watchers) can alert on a
+    # silently-stalled OpenD connection.
+    try:
+        if _moomoo_trader is not None and _moomoo_trader.is_alive():
+            result["moomoo_connected"] = True
+            last_iso = getattr(_moomoo_trader, "last_healthy_iso", None)
+            result["moomoo_last_healthy_iso"] = last_iso
+            if last_iso:
+                last_dt = datetime.fromisoformat(last_iso)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                delta = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                result["moomoo_seconds_since_healthy"] = round(delta, 1)
+                # 5 minutes without a successful broker call → stale.
+                # (account/positions/snapshot polling at 15s should keep
+                # this fresh whenever the scanner or monitor is active.)
+                if delta > 300:
+                    result["moomoo_stalled"] = True
+                    result["alerts"].append({
+                        "level": "warning" if delta < 900 else "critical",
+                        "code": "moomoo_stalled",
+                        "message": f"OpenD silent for {int(delta)}s — connection may be dead",
+                    })
+    except Exception:  # noqa: BLE001
+        pass
 
     # IBKR socket
     if not HAS_IBSYNC:
@@ -2372,10 +2403,12 @@ async def moomoo_execute(req: MoomooOrderRequest):
 @app.post("/api/moomoo/exit")
 async def moomoo_exit(payload: dict):
     position_id = (payload or {}).get("position_id")
+    reason = (payload or {}).get("reason") or "manual_exit"
     if not position_id:
         return {"error": "missing_position_id"}
-    from core.journal import get_journal
+    from core.journal import get_journal, Order
     from core.broker import get_broker, BrokerNotConnected
+    import uuid
     journal = get_journal()
     pos = journal.get_position(position_id)
     if not pos:
@@ -2388,19 +2421,155 @@ async def moomoo_exit(payload: dict):
         broker = get_broker("moomoo")
     except BrokerNotConnected as exc:
         return {"error": f"moomoo not connected: {exc}"}
+
+    # Capture spread mid BEFORE close so we have a P&L reference if leg fills
+    # don't reconcile cleanly (best-effort; None means no quote available).
+    pre_close_mid = None
+    try:
+        pre_close_mid = await broker.get_spread_mid(list(pos.legs))
+    except Exception:
+        pass
+
     try:
         result = await broker.close_position(position_id, list(pos.legs))
     except Exception as exc:
         journal.log_event("exit_failed", subject=position_id, payload={
-            "error": str(exc), "broker": "moomoo",
+            "error": str(exc), "broker": "moomoo", "reason": reason,
         })
         return {"error": f"close_position failed: {exc}"}
-    # Mark journal closed only after broker accepted the close orders.
-    journal.close_position(position_id, exit_cost=0.0, exit_reason="manual_exit")
+
+    # Record an exit order per leg so fill_watcher can reconcile each fill
+    # individually.  Mark position state='closing' — fill_watcher will close
+    # it (with real realized_pnl) once both leg fills are confirmed.
+    close_orders = result.get("close_orders", []) if isinstance(result, dict) else []
+    submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    recorded_order_ids = []
+    for entry in close_orders:
+        leg = entry.get("leg") if isinstance(entry, dict) else None
+        broker_order_id = entry.get("order_id") if isinstance(entry, dict) else None
+        side = "SELL" if (leg or {}).get("side") == "long" else "BUY"
+        order_id = str(uuid.uuid4())
+        try:
+            journal.record_order(Order(
+                id=order_id,
+                position_id=position_id,
+                broker="moomoo",
+                broker_order_id=str(broker_order_id) if broker_order_id is not None else "",
+                side=side,
+                limit_price=None,
+                status="submitted",
+                submitted_at=submitted_at,
+                kind="exit",
+                idempotency_key=f"exit:{position_id}:{reason}:{order_id[:8]}",
+            ))
+            recorded_order_ids.append(order_id)
+        except Exception as exc:  # noqa: BLE001
+            journal.log_event("exit_order_record_failed", subject=position_id,
+                              payload={"error": str(exc), "broker_order_id": broker_order_id})
+
+    journal.update_position(position_id, state="closing", exit_reason=reason)
     journal.log_event("exit_submitted", subject=position_id, payload={
-        "broker": "moomoo", "result": result,
+        "broker": "moomoo", "reason": reason,
+        "pre_close_spread_mid": pre_close_mid,
+        "leg_orders": recorded_order_ids,
+        "result": result,
     })
-    return result
+    return {**result, "pre_close_spread_mid": pre_close_mid, "exit_orders": recorded_order_ids}
+
+
+@app.post("/api/moomoo/flatten_all")
+async def moomoo_flatten_all():
+    """Kill switch — market-close every open moomoo position.
+
+    Mirrors /api/ibkr/flatten_all: iterates the journal's open moomoo
+    positions and fires broker.close_position on each.  Best-effort —
+    individual failures are returned in the results list but don't abort
+    the loop.  Telegram alert fires regardless of partial failures so
+    the operator gets a notification.
+    """
+    from core.broker import get_broker, BrokerNotConnected
+    from core.journal import get_journal, Order
+    import uuid
+
+    journal = get_journal()
+    try:
+        broker = get_broker("moomoo")
+    except BrokerNotConnected as exc:
+        return {"error": "broker_not_connected", "reason": str(exc)}
+
+    open_positions = [p for p in journal.list_open() if p.broker == "moomoo"]
+    if not open_positions:
+        return {"closed": 0, "msg": "No open moomoo positions."}
+
+    submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    results = []
+    for pos in open_positions:
+        if pos.state not in ("open", "closing"):
+            continue
+        try:
+            legs_list = [dict(leg) for leg in pos.legs]
+            # Best-effort pre-close mid for the audit trail.
+            try:
+                pre_mid = await broker.get_spread_mid(legs_list)
+            except Exception:
+                pre_mid = None
+            close_result = await broker.close_position(pos.id, legs_list)
+            recorded = []
+            for entry in (close_result.get("close_orders") or []):
+                leg = entry.get("leg") if isinstance(entry, dict) else None
+                broker_order_id = entry.get("order_id") if isinstance(entry, dict) else None
+                side = "SELL" if (leg or {}).get("side") == "long" else "BUY"
+                order_id = str(uuid.uuid4())
+                journal.record_order(Order(
+                    id=order_id,
+                    position_id=pos.id,
+                    broker="moomoo",
+                    broker_order_id=str(broker_order_id) if broker_order_id is not None else "",
+                    side=side,
+                    limit_price=None,
+                    status="submitted",
+                    submitted_at=submitted_at,
+                    kind="exit",
+                    idempotency_key=f"flatten:{pos.id}:{order_id[:8]}",
+                ))
+                recorded.append(order_id)
+            journal.update_position(pos.id, state="closing", exit_reason="manual_flatten")
+            journal.log_event("exit_submitted", subject=pos.id, payload={
+                "broker": "moomoo", "reason": "manual_flatten",
+                "pre_close_spread_mid": pre_mid, "leg_orders": recorded,
+            })
+            results.append({
+                "position_id": pos.id, "ok": True,
+                "leg_orders": recorded, "pre_close_mid": pre_mid,
+            })
+        except Exception as exc:  # noqa: BLE001
+            journal.log_event("exit_failed", subject=pos.id, payload={
+                "error": str(exc), "broker": "moomoo", "reason": "manual_flatten",
+            })
+            results.append({"position_id": pos.id, "ok": False, "error": str(exc)})
+
+    journal.log_event("flatten_all", payload={
+        "broker": "moomoo", "count": len(results),
+    })
+    try:
+        from core.telegram_bot import notify_alert
+        notify_alert("critical", f"MOOMOO FLATTEN ALL — {len(results)} position(s) closing")
+    except Exception:  # noqa: BLE001
+        pass
+    return {"closed": len(results), "results": results}
+
+
+@app.post("/api/moomoo/reconcile")
+async def moomoo_reconcile():
+    """Manually trigger the orphan-leg reconciler.
+
+    Compares moomoo broker positions against journal open positions.
+    Returns counts + any orphans (broker has, journal doesn't) and
+    phantoms (journal has, broker doesn't).  Phantoms older than 60s
+    are auto-closed with reason='reconcile_phantom'.
+    """
+    from core.moomoo_reconciler import reconcile_once
+    return await reconcile_once()
 
 
 @app.post("/api/moomoo/cancel")
@@ -2495,6 +2664,40 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
     )
     if not spread:
         return {"error": "no_spread_found", "reason": "pick_bull_call_strikes returned None"}
+
+    # Pre-trade chain quality check — reject degenerate quotes BEFORE order
+    # submission.  Catches: zero bid/ask, crossed markets, blown-out spreads,
+    # near-zero debit, and (where data is available) low volume/OI.
+    from core.chain import validate_spread_quality
+    quality_lookup = {
+        float(row["strike_price"]): {
+            "volume": int(row.get("volume", 0) or 0),
+            "open_interest": int(row.get("open_interest", 0) or 0),
+        }
+        for _, row in chain_sub.iterrows()
+    }
+    quality_ok, quality_reason = validate_spread_quality(
+        spread,
+        max_bid_ask_pct=0.10,         # 10% bid/ask spread tolerance
+        min_mid=0.05,                  # debit must be ≥ $0.05 per contract
+        quality_lookup=quality_lookup,
+        min_volume=10,                 # at least 10 contracts traded today
+        min_open_interest=50,          # at least 50 contracts of OI
+    )
+    if not quality_ok:
+        journal.log_event("chain_quality_rejected", subject=req.symbol, payload={
+            "reason": quality_reason, "broker": "moomoo",
+            "K_long": spread.get("K_long"), "K_short": spread.get("K_short"),
+            "long_bid": spread.get("long_bid"), "long_ask": spread.get("long_ask"),
+            "short_bid": spread.get("short_bid"), "short_ask": spread.get("short_ask"),
+        })
+        return {
+            "error": "chain_quality_rejected",
+            "reason": quality_reason,
+            "K_long": spread.get("K_long"), "K_short": spread.get("K_short"),
+            "long_bid": spread.get("long_bid"), "long_ask": spread.get("long_ask"),
+            "short_bid": spread.get("short_bid"), "short_ask": spread.get("short_ask"),
+        }
 
     # Position sizing — debit-per-contract is in $ (mid-leg dollars * 100).
     from core.risk import size_position, RiskContext, RiskLimits
@@ -2823,6 +3026,40 @@ def _run_monitor_tick():
         logging.getLogger(__name__).warning("monitor tick failed: %s", e)
 
 
+def _run_moomoo_reconcile():
+    """Sync wrapper that drives the moomoo orphan-leg reconciler.
+
+    Detects mismatches between OpenD's position_list_query and our journal:
+    - Orphan broker legs (broker has, journal doesn't) → CRITICAL alert
+    - Phantom journal positions (journal has, broker doesn't) → auto-close
+    """
+    import asyncio as _aio
+    from core.leader import is_leader
+    if not is_leader():
+        return
+    # No moomoo work? skip.
+    try:
+        from core.broker import _registry
+        if "moomoo" not in _registry:
+            return
+    except Exception:  # noqa: BLE001
+        return
+
+    async def _go():
+        from core.moomoo_reconciler import reconcile_once
+        return await reconcile_once()
+
+    loop = _MAIN_LOOP
+    if loop is None or not loop.is_running():
+        return
+    try:
+        future = _aio.run_coroutine_threadsafe(_go(), loop)
+        future.result(timeout=30)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("moomoo reconcile failed: %s", e)
+
+
 def _run_fill_reconcile():
     """Sync wrapper that drives the async fill reconciler from APScheduler."""
     import asyncio as _aio
@@ -2898,13 +3135,18 @@ def start_monitor(interval: int = 15):
 
     # Remove existing monitor jobs if re-registering
     for job in scheduler.get_jobs():
-        if job.id in ("live_monitor", "fill_watcher"):
+        if job.id in ("live_monitor", "fill_watcher", "moomoo_reconcile"):
             job.remove()
 
     scheduler.add_job(_run_monitor_tick, "interval", seconds=secs,
                       id="live_monitor", replace_existing=True)
     scheduler.add_job(_run_fill_reconcile, "interval", seconds=secs,
                       id="fill_watcher", replace_existing=True)
+    # Moomoo orphan-leg reconciler — runs at 4× monitor interval (e.g. every
+    # 60s if monitor is 15s) since it's read-only and doesn't need to be
+    # synchronous with fill polling.
+    scheduler.add_job(_run_moomoo_reconcile, "interval", seconds=max(secs * 4, 60),
+                      id="moomoo_reconcile", replace_existing=True)
 
     # I2: daily digest at 16:05 ET (after market close) — best-effort, no-op
     # when NOTIFY_WEBHOOK_URL is not configured.

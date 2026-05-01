@@ -373,28 +373,42 @@ async def _submit_exit_order_moomoo(
     reason: str,
     journal: Journal,
 ) -> dict[str, Any]:
-    """Fire a moomoo close_position and journal the exit. Never raises."""
+    """Fire moomoo close_position and journal one exit Order per leg.
+
+    Records one Order row per leg so the fill_watcher can reconcile each
+    leg individually.  Sets position state='closing'; the multi-leg
+    exit reconciler will mark it 'closed' with realized_pnl once all
+    legs fill.
+    """
     try:
         legs_list = [dict(leg) for leg in pos.legs]
         result = await broker.close_position(pos.id, legs_list)
-        order_id = str(uuid.uuid4())
-        journal.record_order(Order(
-            id=order_id,
-            position_id=pos.id,
-            broker="moomoo",
-            broker_order_id=result.get("close_orders", [{}])[0].get("order_id"),
-            side="SELL",
-            limit_price=mid,
-            status="submitted",
-            submitted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            kind="exit",
-            idempotency_key=f"exit:{pos.id}:{reason}",
-        ))
-        journal.update_position(pos.id, state="closing")
+        submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        recorded = []
+        for entry in (result.get("close_orders") or []):
+            leg = entry.get("leg") if isinstance(entry, dict) else None
+            broker_order_id = entry.get("order_id") if isinstance(entry, dict) else None
+            side = "SELL" if (leg or {}).get("side") == "long" else "BUY"
+            order_id = str(uuid.uuid4())
+            journal.record_order(Order(
+                id=order_id,
+                position_id=pos.id,
+                broker="moomoo",
+                broker_order_id=str(broker_order_id) if broker_order_id is not None else "",
+                side=side,
+                limit_price=mid,
+                status="submitted",
+                submitted_at=submitted_at,
+                kind="exit",
+                idempotency_key=f"exit:{pos.id}:{reason}:{order_id[:8]}",
+            ))
+            recorded.append(order_id)
+        journal.update_position(pos.id, state="closing", exit_reason=reason)
         journal.log_event("exit_submitted", subject=pos.id, payload={
             "reason": reason, "mid": mid, "broker": "moomoo",
+            "leg_orders": recorded,
         })
-        return {"ok": True, "order_id": order_id, "reason": reason, "mid": mid}
+        return {"ok": True, "leg_orders": recorded, "reason": reason, "mid": mid}
     except Exception as e:  # noqa: BLE001
         journal.log_event("exit_failed", subject=pos.id, payload={
             "reason": reason, "error": f"{type(e).__name__}: {e}", "broker": "moomoo",

@@ -269,14 +269,17 @@ def _cmd_help(_args):
         "*SPY Spread Bot — commands*",
         "",
         "_Read-only:_",
-        "/status — server + IBKR + market state",
+        "/status — server + IBKR + moomoo + market state",
+        "/moomoo — moomoo broker connection + equity",
         "/positions — open positions and live P&L",
         "/pnl — today's realized P&L + recent history",
         "/presets — list saved scanner presets",
         "/scanner — current scanner state",
         "",
         "_Control:_",
-        "/flatten confirm — close every open position now",
+        "/flatten confirm — close every open position (all brokers)",
+        "/flatten ibkr confirm — close only IBKR positions",
+        "/flatten moomoo confirm — close only moomoo positions",
         "/preset\\_start <name> — start a preset scanner",
         "/preset\\_stop — stop the active preset scanner",
         "",
@@ -293,7 +296,9 @@ def _cmd_status(_args):
         from core.settings import SETTINGS
         from core.calendar import is_market_open
         j = get_journal()
-        open_count = len(j.list_open())
+        all_open = j.list_open()
+        open_ibkr = sum(1 for p in all_open if p.broker == "ibkr")
+        open_moomoo = sum(1 for p in all_open if p.broker == "moomoo")
         today_pnl = j.today_realized_pnl()
         today_trades = j.today_trade_count()
 
@@ -302,6 +307,18 @@ def _cmd_status(_args):
         trader = _ib_instances.get(key)
         ib_state = "live" if (trader and trader.is_alive()) else "off"
 
+        # Moomoo connection from registry
+        try:
+            from core.broker import _registry
+            moomoo = _registry.get("moomoo")
+            if moomoo and moomoo.is_alive():
+                env = "REAL" if getattr(moomoo, "_trd_env_int", 0) == 1 else "SIM"
+                moomoo_state = f"live ({env})"
+            else:
+                moomoo_state = "off"
+        except Exception:  # noqa: BLE001
+            moomoo_state = "off"
+
         is_open, why = is_market_open()
         mkt = "OPEN" if is_open else f"CLOSED ({why})"
     except Exception as e:  # noqa: BLE001
@@ -309,9 +326,10 @@ def _cmd_status(_args):
 
     return (
         "*Status*\n"
-        f"IBKR: `{ib_state}`\n"
-        f"Market: `{mkt}`\n"
-        f"Open positions: *{open_count}*\n"
+        f"IBKR:    `{ib_state}`\n"
+        f"Moomoo:  `{moomoo_state}`\n"
+        f"Market:  `{mkt}`\n"
+        f"Open:    *{open_ibkr}* IBKR · *{open_moomoo}* moomoo\n"
         f"Today P&L: *{_fmt_usd(today_pnl, sign=True)}*  ({today_trades} trades)"
     )
 
@@ -406,45 +424,118 @@ def _cmd_scanner(_args):
 
 @register_command("flatten")
 def _cmd_flatten(args):
-    """Two-step confirmation: ``/flatten`` shows count, ``/flatten confirm`` fires."""
+    """Multi-broker flatten with two-step confirmation.
+
+    Usage:
+        /flatten                  — show position counts (no action)
+        /flatten confirm          — flatten ALL brokers
+        /flatten ibkr confirm     — flatten only IBKR
+        /flatten moomoo confirm   — flatten only moomoo
+    """
+    args = [a.lower() for a in (args or [])]
+    if "ibkr" in args:
+        broker_filter = "ibkr"
+        args = [a for a in args if a != "ibkr"]
+    elif "moomoo" in args:
+        broker_filter = "moomoo"
+        args = [a for a in args if a != "moomoo"]
+    else:
+        broker_filter = None  # all
+
     try:
         from core.journal import get_journal
         positions = get_journal().list_open()
+        if broker_filter:
+            positions = [p for p in positions if p.broker == broker_filter]
     except Exception as e:  # noqa: BLE001
         return f"⚠️ flatten query failed: `{e}`"
 
     if not positions:
-        return "_No open positions to flatten._"
+        scope = broker_filter or "any broker"
+        return f"_No open positions on {scope} to flatten._"
 
-    if not args or args[0].lower() != "confirm":
+    if not args or args[0] != "confirm":
+        scope = f"*{broker_filter.upper()}*" if broker_filter else "*ALL brokers*"
+        cmd_suffix = f"{broker_filter} confirm" if broker_filter else "confirm"
         return (
-            f"⚠️ *Confirm flatten?*\n"
-            f"This will submit market-aggressive close orders for "
-            f"*{len(positions)}* open position(s).\n\n"
-            f"Send `/flatten confirm` to proceed."
+            f"⚠️ *Confirm flatten on {scope}?*\n"
+            f"This will market-close *{len(positions)}* position(s).\n\n"
+            f"Send `/flatten {cmd_suffix}` to proceed."
         )
 
-    # Confirmed — schedule the close on the main loop.
+    # Confirmed — schedule per broker on the main loop.
     try:
         import asyncio
         import main
         loop = main._MAIN_LOOP
         if loop is None or not loop.is_running():
             return "⚠️ Server not ready — cannot flatten right now."
-        from core.settings import SETTINGS
-        ib_creds = SETTINGS.ibkr.as_dict()
-        future = asyncio.run_coroutine_threadsafe(
-            main.ibkr_flatten_all(main.IBKRConnectRequest(**ib_creds)),
-            loop,
-        )
-        result = future.result(timeout=60)
+
+        results = []
+        if broker_filter in (None, "ibkr"):
+            from core.settings import SETTINGS
+            ib_creds = SETTINGS.ibkr.as_dict()
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    main.ibkr_flatten_all(main.IBKRConnectRequest(**ib_creds)), loop,
+                )
+                r = fut.result(timeout=60)
+                results.append(("IBKR", r))
+            except Exception as e:  # noqa: BLE001
+                results.append(("IBKR", {"error": str(e)}))
+        if broker_filter in (None, "moomoo"):
+            try:
+                fut = asyncio.run_coroutine_threadsafe(main.moomoo_flatten_all(), loop)
+                r = fut.result(timeout=60)
+                results.append(("MOOMOO", r))
+            except Exception as e:  # noqa: BLE001
+                results.append(("MOOMOO", {"error": str(e)}))
     except Exception as e:  # noqa: BLE001
         return f"⚠️ flatten failed: `{e}`"
 
-    if result.get("error"):
-        return f"⚠️ flatten error: `{result['error']}`"
-    closed = result.get("closed", 0)
-    return f"✅ *Flatten submitted* — {closed} position(s) closing."
+    lines = ["✅ *Flatten submitted*"]
+    for name, r in results:
+        if r.get("error"):
+            lines.append(f"  {name}: ⚠️ `{r['error']}`")
+        else:
+            lines.append(f"  {name}: {r.get('closed', 0)} closing")
+    return "\n".join(lines)
+
+
+@register_command("moomoo")
+def _cmd_moomoo(_args):
+    """Moomoo broker status: connection, account equity, last healthy."""
+    try:
+        from core.broker import _registry
+        moomoo = _registry.get("moomoo")
+        if not moomoo or not moomoo.is_alive():
+            return "*Moomoo*: `not connected`"
+
+        env = "REAL" if getattr(moomoo, "_trd_env_int", 0) == 1 else "SIMULATE"
+        last_iso = getattr(moomoo, "last_healthy_iso", None) or "—"
+        acc_id = getattr(moomoo, "_acc_id", None) or "—"
+
+        # Best-effort live account snapshot
+        equity_str = "—"
+        try:
+            import asyncio, main
+            loop = main._MAIN_LOOP
+            if loop is not None and loop.is_running():
+                fut = asyncio.run_coroutine_threadsafe(moomoo.get_account_summary(), loop)
+                acct = fut.result(timeout=5)
+                equity_str = _fmt_usd(acct.get("equity", 0))
+        except Exception:  # noqa: BLE001
+            pass
+
+        return (
+            "*Moomoo*\n"
+            f"Env:    `{env}`\n"
+            f"Acct:   `{acc_id}`\n"
+            f"Equity: *{equity_str}*\n"
+            f"Last healthy: `{last_iso}`"
+        )
+    except Exception as e:  # noqa: BLE001
+        return f"⚠️ moomoo query failed: `{e}`"
 
 
 @register_command("preset_start")

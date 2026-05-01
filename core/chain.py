@@ -173,6 +173,73 @@ def pick_bull_call_strikes(
     return best
 
 
+def validate_spread_quality(
+    spread: dict,
+    *,
+    max_bid_ask_pct: float = 0.10,    # 10% — generous default; production use 0.05
+    min_mid: float = 0.05,             # reject spreads worth < 5¢ per contract
+    quality_lookup: Optional[dict] = None,  # {strike: {"volume": int, "open_interest": int}}
+    min_volume: Optional[int] = None,
+    min_open_interest: Optional[int] = None,
+) -> tuple[bool, str]:
+    """Return (is_acceptable, reason) for a picked spread.
+
+    Checks performed:
+      1. Both legs have positive bid AND ask (sanity)
+      2. Per-leg bid/ask spread <= max_bid_ask_pct of mid
+      3. Spread mid >= min_mid (non-trivial value)
+      4. Per-leg volume >= min_volume (if quality_lookup provided)
+      5. Per-leg open_interest >= min_open_interest (if quality_lookup provided)
+
+    Returns (True, "ok") on pass, (False, "<reason>") on first failure.
+    Designed to short-circuit before order submission so degenerate
+    quotes (zero bids, blown-out spreads, no volume) never reach the
+    broker.
+    """
+    long_bid = float(spread.get("long_bid", 0) or 0)
+    long_ask = float(spread.get("long_ask", 0) or 0)
+    short_bid = float(spread.get("short_bid", 0) or 0)
+    short_ask = float(spread.get("short_ask", 0) or 0)
+    if long_bid <= 0 or long_ask <= 0:
+        return False, "long_leg_no_quote"
+    if short_bid <= 0 or short_ask <= 0:
+        return False, "short_leg_no_quote"
+    if long_ask < long_bid:
+        return False, "long_leg_crossed_quote"
+    if short_ask < short_bid:
+        return False, "short_leg_crossed_quote"
+
+    long_mid = (long_bid + long_ask) / 2.0
+    short_mid = (short_bid + short_ask) / 2.0
+    if long_mid > 0 and (long_ask - long_bid) / long_mid > max_bid_ask_pct:
+        return False, f"long_leg_spread_wide_{(long_ask - long_bid) / long_mid * 100:.1f}pct"
+    if short_mid > 0 and (short_ask - short_bid) / short_mid > max_bid_ask_pct:
+        return False, f"short_leg_spread_wide_{(short_ask - short_bid) / short_mid * 100:.1f}pct"
+
+    debit = float(spread.get("debit_per_contract", 0) or 0)
+    if debit < min_mid:
+        return False, f"spread_too_thin_{debit:.3f}"
+
+    if quality_lookup:
+        for strike, label in (
+            (spread.get("K_long"), "long"),
+            (spread.get("K_short"), "short"),
+        ):
+            if strike is None:
+                continue
+            q = quality_lookup.get(float(strike)) or quality_lookup.get(strike) or {}
+            if min_volume is not None:
+                vol = int(q.get("volume", 0) or 0)
+                if vol < min_volume:
+                    return False, f"{label}_leg_volume_{vol}_below_{min_volume}"
+            if min_open_interest is not None:
+                oi = int(q.get("open_interest", 0) or 0)
+                if oi < min_open_interest:
+                    return False, f"{label}_leg_oi_{oi}_below_{min_open_interest}"
+
+    return True, "ok"
+
+
 # ── Live IBKR-backed resolver ──────────────────────────────────────────────
 
 async def resolve_bull_call_spread(

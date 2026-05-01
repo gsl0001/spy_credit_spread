@@ -88,6 +88,19 @@ class MoomooTrader:
         self._connected = False
         # resolved after import — set in connect()
         self._ft_trd_env = None
+        # Health tracking: last successful broker call, used by /heartbeat
+        # and the OpenD-staleness alert.  Updated on every successful API
+        # round-trip.
+        self._last_healthy_iso: str | None = None
+
+    def _mark_healthy(self) -> None:
+        """Stamp now() as the last successful OpenD call timestamp."""
+        from datetime import datetime, timezone
+        self._last_healthy_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    @property
+    def last_healthy_iso(self) -> str | None:
+        return self._last_healthy_iso
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
 
@@ -257,6 +270,7 @@ class MoomooTrader:
         self._trd_ctx = trd_ctx
         self._acc_id = acc_id
         self._connected = True
+        self._mark_healthy()
         logger.info("MoomooTrader connected. acc_id=%s env=%s", acc_id, env_label)
         return {
             "connected": True,
@@ -330,6 +344,7 @@ class MoomooTrader:
             return data.iloc[0].to_dict()
 
         raw = await loop.run_in_executor(None, _fetch)
+        self._mark_healthy()
         return self._map_account(raw)
 
     # ── Positions ─────────────────────────────────────────────────────────────
@@ -347,7 +362,9 @@ class MoomooTrader:
                 raise RuntimeError(f"position_list_query: {data}")
             return data.to_dict(orient="records")
 
-        return await loop.run_in_executor(None, _fetch)
+        result = await loop.run_in_executor(None, _fetch)
+        self._mark_healthy()
+        return result
 
     # ── Live price ────────────────────────────────────────────────────────────
 
@@ -368,7 +385,9 @@ class MoomooTrader:
                 "volume": int(row.get("volume", 0)),
             }
 
-        return await loop.run_in_executor(None, _fetch)
+        result = await loop.run_in_executor(None, _fetch)
+        self._mark_healthy()
+        return result
 
     # ── Option chain ──────────────────────────────────────────────────────────
 
@@ -398,6 +417,7 @@ class MoomooTrader:
             return data
 
         chain = await loop.run_in_executor(None, _fetch_chain)
+        self._mark_healthy()
         if chain is None or len(chain) == 0:
             return chain
 

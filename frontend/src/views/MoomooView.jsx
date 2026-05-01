@@ -14,16 +14,22 @@ const C = {
   btn:        { background: '#f97316', color: '#000', border: 'none' },
 };
 
-const OCard = ({ title, icon, subtitle, children, flush }) => (
+const OCard = ({ title, icon, subtitle, children, flush, right }) => (
   <div style={{
     background: C.cardBg, border: `1px solid ${C.cardBorder}`,
     borderRadius: 10, overflow: 'hidden',
     marginBottom: flush ? 0 : undefined,
   }}>
     {title && (
-      <div style={{ padding: '12px 16px', borderBottom: `1px solid ${C.cardBorder}`, display: 'flex', flexDirection: 'column', gap: 2 }}>
-        <span style={{ fontWeight: 600, fontSize: 13 }}>{title}</span>
-        {subtitle && <span style={{ fontSize: 11, color: 'var(--text-3)' }}>{subtitle}</span>}
+      <div style={{
+        padding: '12px 16px', borderBottom: `1px solid ${C.cardBorder}`,
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+      }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+          <span style={{ fontWeight: 600, fontSize: 13 }}>{title}</span>
+          {subtitle && <span style={{ fontSize: 11, color: 'var(--text-3)' }}>{subtitle}</span>}
+        </div>
+        {right && <div>{right}</div>}
       </div>
     )}
     <div style={flush ? undefined : { padding: '14px 16px' }}>{children}</div>
@@ -166,6 +172,31 @@ export function MoomooView() {
     setAccount(null);
     setConnMsg('Disconnected');
   }, []);
+
+  const doFlattenAll = useCallback(async () => {
+    if (!connected) {
+      setExecMsg('✗ Connect to moomoo first');
+      return;
+    }
+    if (!window.confirm('FLATTEN ALL moomoo positions? This will market-close every open spread.')) return;
+    setExecBusy(true);
+    setExecMsg('Flattening all moomoo positions…');
+    try {
+      const res = await api.moomoo.flattenAll();
+      if (res?.error) {
+        setExecMsg(`✗ ${res.error}`);
+      } else {
+        const ok = (res?.results || []).filter(r => r.ok).length;
+        const total = res?.closed ?? 0;
+        setExecMsg(`✓ ${ok}/${total} position(s) flattening`);
+      }
+      await refreshPositions();
+    } catch (e) {
+      setExecMsg(`✗ ${e.message}`);
+    } finally {
+      setExecBusy(false);
+    }
+  }, [connected, refreshPositions]);
 
   const doProbe = useCallback(async () => {
     if (probeBusy) return;
@@ -673,6 +704,11 @@ export function MoomooView() {
             title="Positions"
             subtitle={`moomoo · ${positions.length} open spread${positions.length === 1 ? '' : 's'}`}
             flush
+            right={positions.length > 0 ? (
+              <OBtn small danger disabled={!connected || execBusy} onClick={doFlattenAll}>
+                Flatten All
+              </OBtn>
+            ) : null}
           >
             <table className="tbl">
               <thead>
