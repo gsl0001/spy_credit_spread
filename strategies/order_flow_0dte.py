@@ -341,11 +341,21 @@ class ZeroDTEOrderFlowBot:
     async def _execute_signal(self, signal: SignalEvent):
         """Place a market order for the 0DTE ATM option."""
         try:
-            # Get current spot price
+            # Get current spot price.
+            # MoomooTrader.get_live_price returns {"last", "bid", "ask",
+            # "volume"} — NOT the raw moomoo "last_price" key.  Reading
+            # the wrong key here silently returned 0 and the bot never
+            # placed an order.
             spot_data = await self._trader.get_live_price(self.config.symbol)
-            spot = spot_data.get("last_price") or spot_data.get("price", 0)
+            spot = (
+                spot_data.get("last")
+                or spot_data.get("last_price")
+                or spot_data.get("price")
+                or 0
+            )
             if not spot or spot <= 0:
-                logger.warning("Cannot execute: no spot price for %s", self.config.symbol)
+                logger.warning("Cannot execute: no spot price for %s (got %r)",
+                               self.config.symbol, spot_data)
                 return
 
             # Select ATM 0DTE option
@@ -398,10 +408,19 @@ class ZeroDTEOrderFlowBot:
             # Wait for fill
             filled = await self._trader._wait_for_fill(order_id, self.config.fill_timeout_s)
             if filled:
-                # Get fill price
+                # Get fill price.  MoomooTrader.get_order_status returns
+                # {"status", "filled", "remaining", "avgFillPrice",
+                # "commission"} — NOT the raw moomoo "dealt_avg_price"
+                # column.  Reading the wrong key left fill_price=0 →
+                # stop_price=0 / target_price=0 → instant "profit_target"
+                # exit on every fill.  Fall back to raw column for safety.
                 status = await self._trader.get_order_status(order_id)
                 if status:
-                    fill_price = float(status.get("dealt_avg_price", 0) or 0)
+                    fill_price = float(
+                        status.get("avgFillPrice")
+                        or status.get("dealt_avg_price")
+                        or 0
+                    )
                     self._active_position.entry_price = fill_price
                     self._active_position.status = "filled"
 
@@ -536,12 +555,18 @@ class ZeroDTEOrderFlowBot:
 
     @staticmethod
     def _notify(msg: str):
-        """Best-effort Telegram notification."""
+        """Best-effort Telegram notification.
+
+        The actual module is core.telegram_bot.notify(text).  Earlier
+        versions imported ``send_telegram`` from a non-existent
+        ``core.notification`` module — every alert was silently swallowed
+        by the bare except.
+        """
         try:
-            from core.notification import send_telegram
-            send_telegram(msg)
-        except Exception:
-            pass
+            from core.telegram_bot import notify
+            notify(msg)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("0DTE telegram notify failed: %s", e)
 
     # ── Status ────────────────────────────────────────────────────────────
 
