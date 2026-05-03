@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 from typing import List, Dict, Optional
 import logging
 
@@ -77,6 +78,18 @@ if not _try_load_ibsync():
         _IBSYNC_IMPORT_ERROR,
     )
 
+# IBKR informational error codes — these are NOT actual failures.
+# 10089/10090/10091/10092: market-data subscription needed (delayed/live entitlement)
+# 10167/10168/10197: similar subscription gaps; "displaying delayed market data"
+# 2104/2106/2107/2158: market-data farm connection status (informational)
+# 2119: market-data farm is connecting
+# 354: requested market data is not subscribed
+_IBKR_INFO_CODES = frozenset({
+    354, 2104, 2106, 2107, 2119, 2158,
+    10089, 10090, 10091, 10092, 10167, 10168, 10197,
+})
+
+
 class IBKRTrader:
     def __init__(self, host: str = '127.0.0.1', port: int = 7497, client_id: int = 1):
         if not HAS_IBSYNC:
@@ -90,34 +103,119 @@ class IBKRTrader:
         self.port = port
         self.client_id = client_id
         self.connected = False
+        self._retry_count = 0
+        self._last_retry_time = 0
+        # Symbols we know have no market-data subscription — short-circuit
+        # reqMktData calls for them so we don't spam IBKR/logs with 10089s.
+        self._no_mktdata_subs: set = set()
+        # Wire the error handler exactly once.
+        try:
+            self.ib.errorEvent += self._on_ib_error
+        except Exception:
+            pass
+
+    def _on_ib_error(self, reqId, errorCode, errorString, contract):
+        """Filter IBKR error-event noise.
+
+        Subscription-gap codes (10089 et al.) are *informational* — they fire
+        whenever `reqMktData` runs against a contract the account isn't
+        entitled to. The app already falls back to yfinance, so we just want
+        to log them quietly and remember the symbol so subsequent ticks
+        skip the doomed `reqMktData` call.
+        """
+        try:
+            if errorCode in _IBKR_INFO_CODES:
+                sym = getattr(contract, "symbol", None) if contract else None
+                if errorCode in (354, 10089, 10090, 10091, 10092) and sym:
+                    self._no_mktdata_subs.add(sym)
+                logging.debug(
+                    "IBKR info code %s on %s: %s",
+                    errorCode, sym or "?", errorString,
+                )
+                return
+            # Real errors — propagate at WARNING so they're visible.
+            logging.warning(
+                "IBKR error %s (reqId=%s) on %s: %s",
+                errorCode, reqId,
+                getattr(contract, "symbol", "?") if contract else "?",
+                errorString,
+            )
+        except Exception:
+            pass
 
     async def connect(self):
+        import time as _time
         try:
-            await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
+            # Set a timeout for the connection attempt
+            await asyncio.wait_for(
+                self.ib.connectAsync(self.host, self.port, clientId=self.client_id),
+                timeout=10
+            )
             self.connected = True
+            self._retry_count = 0
+            # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen.
+            # Delayed-Frozen (4) is the most permissive: it returns the last
+            # cached delayed quote even outside RTH and survives most
+            # subscription gaps that would otherwise trigger error 10089.
+            try:
+                self.ib.reqMarketDataType(4)
+            except Exception as e:
+                logging.warning("reqMarketDataType(4) failed: %s — falling back to delayed", e)
+                try:
+                    self.ib.reqMarketDataType(3)
+                except Exception:
+                    pass
+            # Reset the per-session subscription-failure cache on (re)connect.
+            self._no_mktdata_subs.clear()
+            logging.info(
+                "Connected to IBKR at %s:%s (cid=%s). Market data type=delayed-frozen.",
+                self.host, self.port, self.client_id,
+            )
             return {"success": True, "msg": "Connected to IBKR"}
+        except asyncio.TimeoutError:
+            self.connected = False
+            self._retry_count += 1
+            self._last_retry_time = _time.monotonic()
+            return {"success": False, "msg": "Connection timeout"}
         except Exception as e:
             self.connected = False
+            self._retry_count += 1
+            self._last_retry_time = _time.monotonic()
+            logging.error("IBKR Connection failed: %s", e)
             return {"success": False, "msg": str(e)}
 
     def disconnect(self):
         try:
-            self.ib.disconnect()
+            if self.ib.isConnected():
+                self.ib.disconnect()
         except Exception:
             pass
         self.connected = False
+        self._retry_count = 0
 
     def is_alive(self) -> bool:
         """Return True only when the socket is actually connected."""
         try:
-            return self.connected and self.ib.isConnected()
+            return self.ib.isConnected()
         except Exception:
-            self.connected = False
             return False
 
     async def ensure_connected(self):
-        """Reconnect if the socket dropped."""
+        """Reconnect if the socket dropped, with exponential backoff."""
+        import time as _time
         if not self.is_alive():
+            if self.connected: # It was connected but dropped
+                logging.warning("IBKR connection dropped. Attempting reconnect...")
+            
+            # I7: Exponential backoff logic
+            if self._retry_count > 0:
+                # Max delay 60s: 5, 10, 20, 40, 60, 60...
+                delay = min(60, (2 ** (self._retry_count - 1)) * 5)
+                elapsed = _time.monotonic() - self._last_retry_time
+                if elapsed < delay:
+                    wait_remaining = round(delay - elapsed, 1)
+                    return {"success": False, "msg": f"Backoff: waiting {wait_remaining}s before retry"}
+            
             self.disconnect()
             return await self.connect()
         return {"success": True, "msg": "Already connected"}
@@ -157,6 +255,25 @@ class IBKRTrader:
                 "market_price": p.marketPrice
             } for p in pf
         ]
+
+    async def get_historical_bars(self, symbol: str, duration: str = '30 D', bar_size: str = '1 day') -> Optional[pd.DataFrame]:
+        """Fetch historical bars directly from IBKR. Useful for 'Pure Live' mode."""
+        await self.ensure_connected()
+        contract = Stock(symbol, 'SMART', 'USD')
+        await self.ib.qualifyContractsAsync(contract)
+        
+        bars = await self.ib.reqHistoricalDataAsync(
+            contract, endDateTime='', durationStr=duration,
+            barSizeSetting=bar_size, whatToShow='TRADES', useRTH=False
+        )
+        if not bars:
+            return None
+            
+        df = pd.DataFrame([
+            {'Date': b.date, 'Open': b.open, 'High': b.high, 'Low': b.low, 'Close': b.close, 'Volume': b.volume}
+            for b in bars
+        ])
+        return df
 
     async def place_combo_order(self, symbol: str, legs: List[Dict], sc: int, side: str = 'BUY', lmtPrice: Optional[float] = None):
         """
@@ -215,6 +332,58 @@ class IBKRTrader:
         mid = (ticker.bid + ticker.ask) / 2 if not (pd.isna(ticker.bid) or pd.isna(ticker.ask)) else None
         self.ib.cancelMktData(combo)
         return mid
+
+    async def get_live_price(self, symbol: str) -> Dict:
+        """Fetch live bid/ask/last for a symbol. Useful for extended hours HUD.
+
+        Returns ``{"last": None, ...}`` (instead of raising) when the account
+        has no market-data subscription for the symbol — callers fall back to
+        yfinance. Subsequent calls for known-unsubscribed symbols short-circuit
+        immediately so we don't spam IBKR with 10089s every tick.
+        """
+        empty = {"symbol": symbol, "last": None, "bid": None, "ask": None,
+                 "time": datetime.now(timezone.utc).isoformat(), "no_subscription": False}
+
+        # Short-circuit if we already learned this symbol isn't subscribed.
+        if symbol in self._no_mktdata_subs:
+            empty["no_subscription"] = True
+            return empty
+
+        await self.ensure_connected()
+        contract = Stock(symbol, 'SMART', 'USD')
+        try:
+            await self.ib.qualifyContractsAsync(contract)
+        except Exception as e:
+            logging.debug("qualifyContractsAsync(%s) failed: %s", symbol, e)
+            return empty
+
+        ticker = self.ib.reqMktData(contract, '', False, False)
+        try:
+            # Wait up to 2s for data to arrive
+            timeout = 2.0
+            start = asyncio.get_running_loop().time()
+            while (
+                pd.isna(ticker.last) and pd.isna(ticker.close)
+                and symbol not in self._no_mktdata_subs  # bail if 10089 fires mid-wait
+                and (asyncio.get_running_loop().time() - start < timeout)
+            ):
+                await asyncio.sleep(0.1)
+
+            return {
+                "symbol": symbol,
+                "last": ticker.last if not pd.isna(ticker.last) else (
+                    ticker.close if not pd.isna(ticker.close) else None
+                ),
+                "bid": ticker.bid if not pd.isna(ticker.bid) else None,
+                "ask": ticker.ask if not pd.isna(ticker.ask) else None,
+                "time": datetime.now(timezone.utc).isoformat(),
+                "no_subscription": symbol in self._no_mktdata_subs,
+            }
+        finally:
+            try:
+                self.ib.cancelMktData(contract)
+            except Exception:
+                pass
 
     async def get_active_orders(self):
         await self.ensure_connected()

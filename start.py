@@ -62,7 +62,7 @@ def preflight():
             sys.exit(1)
         log("SETUP", GREEN, "npm install complete.")
 
-    # Check Python deps
+    # Check Pyt hon deps
     missing = []
     for pkg in ["fastapi", "uvicorn", "yfinance", "scipy", "pandas"]:
         try:

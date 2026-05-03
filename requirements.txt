@@ -9,3 +9,10 @@ apscheduler
 pytz
 ib_insync
 alpaca-trade-api
+moomoo-api
+python-dotenv
+python-json-logger
+pandas_market_calendars
+pytest
+pytest-asyncio
+httpx

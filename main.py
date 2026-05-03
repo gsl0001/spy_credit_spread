@@ -1,5 +1,27 @@
-from functools import lru_cache
-from typing import List, Optional
+import contextlib
+import functools
+import time as _time
+from typing import List, Optional, Any
+
+# ── TTL cache (replaces lru_cache on data-fetching functions) ─────────────────
+# lru_cache never expires — live scanner would use bars fetched during backtest.
+# 300-second TTL ensures live mode always sees fresh data.
+_TTL_CACHE: dict = {}
+
+def _ttl_cache(ttl: int = 300):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args):
+            key = (fn.__qualname__, args)
+            entry = _TTL_CACHE.get(key)
+            if entry and (_time.monotonic() - entry[0]) < ttl:
+                return entry[1]
+            result = fn(*args)
+            _TTL_CACHE[key] = (_time.monotonic(), result)
+            return result
+        wrapper.cache_clear = lambda: _TTL_CACHE.clear()
+        return wrapper
+    return decorator
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -11,6 +33,7 @@ from pydantic import BaseModel
 # Strategy imports
 from strategies.consecutive_days import ConsecutiveDaysStrategy
 from strategies.combo_spread import ComboSpreadStrategy
+from strategies.dryrun import DryRunStrategy
 from strategies.builder import OptionTopologyBuilder, bs_call_price, bs_put_price
 
 # Trading & Scheduler imports
@@ -26,7 +49,26 @@ configure_root_logging()
 _startup_log = _logging.getLogger("main")
 log_event(_startup_log, "server_startup", message="FastAPI app initialising")
 
-app = FastAPI(title="SPY Options Backtesting Engine")
+_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(application):
+    global _MAIN_LOOP
+    _MAIN_LOOP = asyncio.get_running_loop()
+
+    # I6: Auto-connect to IBKR on startup if configured
+    from core.settings import SETTINGS
+    ib_cfg = SETTINGS.ibkr.as_dict()
+    if ib_cfg.get("host") and ib_cfg.get("port"):
+        _startup_log.info("auto-connecting to IBKR at %s:%s...", ib_cfg["host"], ib_cfg["port"])
+        asyncio.create_task(get_ib_connection(ib_cfg))
+
+    yield
+    _MAIN_LOOP = None
+
+
+app = FastAPI(title="SPY Options Backtesting Engine", lifespan=_lifespan)
 
 
 def _safe_json(obj):
@@ -89,6 +131,9 @@ class BacktestRequest(BaseModel):
     years_history: int = 2
     capital_allocation: float = 10000.0
     contracts_per_trade: int = 1
+    # use_request §2 — single dropdown:
+    #   "fixed" | "dynamic_risk" | "targeted_spread" | "" (legacy/derive)
+    position_size_method: str = ""
     use_dynamic_sizing: bool = False
     risk_percent: float = 5.0
     max_trade_cap: float = 0.0
@@ -160,26 +205,30 @@ class OptimizerRequest(BaseModel):
 
 
 class StrategyFactory:
-    STRATEGIES = {
-        "consecutive_days": ConsecutiveDaysStrategy,
-        "combo_spread": ComboSpreadStrategy
-    }
+    """Backtest-side strategy lookup. Delegates to core.scanner's registry
+    so adding a new strategy only requires editing one dict."""
+
+    @staticmethod
+    def _registry() -> dict:
+        from core.scanner import list_strategy_classes
+        return list_strategy_classes()
 
     @staticmethod
     def get_strategy(strategy_id: str):
-        strat_cls = StrategyFactory.STRATEGIES.get(strategy_id, ConsecutiveDaysStrategy)
+        registry = StrategyFactory._registry()
+        strat_cls = registry.get(strategy_id) or registry.get("consecutive_days") or ConsecutiveDaysStrategy
         return strat_cls()
 
     @staticmethod
     def get_all_strategies():
         return [
             {"id": k, "name": v().name, "schema": v.get_schema()}
-            for k, v in StrategyFactory.STRATEGIES.items()
+            for k, v in StrategyFactory._registry().items()
         ]
 
 
 # ── Data fetching ──────────────────────────────────────────────────────────
-@lru_cache(maxsize=10)
+@_ttl_cache(300)
 def fetch_historical_data(ticker: str, years: int):
     period = f"{years}y"
     df = yf.download(ticker, period=period, progress=False)
@@ -193,7 +242,7 @@ def fetch_historical_data(ticker: str, years: int):
     return df
 
 
-@lru_cache(maxsize=5)
+@_ttl_cache(300)
 def fetch_risk_free_rate():
     """Fetch 13-week T-Bill (^IRX) as a risk-free rate proxy."""
     try:
@@ -204,7 +253,7 @@ def fetch_risk_free_rate():
     except Exception:
         return 0.045
 
-@lru_cache(maxsize=5)
+@_ttl_cache(300)
 def fetch_vix_data(years: int):
     """Fetch VIX index data for regime/volatility filtering."""
     try:
@@ -441,6 +490,7 @@ def run_backtest_engine(req: BacktestRequest, df: pd.DataFrame, start_idx: int =
                 trades.append({
                     "entry_date": current_entry["entry_date"], "exit_date": date,
                     "entry_spy": round(current_entry["entry_spy"], 2), "exit_spy": round(S, 2),
+                    "side": "BUY" if current_entry["entry_cost"] > 0 else "SELL",
                     "spread_cost": round(current_entry["entry_cost"], 2), "spread_exit": round(cv_exit, 2),
                     "pnl": round(float(pnl), 2), "contracts": sc, "days_held": days_held,
                     "commission": round(tc, 2), "win": bool(pnl > 0),
@@ -602,7 +652,9 @@ def run_walk_forward(req, df):
 
 @app.get("/api/strategies")
 def get_strategies():
-    return StrategyFactory.get_all_strategies()
+    all_strats = StrategyFactory.get_all_strategies()
+    log_event(_startup_log, "fetch_strategies", count=len(all_strats))
+    return all_strats
 
 
 # ── Main endpoint ──────────────────────────────────────────────────────────
@@ -642,12 +694,12 @@ def backtest(req: BacktestRequest):
 
         wf = run_walk_forward(req, df) if req.enable_walk_forward else []
 
-        return {
+        return _safe_json({
             "metrics": metrics, "trades": trades, "equity_curve": equity_curve,
             "price_history": price_history, "heatmap": heatmap, "monte_carlo": mc,
             "walk_forward": wf, "duration_dist": dur_dist, "regime_stats": regime_stats,
             "regime_timeline": regime_timeline,
-        }
+        })
     except Exception as e:
         import traceback; traceback.print_exc()
         return {"error": str(e)}
@@ -655,10 +707,28 @@ def backtest(req: BacktestRequest):
 
 # ── SPY Intraday Sparkline ─────────────────────────────────────────────────
 @app.get("/api/spy/intraday")
-def spy_intraday():
-    """Fetch today's SPY 1-min bars for sparkline display."""
+async def spy_intraday(host: str = None, port: int = None, client_id: int = None):
+    """Fetch today's SPY 1-min bars, with live IBKR price if available."""
+    out = {"data": [], "current": 0, "change": 0, "change_pct": 0, "source": "yfinance"}
+    
+    # 1. Try to get live price from IBKR if creds provided and connection exists
+    if host and port and client_id:
+        from ibkr_trading import _ib_instances
+        key = f"{host}:{port}:{client_id}"
+        trader = _ib_instances.get(key)
+        if trader and trader.is_alive():
+            try:
+                live = await trader.get_live_price("SPY")
+                if live.get("last"):
+                    out["current"] = live["last"]
+                    out["source"] = "ibkr"
+            except Exception:
+                pass
+
+    # 2. Fetch history from yfinance (with prepost=True for extended hours)
     try:
-        df = yf.download("SPY", period="1d", interval="1m", progress=False)
+        # Use 2d period to ensure we have context for overnight/pre-market moves
+        df = yf.download("SPY", period="2d", interval="1m", progress=False, prepost=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.reset_index(inplace=True)
@@ -669,15 +739,29 @@ def spy_intraday():
             if hasattr(ts, "tz_localize"):
                 ts = ts.tz_localize(None) if ts.tzinfo is None else ts.tz_convert(None)
             data.append({"time": str(ts), "close": round(float(row["Close"]), 2)})
-        if not data:
-            return {"data": [], "current": 0, "change": 0, "change_pct": 0}
-        current = data[-1]["close"]
-        day_open = data[0]["close"]
-        change = round(current - day_open, 2)
-        change_pct = round((change / day_open) * 100, 2) if day_open else 0
-        return {"data": data, "current": current, "change": change, "change_pct": change_pct}
+        
+        out["data"] = data
+        if data:
+            if out["current"] == 0:
+                out["current"] = data[-1]["close"]
+            else:
+                out["data"].append({"time": "live", "close": out["current"]})
+            
+            # Use yfinance ticker info to get an accurate previous close
+            try:
+                ticker_info = yf.Ticker("SPY").fast_info
+                prev_close = ticker_info.get("previousClose") or data[0]["close"]
+            except Exception:
+                prev_close = data[0]["close"]
+
+            out["change"] = round(out["current"] - prev_close, 2)
+            out["change_pct"] = round((out["change"] / prev_close) * 100, 2) if prev_close else 0
+            
     except Exception as e:
-        return {"error": str(e), "data": [], "current": 0, "change": 0, "change_pct": 0}
+        if out["current"] == 0:
+            return {"error": str(e), "data": [], "current": 0, "change": 0, "change_pct": 0}
+
+    return out
 
 
 # ── Live Options Chain ─────────────────────────────────────────────────────
@@ -710,6 +794,17 @@ def live_chain(ticker: str = "SPY"):
 
 
 # ── Optimizer endpoint ─────────────────────────────────────────────────────
+@app.get("/api/strategies/{strategy_id}/schema")
+def get_strategy_schema(strategy_id: str):
+    cls = StrategyFactory._registry().get(strategy_id)
+    if cls is None:
+        return {"error": "unknown_strategy", "strategy_id": strategy_id}
+    try:
+        return {"strategy_id": strategy_id, "schema": cls.get_schema()}
+    except Exception as e:  # noqa: BLE001
+        return {"error": "schema_failed", "detail": str(e)}
+
+
 @app.post("/api/optimize")
 def optimize(req: OptimizerRequest):
     try:
@@ -868,11 +963,41 @@ def run_market_scan():
             mode = scanner_state.get("mode", "paper")
             creds = scanner_state.get("creds") or {}
             if mode == "paper" and creds.get("api_key"):
-                from paper_trading import place_equity_order
-                side = "sell" if config.get("direction", "bull") == "bear" else "buy"
-                place_equity_order(creds["api_key"], creds["api_secret"],
-                                   config.get("ticker", "SPY"),
-                                   config.get("contracts_per_trade", 1) * 100, side)
+                # I5: Generate an idempotency key scoped to date + symbol + strategy
+                # so rapid scanner fires on the same day are suppressed as duplicates.
+                _scan_date = datetime.now().strftime("%Y-%m-%d")
+                _scan_symbol = config.get("ticker", "SPY")
+                _scan_strategy = config.get("strategy_id", "default")
+                _idem_key = f"scan:{_scan_date}:{_scan_symbol}:{_scan_strategy}"
+
+                from core.journal import get_journal as _get_j, Order as _Order
+                import uuid as _uuid_scan
+                _jnl = _get_j()
+                _existing = _jnl.get_order_by_idempotency(_idem_key)
+                if _existing is not None:
+                    import logging as _scan_log
+                    _scan_log.getLogger(__name__).info(
+                        "duplicate scan signal suppressed (key=%s)", _idem_key
+                    )
+                else:
+                    from paper_trading import place_equity_order
+                    side = "sell" if config.get("direction", "bull") == "bear" else "buy"
+                    place_equity_order(creds["api_key"], creds["api_secret"],
+                                       _scan_symbol,
+                                       config.get("contracts_per_trade", 1) * 100, side)
+                    _now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    _jnl.record_order(_Order(
+                        id=str(_uuid_scan.uuid4()),
+                        position_id=None,
+                        broker="paper",
+                        broker_order_id=None,
+                        side=side.upper(),
+                        limit_price=None,
+                        status="submitted",
+                        submitted_at=_now_iso,
+                        kind="entry",
+                        idempotency_key=_idem_key,
+                    ))
 
     except Exception as e:
         import logging
@@ -901,6 +1026,10 @@ def run_market_scan():
 
 @app.post("/api/scanner/start")
 def start_scanner(req: ScannerConfigRequest):
+    from core.leader import try_acquire_leadership
+    # I6: Claim leadership when starting automated background work
+    try_acquire_leadership("data/monitor.lock")
+
     scanner_state["active"] = True
     scanner_state["timing_mode"] = req.timing_mode
     scanner_state["timing_value"] = req.timing_value
@@ -950,6 +1079,458 @@ def stop_scanner():
 def get_scanner_status():
     return scanner_state
 
+
+# ── Scanner presets (use_request §4) ──────────────────────────────────────
+
+from core.presets import PresetStore as _PresetStore, ScannerPreset as _ScannerPreset
+
+_preset_store = _PresetStore()
+
+
+@app.get("/api/presets")
+def list_presets():
+    return {"presets": [p.to_dict() for p in _preset_store.list()]}
+
+
+@app.get("/api/presets/{name}")
+def get_preset(name: str):
+    p = _preset_store.get(name)
+    if p is None:
+        return {"error": "not_found", "name": name}
+    return p.to_dict()
+
+
+@app.post("/api/presets")
+def save_preset(payload: dict):
+    try:
+        preset = _ScannerPreset.from_dict(payload)
+    except (KeyError, ValueError, TypeError) as e:
+        return {"error": "invalid_preset", "detail": str(e)}
+    saved = _preset_store.save(preset)
+    return {"saved": True, "preset": saved.to_dict()}
+
+
+@app.delete("/api/presets/{name}")
+def delete_preset(name: str):
+    ok = _preset_store.delete(name)
+    return {"deleted": ok, "name": name}
+
+
+# ── Preset-driven scanner (use_request §4) ────────────────────────────────
+
+from core.scanner import (
+    Scanner as _Scanner,
+    PresetRequired as _PresetRequired,
+    resolve_strategy_class as _resolve_strategy_class,
+)
+
+
+# IBKR canonical bar-size string → yfinance interval string. Recognised
+# values are the ones declared via BaseStrategy.BAR_SIZE; anything else
+# falls back to daily.
+_YF_INTERVAL_MAP = {
+    "1 min":   "1m",
+    "5 mins":  "5m",
+    "15 mins": "15m",
+    "30 mins": "30m",
+    "1 hour":  "60m",
+    "1 day":   "1d",
+}
+
+# yfinance period caps depending on intraday granularity. yfinance
+# rejects e.g. period="1mo" with interval="1m" — these are the safe
+# defaults used when the strategy didn't declare HISTORY_PERIOD or
+# declared one that's too long for the requested interval.
+_YF_INTRADAY_CAP = {
+    "1m":  "7d",
+    "5m":  "60d",
+    "15m": "60d",
+    "30m": "60d",
+    "60m": "730d",
+}
+
+# IBKR durationStr defaults paired to bar size. IBKR enforces strict
+# (barSize, duration) pairs — these are conservative working values.
+_IB_DURATION_MAP = {
+    "1 min":   "2 D",
+    "5 mins":  "5 D",
+    "15 mins": "15 D",
+    "30 mins": "30 D",
+    "1 hour":  "30 D",
+    "1 day":   "30 D",
+}
+
+
+def _resolve_bar_spec(preset_or_strategy):
+    """Resolve (bar_size, history_period) for a preset OR a bare strategy name.
+
+    Reads the strategy class's ``BAR_SIZE`` / ``HISTORY_PERIOD`` class
+    attributes (Option B — strategy-declared). Falls back to daily if
+    the strategy can't be resolved.
+
+    Accepts either a ``ScannerPreset`` (uses ``preset.strategy_name``) or
+    a string strategy id directly — so the monitor can ask for bars
+    sized to a position's recorded strategy without needing the preset.
+    """
+    bar_size = "1 day"
+    history_period = "1mo"
+    strategy_name = None
+    if isinstance(preset_or_strategy, str):
+        strategy_name = preset_or_strategy
+    elif preset_or_strategy is not None:
+        strategy_name = getattr(preset_or_strategy, "strategy_name", None)
+    if strategy_name:
+        cls = _resolve_strategy_class(strategy_name)
+        if cls is not None:
+            bar_size = getattr(cls, "BAR_SIZE", bar_size)
+            history_period = getattr(cls, "HISTORY_PERIOD", history_period)
+    return bar_size, history_period
+
+
+def _preset_bars_fetcher(symbol: str, strategy_name: Optional[str] = None):
+    """Fetcher for the preset-driven scanner AND the live-monitor's
+    strategy-exit checks.
+
+    Honours the strategy's declared ``BAR_SIZE`` / ``HISTORY_PERIOD``
+    so intraday strategies (e.g. dryrun) get 5-minute bars while daily
+    strategies (consecutive_days, combo_spread) get daily bars.
+
+    Resolution order for the strategy:
+      1. Explicit ``strategy_name`` argument (used by the monitor — picks
+         the bar size based on the position being checked, regardless of
+         which preset is currently active in the scanner).
+      2. The currently active scanner preset's strategy.
+      3. Daily defaults.
+    """
+    import yfinance as yf
+    from core.settings import SETTINGS
+    import asyncio
+
+    # The active preset is consulted for two things: bar-size resolution
+    # (when no explicit ``strategy_name`` is passed) and the
+    # ``fetch_only_live`` flag below.
+    p = _preset_scanner.active_preset
+    if strategy_name:
+        bar_size, history_period = _resolve_bar_spec(strategy_name)
+    else:
+        bar_size, history_period = _resolve_bar_spec(p)
+    is_intraday = bar_size != "1 day"
+
+    yf_interval = _YF_INTERVAL_MAP.get(bar_size, "1d")
+    # Cap the period for intraday intervals so yfinance doesn't reject the request.
+    if is_intraday:
+        cap = _YF_INTRADAY_CAP.get(yf_interval, "5d")
+        # Take whichever is shorter — strategy's declared period or the cap.
+        # Simple approach: trust the cap unless strategy explicitly declared shorter.
+        yf_period = history_period if history_period in {"1d", "2d", "5d", "7d"} else cap
+    else:
+        yf_period = history_period
+
+    # ── 1. Live anchor (only useful for daily bars) ────────────────────
+    live_price = None
+    trader = None
+    try:
+        from ibkr_trading import _ib_instances
+        creds = SETTINGS.ibkr.as_dict()
+        key = f"{creds.get('host', '127.0.0.1')}:{creds.get('port', 7497)}:{creds.get('client_id', 1)}"
+        trader = _ib_instances.get(key)
+        if trader and trader.is_alive() and not is_intraday:
+            loop = _MAIN_LOOP
+            if loop and loop.is_running():
+                live = asyncio.run_coroutine_threadsafe(
+                    trader.get_live_price(symbol), loop,
+                ).result(timeout=5)
+                live_price = live.get("last")
+    except Exception:
+        pass
+
+    if not live_price and not is_intraday:
+        try:
+            live_price = yf.Ticker(symbol).fast_info.get("lastPrice")
+        except Exception:
+            pass
+
+    # ── 2. Pure-Live mode via IBKR historical (requires Historical Data entitlement) ──
+    if p and getattr(p, "fetch_only_live", False) and trader and trader.is_alive():
+        try:
+            loop = _MAIN_LOOP
+            if loop and loop.is_running():
+                ib_duration = _IB_DURATION_MAP.get(bar_size, "30 D")
+                df = asyncio.run_coroutine_threadsafe(
+                    trader.get_historical_bars(symbol, duration=ib_duration, bar_size=bar_size),
+                    loop,
+                ).result(timeout=10)
+                if df is not None and not df.empty:
+                    if live_price and not is_intraday:
+                        df.loc[df.index[-1], "Close"] = live_price
+                    return df
+        except Exception:
+            pass
+
+    # ── 3. yfinance fallback (free, no subscription) ──────────────────
+    df = yf.download(symbol, period=yf_period, interval=yf_interval, progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    if len(df) == 0:
+        return df
+
+    df.reset_index(inplace=True)
+    # yfinance puts the timestamp column under different names depending on interval.
+    for cand in ("Date", "Datetime", "index"):
+        if cand in df.columns:
+            if cand != "Date":
+                df.rename(columns={cand: "Date"}, inplace=True)
+            break
+
+    # Timezone handling: intraday strategies compare ts.time() against ET
+    # wall-clock windows (e.g. 09:35), so convert to America/New_York
+    # *before* stripping the tz. Daily bars don't need this.
+    if hasattr(df["Date"].dt, "tz") and df["Date"].dt.tz is not None:
+        if is_intraday:
+            try:
+                df["Date"] = df["Date"].dt.tz_convert("America/New_York")
+            except Exception:
+                pass
+        df["Date"] = df["Date"].dt.tz_localize(None)
+
+    # Mirror the index to "Date" so strategies that read either work.
+    df.set_index("Date", drop=False, inplace=True)
+
+    # ── 4. Live anchor injection (daily-bar hack only) ────────────────
+    if live_price and not is_intraday:
+        last_dt = df["Date"].iloc[-1].date()
+        today_dt = datetime.now().date()
+        if last_dt == today_dt:
+            df.loc[df.index[-1], "Close"] = live_price
+        else:
+            new_row = df.iloc[-1].copy()
+            new_row["Date"] = datetime.now().replace(microsecond=0)
+            new_row["Open"] = live_price
+            new_row["High"] = live_price
+            new_row["Low"] = live_price
+            new_row["Close"] = live_price
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+    return df
+
+
+_preset_scanner = _Scanner(
+    store=_preset_store,
+    bars_fetcher=_preset_bars_fetcher,
+)
+
+
+def _run_preset_tick():
+    """Background wrapper to call tick and update shared logs."""
+    try:
+        signals = _preset_scanner.tick()
+        if signals:
+            # Update the main scanner logs so the UI shows the new ticks
+            recent = _preset_scanner.history(limit=50)
+            scanner_state["logs"] = recent
+            if recent:
+                scanner_state["last_run"] = recent[0]["time"]
+
+            # I5: Auto-execute signals if preset allows it
+            p = _preset_scanner.active_preset
+            if p and p.auto_execute:
+                from core.settings import SETTINGS
+                from core.journal import get_journal as _gj
+                for sig in signals:
+                    if not (sig.fired and sig.signal_type == "entry"):
+                        continue
+
+                    # Per-day idempotency: same symbol + preset can only fire once/day
+                    _date = datetime.now().strftime("%Y-%m-%d")
+                    _idem_key = f"scan:{_date}:{sig.symbol}:{p.name}"
+                    if _gj().get_order_by_idempotency(_idem_key):
+                        log_event(_startup_log, "preset_scan_duplicate_suppressed",
+                                  key=_idem_key)
+                        continue
+
+                    log_event(_startup_log, "preset_scan_signal_fired",
+                              symbol=sig.symbol, preset=p.name, key=_idem_key,
+                              broker=p.broker)
+
+                    broker_name = getattr(p, "broker", "ibkr")
+
+                    if broker_name == "moomoo":
+                        # Moomoo path: build MoomooOrderRequest and route to moomoo impl
+                        try:
+                            order_req = MoomooOrderRequest(
+                                symbol=sig.symbol or p.ticker,
+                                direction=p.strategy_type,
+                                contracts=int(getattr(sig, "contracts", 0) or 0),
+                                strike_width=int(p.strike_width),
+                                target_dte=int(p.target_dte),
+                                spread_cost_target=float(p.spread_cost_target),
+                                position_size_method=p.position_size_method or "fixed",
+                                risk_percent=float(p.sizing_params.get("risk_percent", 1.0)),
+                                max_allocation_cap=float(p.sizing_params.get("max_allocation_cap", 500.0)),
+                                stop_loss_pct=float(p.stop_loss_pct),
+                                take_profit_pct=float(p.take_profit_pct),
+                                trailing_stop_pct=float(p.trailing_stop_pct),
+                                otm_offset=float(p.strategy_params.get("offset", 0.0)),
+                                client_order_id=_idem_key,
+                            )
+                        except Exception as e:
+                            log_event(_startup_log, "preset_auto_execute_build_failed",
+                                      error=str(e), preset=p.name)
+                            continue
+                        coro = _moomoo_execute_impl(order_req)
+                    else:
+                        # IBKR path (default)
+                        ib_creds = SETTINGS.ibkr.as_dict()
+                        if not (ib_creds.get("host") and ib_creds.get("port")):
+                            log_event(_startup_log, "preset_auto_execute_skipped",
+                                      reason="no_ibkr_creds", preset=p.name)
+                            continue
+                        try:
+                            order_req = IBKROrderRequest(
+                                creds=IBKRConnectRequest(
+                                    host=ib_creds["host"],
+                                    port=int(ib_creds["port"]),
+                                    client_id=int(ib_creds.get("client_id", 1)),
+                                ),
+                                symbol=sig.symbol or p.ticker,
+                                topology=p.topology,
+                                direction=p.strategy_type,
+                                contracts=int(getattr(sig, "contracts", 0) or 0),
+                                strike_width=int(p.strike_width),
+                                target_dte=int(p.target_dte),
+                                spread_cost_target=float(p.spread_cost_target),
+                                position_size_method=p.position_size_method or "",
+                                risk_percent=float(p.sizing_params.get("risk_percent", 5.0)),
+                                max_trade_cap=float(p.sizing_params.get("max_trade_cap", 0.0)),
+                                target_spread_pct=float(p.sizing_params.get("target_spread_pct", 2.0)),
+                                max_allocation_cap=float(p.sizing_params.get("max_allocation_cap", 2500.0)),
+                                stop_loss_pct=float(p.stop_loss_pct),
+                                take_profit_pct=float(p.take_profit_pct),
+                                trailing_stop_pct=float(p.trailing_stop_pct),
+                                otm_offset=float(p.strategy_params.get("offset", 0.0)),
+                                client_order_id=_idem_key,
+                            )
+                        except Exception as e:
+                            log_event(_startup_log, "preset_auto_execute_build_failed",
+                                      error=str(e), preset=p.name)
+                            continue
+                        coro = _ibkr_execute_impl(order_req)
+
+                    # Schedule the async order placement on the main event loop.
+                    # _run_preset_tick runs in the APScheduler thread, so we
+                    # need run_coroutine_threadsafe to cross threads safely.
+                    loop = _MAIN_LOOP
+                    if loop is None or not loop.is_running():
+                        log_event(_startup_log, "preset_auto_execute_skipped",
+                                  reason="loop_not_running", preset=p.name)
+                        continue
+                    try:
+                        future = asyncio.run_coroutine_threadsafe(coro, loop)
+                        result = future.result(timeout=60)
+                    except Exception as e:
+                        log_event(_startup_log, "preset_auto_execute_failed",
+                                  error=str(e), preset=p.name, key=_idem_key)
+                        continue
+
+                    if isinstance(result, dict) and result.get("error"):
+                        log_event(_startup_log, "preset_auto_execute_rejected",
+                                  preset=p.name, key=_idem_key,
+                                  error=result.get("error"),
+                                  reason=result.get("reason"))
+                    else:
+                        log_event(_startup_log, "preset_auto_execute_submitted",
+                                  preset=p.name, key=_idem_key,
+                                  order_id=result.get("order_id"),
+                                  position_id=result.get("position_id"),
+                                  contracts=result.get("contracts"),
+                                  limit=result.get("limit_price"))
+    except Exception as e:
+        log_event(_startup_log, "preset_tick_failed", error=str(e))
+
+
+@app.post("/api/scanner/preset/start")
+def start_preset_scanner(payload: dict):
+    name = (payload or {}).get("name")
+    if not name:
+        return {"error": "missing_preset_name"}
+    try:
+        from core.leader import try_acquire_leadership
+        # I6: Claim leadership when starting automated background work
+        try_acquire_leadership("data/monitor.lock")
+
+        preset = _preset_scanner.load_preset(name)
+
+        # Deactivate standard scanner to avoid duplicate jobs
+        scanner_state["active"] = True  # Mark as active for HUD
+        scanner_state["config"] = preset.to_dict()
+        scanner_state["timing_mode"] = preset.timing_mode
+        scanner_state["timing_value"] = preset.timing_value
+        scheduler.remove_all_jobs()
+
+        if preset.timing_mode == "interval":
+            secs = max(preset.timing_value, 10)
+            scheduler.add_job(_run_preset_tick, "interval", seconds=secs,
+                              id="market_scan", replace_existing=True)
+        elif preset.timing_mode == "after_open":
+            total_mins = 30 + preset.timing_value
+            hour = 9 + total_mins // 60
+            minute = total_mins % 60
+            scheduler.add_job(_run_preset_tick, "cron", hour=hour, minute=minute,
+                              day_of_week="mon-fri", timezone="America/New_York", id="market_scan")
+        elif preset.timing_mode == "before_close":
+            total_mins = 16 * 60 - preset.timing_value
+            hour = total_mins // 60
+            minute = total_mins % 60
+            scheduler.add_job(_run_preset_tick, "cron", hour=hour, minute=minute,
+                              day_of_week="mon-fri", timezone="America/New_York", id="market_scan")
+        elif preset.timing_mode == "on_open":
+            scheduler.add_job(_run_preset_tick, "cron", hour=9, minute=30,
+                              day_of_week="mon-fri", timezone="America/New_York", id="market_scan")
+        elif preset.timing_mode == "on_close":
+            scheduler.add_job(_run_preset_tick, "cron", hour=16, minute=0,
+                              day_of_week="mon-fri", timezone="America/New_York", id="market_scan")
+
+    except KeyError as e:
+        return {"error": "preset_not_found", "detail": str(e)}
+    return {"started": True, "preset": preset.to_dict()}
+
+
+@app.post("/api/scanner/preset/tick")
+def tick_preset_scanner():
+    """Manual tick — useful for tests + UI 'Scan Now' button."""
+    try:
+        signals = _preset_scanner.tick()
+        # Sync logs for HUD
+        recent = _preset_scanner.history(limit=50)
+        scanner_state["logs"] = recent
+        if recent:
+            scanner_state["last_run"] = recent[0]["time"]
+    except _PresetRequired as e:
+        return {"error": "preset_required", "detail": str(e)}
+    return {
+        "signals": [s.to_dict() for s in signals],
+        "history": _preset_scanner.history(limit=20),
+    }
+
+
+@app.post("/api/scanner/preset/stop")
+def stop_preset_scanner():
+    _preset_scanner.stop()
+    scanner_state["active"] = False
+    scheduler.remove_all_jobs()
+    return {"stopped": True}
+
+
+@app.get("/api/scanner/preset/status")
+def preset_scanner_status():
+    p = _preset_scanner.active_preset
+    return {
+        "active": _preset_scanner.is_active,
+        "preset": p.to_dict() if p else None,
+        "history": _preset_scanner.history(limit=20),
+    }
+
+
 class IBKRConnectRequest(BaseModel):
     host: str = "127.0.0.1"
     port: int = 7497
@@ -981,6 +1562,7 @@ class IBKROrderRequest(BaseModel):
     target_dte: int = 14
     spread_cost_target: float = 250.0
     # Sizing overrides (0 = use SETTINGS defaults)
+    position_size_method: str = ""  # "fixed"|"dynamic_risk"|"targeted_spread"|""
     use_dynamic_sizing: bool = False
     use_targeted_spread: bool = False
     risk_percent: float = 5.0
@@ -991,11 +1573,21 @@ class IBKROrderRequest(BaseModel):
     stop_loss_pct: float = 50.0
     take_profit_pct: float = 50.0
     trailing_stop_pct: float = 0.0
+    # Strike offset: points above underlying for K_long (SSRN 6355218: 0.96–2.00, default 1.50)
+    otm_offset: float = 0.0
+    # I5: optional client-provided ID for idempotency
+    client_order_id: Optional[str] = None
 
 
-@app.post("/api/ibkr/execute")
-async def ibkr_execute(req: IBKROrderRequest):
-    """Live order path — uses real chain, risk checks, journal, and fill watcher."""
+async def _ibkr_execute_impl(req: IBKROrderRequest) -> dict:
+    """Live order path — used by both /api/ibkr/execute and the preset
+    auto-execute scheduler. Performs idempotency check, chain resolution,
+    sizing, pre-trade risk gate, order submission, and journaling.
+
+    Returns a JSON-serialisable dict with either ``success: True`` (and
+    order details) or ``error: "..."`` so callers can surface the result
+    uniformly.
+    """
     import uuid as _uuid
     from core.journal import Position, Order, get_journal
     from core.risk import (
@@ -1007,6 +1599,20 @@ async def ibkr_execute(req: IBKROrderRequest):
     from core.settings import SETTINGS
 
     journal = get_journal()
+
+    # I5: Check for existing idempotency key BEFORE doing any work
+    idem_key = req.client_order_id if req.client_order_id else None
+    if idem_key:
+        existing = journal.get_order_by_idempotency(idem_key)
+        if existing:
+            _startup_log.info("duplicate order suppressed (key=%s)", idem_key)
+            return {
+                "success": True,
+                "duplicate": True,
+                "order_id": existing.id,
+                "position_id": existing.position_id,
+                "status": existing.status,
+            }
 
     # 1. Connect to IBKR
     trader, msg = await get_ib_connection(req.creds.model_dump())
@@ -1030,6 +1636,7 @@ async def ibkr_execute(req: IBKROrderRequest):
     spread = await resolve_bull_call_spread(
         trader, req.symbol, req.target_dte, req.spread_cost_target,
         max_width=req.strike_width + 35,
+        otm_offset=req.otm_offset,
     )
     if spread is None:
         journal.log_event("chain_resolve_failed", subject=req.symbol)
@@ -1073,6 +1680,17 @@ async def ibkr_execute(req: IBKROrderRequest):
         journal.log_event("risk_rejected", subject=req.symbol, payload={
             "reason": decision.reason, **decision.details,
         })
+        # Telegram: only buzz on risk-gate rejections; sizing_zero / chain
+        # failures are noisier (every tick of a misconfigured preset would
+        # ping the phone).
+        try:
+            from core.telegram_bot import notify_entry_rejected
+            notify_entry_rejected(
+                req.symbol, decision.reason,
+                detail=", ".join(f"{k}={v}" for k, v in (decision.details or {}).items()),
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return {"error": "risk_rejected", "reason": decision.reason, "details": decision.details}
 
     # 6. Determine order side from spread type (C5 fix — no more hardcoded BUY)
@@ -1091,8 +1709,9 @@ async def ibkr_execute(req: IBKROrderRequest):
     # 8. Submit order
     pos_id = str(_uuid.uuid4())
     order_id = str(_uuid.uuid4())
-    idem_key = f"entry:{pos_id}"
-    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    # I5: use client_order_id if provided, else fall back to position-based key
+    idem_key = req.client_order_id if req.client_order_id else f"entry:{pos_id}"
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     try:
         res = await trader.place_combo_order(
@@ -1146,6 +1765,16 @@ async def ibkr_execute(req: IBKROrderRequest):
         "broker_order_id": broker_order_id,
     })
 
+    # Telegram: ping the operator that an order is in flight.
+    try:
+        from core.telegram_bot import notify_entry_submitted
+        notify_entry_submitted(
+            req.symbol, side, contracts, limit_price,
+            idem_key=idem_key,
+        )
+    except Exception:  # noqa: BLE001
+        pass  # best-effort; never let notify failure rollback an order
+
     return {
         "success": True,
         "position_id": pos_id,
@@ -1163,9 +1792,77 @@ async def ibkr_execute(req: IBKROrderRequest):
         "K_short": spread.meta.get("K_short"),
         "underlying_price": spread.underlying_price,
     }
+
+
+@app.post("/api/ibkr/execute")
+async def ibkr_execute(req: IBKROrderRequest):
+    """Public order endpoint — thin wrapper around _ibkr_execute_impl."""
+    return await _ibkr_execute_impl(req)
+
+
+# Haircut percentages for exit paths.
+# - Manual exit: moderate (0.05) — same as the algorithmic monitor.
+# - Flatten-all (panic button): aggressive (0.15) — user wants out NOW,
+#   accept slippage to ensure fills cross any reasonable spread.
+_EXIT_HAIRCUT_MANUAL = 0.05
+_EXIT_HAIRCUT_PANIC = 0.15
+
+
+@app.post("/api/ibkr/exit")
+async def ibkr_exit(req: dict):
+    """Manual exit for a single position. JSON: { "creds": {...}, "position_id": "..." }"""
+    from core.journal import get_journal
+    from core.monitor import submit_exit_order
+
+    journal = get_journal()
+    trader, msg = await get_ib_connection(req.get("creds", {}))
+    if not trader:
+        return {"error": msg}
+
+    pos_id = req.get("position_id")
+    pos = journal.get_position(pos_id)
+    if not pos:
+        return {"error": "position_not_found", "id": pos_id}
+
+    if pos.state not in ("open", "closing"):
+        return {"error": "position_not_open", "state": pos.state}
+
+    try:
+        legs_list = [dict(leg) for leg in pos.legs]
+        mid = await trader.get_combo_midpoint(pos.symbol, legs_list)
+        # No quote → don't fabricate a $0.01 limit that can never fill.
+        # Tell the caller the real situation so they can retry, escalate
+        # to flatten-all (which uses a market-order fallback), or wait.
+        if mid is None or mid <= 0 or (isinstance(mid, float) and np.isnan(mid)):
+            journal.log_event("exit_no_quote", subject=pos_id, payload={
+                "symbol": pos.symbol, "reason": "manual_close",
+            })
+            return {
+                "error": "no_quote",
+                "detail": "Could not fetch a combo midpoint for this position. "
+                          "Retry once a quote is available, or use FLATTEN ALL "
+                          "to escalate to a market-order close.",
+                "position_id": pos_id,
+            }
+        res = await submit_exit_order(
+            trader, pos, float(mid), "manual_close", journal,
+            haircut_pct=_EXIT_HAIRCUT_MANUAL,
+        )
+        # ``submit_exit_order`` never raises — surface its real outcome
+        # (ok / error) instead of an unconditional success: True.
+        return {"success": bool(res.get("ok")), **res}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/api/ibkr/flatten_all")
 async def ibkr_flatten_all(req: IBKRConnectRequest):
-    """C6: Kill switch — close every open position at market mid. One-button panic."""
+    """C6: Kill switch — close every open position aggressively.
+
+    Uses a wide haircut so limit orders cross any reasonable spread, and
+    falls back to a market order when no quote is available. The user
+    clicked panic for a reason; getting filled matters more than slippage.
+    """
     from core.journal import get_journal
     from core.monitor import submit_exit_order
 
@@ -1185,17 +1882,85 @@ async def ibkr_flatten_all(req: IBKRConnectRequest):
         try:
             legs_list = [dict(leg) for leg in pos.legs]
             mid = await trader.get_combo_midpoint(pos.symbol, legs_list)
-            if mid is None or mid <= 0:
-                mid = 0.01  # market-close fallback
-            res = await submit_exit_order(
-                trader, pos, float(mid), "manual_flatten", journal, haircut_pct=0.0,
-            )
+            if mid is None or mid <= 0 or (isinstance(mid, float) and np.isnan(mid)):
+                # No quote — fall back to a market-order close so the
+                # position actually exits. ``_market_close_position`` posts
+                # the same journal entries as ``submit_exit_order`` but
+                # with ``lmtPrice=None`` so IBKR routes it as a market order.
+                res = await _market_close_position(trader, pos, journal,
+                                                    reason="manual_flatten_market")
+            else:
+                res = await submit_exit_order(
+                    trader, pos, float(mid), "manual_flatten", journal,
+                    haircut_pct=_EXIT_HAIRCUT_PANIC,
+                )
             results.append({"position_id": pos.id, **res})
         except Exception as e:
             results.append({"position_id": pos.id, "error": str(e)})
 
     journal.log_event("flatten_all", payload={"count": len(results)})
+    try:
+        from core.telegram_bot import notify_alert
+        notify_alert("critical", f"FLATTEN ALL fired — {len(results)} position(s) closing")
+    except Exception:  # noqa: BLE001
+        pass
     return {"closed": len(results), "results": results}
+
+
+async def _market_close_position(trader, pos, journal, *, reason: str) -> dict:
+    """Fallback close path used when no combo quote is available.
+
+    Submits the close as a market order (no ``lmtPrice``) so it crosses
+    any spread. Mirrors ``submit_exit_order``'s journaling so the fill
+    watcher reconciles the resulting fill the same way as a normal exit.
+    """
+    import uuid as _uuid
+    from datetime import timezone as _tz
+    from core.journal import Order
+
+    # Closing side: debit spreads (entered BUY) close SELL; credits the inverse.
+    combo_type = (pos.meta or {}).get("combo_type", "debit")
+    close_side = "SELL" if combo_type == "debit" else "BUY"
+
+    # Reverse the legs so place_combo_order interprets the close correctly
+    # when we pass side=close_side.
+    legs = []
+    for leg in pos.legs:
+        flipped = dict(leg)
+        side = leg.get("side", "long")
+        flipped["side"] = "short" if side == "long" else "long"
+        legs.append(flipped)
+    try:
+        res = await trader.place_combo_order(
+            pos.symbol, legs, int(pos.contracts), side=close_side, lmtPrice=None,
+        )
+    except Exception as e:
+        journal.log_event("exit_failed", subject=pos.id, payload={
+            "reason": reason, "error": f"{type(e).__name__}: {e}",
+        })
+        return {"ok": False, "error": str(e), "reason": reason}
+
+    broker_order_id = str(res.get("orderId", "")) if isinstance(res, dict) else ""
+    order_id = str(_uuid.uuid4())
+    journal.record_order(Order(
+        id=order_id,
+        position_id=pos.id,
+        broker=pos.broker,
+        broker_order_id=broker_order_id or None,
+        side=close_side,
+        limit_price=None,
+        status="submitted",
+        submitted_at=datetime.now(_tz.utc).isoformat(timespec="seconds"),
+        kind="exit",
+        idempotency_key=f"exit:{pos.id}:{reason}",
+    ))
+    journal.update_position(pos.id, state="closing")
+    journal.log_event("exit_submitted", subject=pos.id, payload={
+        "reason": reason, "order_type": "MARKET",
+        "broker_order_id": broker_order_id,
+    })
+    return {"ok": True, "order_id": order_id, "reason": reason,
+            "order_type": "MARKET"}
 
 
 @app.post("/api/ibkr/chain_debug")
@@ -1330,6 +2095,10 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
         "monitor_seconds_since_tick": None,
         "monitor_stalled": False,
         "ibkr_dropped": False,
+        "moomoo_connected": False,
+        "moomoo_last_healthy_iso": None,
+        "moomoo_seconds_since_healthy": None,
+        "moomoo_stalled": False,
         "alerts": [],
     }
 
@@ -1409,6 +2178,33 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
             "message": "Monitor registered but has not ticked yet",
         })
 
+    # Moomoo OpenD health.  Surface connection state + staleness so
+    # heartbeat consumers (UI, /api/health watchers) can alert on a
+    # silently-stalled OpenD connection.
+    try:
+        if _moomoo_trader is not None and _moomoo_trader.is_alive():
+            result["moomoo_connected"] = True
+            last_iso = getattr(_moomoo_trader, "last_healthy_iso", None)
+            result["moomoo_last_healthy_iso"] = last_iso
+            if last_iso:
+                last_dt = datetime.fromisoformat(last_iso)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                delta = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                result["moomoo_seconds_since_healthy"] = round(delta, 1)
+                # 5 minutes without a successful broker call → stale.
+                # (account/positions/snapshot polling at 15s should keep
+                # this fresh whenever the scanner or monitor is active.)
+                if delta > 300:
+                    result["moomoo_stalled"] = True
+                    result["alerts"].append({
+                        "level": "warning" if delta < 900 else "critical",
+                        "code": "moomoo_stalled",
+                        "message": f"OpenD silent for {int(delta)}s — connection may be dead",
+                    })
+    except Exception:  # noqa: BLE001
+        pass
+
     # IBKR socket
     if not HAS_IBSYNC:
         return result
@@ -1461,6 +2257,593 @@ async def ibkr_reconnect(req: IBKRConnectRequest):
     return {"connected": False, "error": msg}
 
 
+# ── Moomoo API endpoints ──────────────────────────────────────────────────
+
+
+class MoomooConnectRequest(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 11111
+    trade_password: str = ""
+    trd_env: int = 0                  # 0=simulate, 1=real
+    security_firm: str = "NONE"       # NONE=auto, FUTUINC=US, FUTUCA=Canada, FUTUSECURITIES=HK
+    filter_trdmarket: str = "NONE"    # NONE=auto (recommended), US, HK, CA, etc.
+
+
+class MoomooProbeRequest(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 11111
+
+
+class MoomooOrderRequest(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 11111
+    trade_password: str = ""
+    symbol: str = "SPY"
+    direction: str = "bull_call"        # "bull_call" | "bear_put"
+    contracts: int = 1
+    strike_width: int = 5
+    target_dte: int = 0
+    spread_cost_target: float = 250.0
+    otm_offset: float = 0.0
+    position_size_method: str = "fixed"
+    risk_percent: float = 1.0
+    max_allocation_cap: float = 500.0
+    stop_loss_pct: float = 50.0
+    take_profit_pct: float = 50.0
+    trailing_stop_pct: float = 0.0
+    client_order_id: Optional[str] = None
+    # Test-only escape hatch: skip the event-blackout gate so smoke
+    # tests can fire orders during news days.  NEVER set True in
+    # production scanner code paths — the news filter exists for a
+    # reason (NFP/FOMC/CPI move SPY 2-3% in seconds).
+    bypass_event_blackout: bool = False
+
+
+_moomoo_trader = None
+
+
+@app.post("/api/moomoo/connect")
+async def moomoo_connect(req: MoomooConnectRequest):
+    global _moomoo_trader
+    from moomoo_trading import MoomooTrader
+    from core.broker import register_broker
+    trader = MoomooTrader(
+        host=req.host,
+        port=req.port,
+        trade_password=req.trade_password,
+        trd_env=req.trd_env,
+        security_firm=req.security_firm,
+        filter_trdmarket=req.filter_trdmarket,
+    )
+    try:
+        result = await trader.connect()
+        _moomoo_trader = trader
+        register_broker("moomoo", trader)
+        return result
+    except Exception as exc:
+        return {"connected": False, "error": str(exc)}
+
+
+@app.post("/api/moomoo/probe")
+async def moomoo_probe(req: MoomooProbeRequest):
+    """Diagnostic: list every account OpenD has, regardless of filters.
+
+    Lets the UI show the user which accounts are visible and what trd_env /
+    security_firm / trdmarket_auth values they have, so they can pick the
+    right combo before calling /connect.
+    """
+    from moomoo_trading import MoomooTrader
+    return await MoomooTrader.probe(host=req.host, port=req.port)
+
+
+@app.post("/api/moomoo/disconnect")
+async def moomoo_disconnect():
+    global _moomoo_trader
+    from core.broker import unregister_broker
+    if _moomoo_trader:
+        _moomoo_trader.disconnect()
+        _moomoo_trader = None
+    unregister_broker("moomoo")
+    return {"status": "disconnected"}
+
+
+@app.get("/api/moomoo/account")
+async def moomoo_account():
+    from core.broker import get_broker, BrokerNotConnected
+    try:
+        broker = get_broker("moomoo")
+        return await broker.get_account_summary()
+    except BrokerNotConnected as exc:
+        return {"error": str(exc)}
+
+
+@app.get("/api/moomoo/positions")
+async def moomoo_positions():
+    from core.broker import get_broker, BrokerNotConnected
+    try:
+        broker = get_broker("moomoo")
+        return {"positions": await broker.get_positions()}
+    except BrokerNotConnected as exc:
+        return {"error": str(exc)}
+
+
+@app.get("/api/moomoo/chain")
+async def moomoo_chain(symbol: str = "SPY", date: str = ""):
+    from core.broker import get_broker, BrokerNotConnected
+    if not date:
+        from datetime import date as _date
+        date = _date.today().strftime("%Y-%m-%d")
+    try:
+        broker = get_broker("moomoo")
+        df = await broker.get_option_chain(symbol, date)
+        return {"chain": df.to_dict(orient="records") if hasattr(df, "to_dict") else []}
+    except BrokerNotConnected as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@app.post("/api/moomoo/execute")
+async def moomoo_execute(req: MoomooOrderRequest):
+    """Public moomoo order entry point.  Wraps the impl with a catch-all so
+    unexpected exceptions surface as JSON instead of HTTP 500 — the UI can't
+    show a useful error from a plain 'Internal Server Error' string body.
+    """
+    try:
+        return await _moomoo_execute_impl(req)
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        from core.journal import get_journal
+        tb = traceback.format_exc()
+        try:
+            get_journal().log_event(
+                "moomoo_execute_unhandled",
+                payload={"error": str(exc), "type": type(exc).__name__, "traceback": tb[:4000]},
+            )
+        except Exception:
+            pass
+        return {"error": "unhandled_exception", "reason": f"{type(exc).__name__}: {exc}"}
+
+
+@app.post("/api/moomoo/exit")
+async def moomoo_exit(payload: dict):
+    position_id = (payload or {}).get("position_id")
+    reason = (payload or {}).get("reason") or "manual_exit"
+    if not position_id:
+        return {"error": "missing_position_id"}
+    from core.journal import get_journal, Order
+    from core.broker import get_broker, BrokerNotConnected
+    import uuid
+    journal = get_journal()
+    pos = journal.get_position(position_id)
+    if not pos:
+        return {"error": "position_not_found"}
+    if pos.broker != "moomoo":
+        return {"error": f"position broker is '{pos.broker}', not 'moomoo'"}
+    if pos.state != "open":
+        return {"error": f"position state is '{pos.state}', not 'open'"}
+    try:
+        broker = get_broker("moomoo")
+    except BrokerNotConnected as exc:
+        return {"error": f"moomoo not connected: {exc}"}
+
+    # Capture spread mid BEFORE close so we have a P&L reference if leg fills
+    # don't reconcile cleanly (best-effort; None means no quote available).
+    pre_close_mid = None
+    try:
+        pre_close_mid = await broker.get_spread_mid(list(pos.legs))
+    except Exception:
+        pass
+
+    try:
+        result = await broker.close_position(position_id, list(pos.legs))
+    except Exception as exc:
+        journal.log_event("exit_failed", subject=position_id, payload={
+            "error": str(exc), "broker": "moomoo", "reason": reason,
+        })
+        return {"error": f"close_position failed: {exc}"}
+
+    # Record an exit order per leg so fill_watcher can reconcile each fill
+    # individually.  Mark position state='closing' — fill_watcher will close
+    # it (with real realized_pnl) once both leg fills are confirmed.
+    close_orders = result.get("close_orders", []) if isinstance(result, dict) else []
+    submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    recorded_order_ids = []
+    for entry in close_orders:
+        leg = entry.get("leg") if isinstance(entry, dict) else None
+        broker_order_id = entry.get("order_id") if isinstance(entry, dict) else None
+        side = "SELL" if (leg or {}).get("side") == "long" else "BUY"
+        order_id = str(uuid.uuid4())
+        try:
+            journal.record_order(Order(
+                id=order_id,
+                position_id=position_id,
+                broker="moomoo",
+                broker_order_id=str(broker_order_id) if broker_order_id is not None else "",
+                side=side,
+                limit_price=None,
+                status="submitted",
+                submitted_at=submitted_at,
+                kind="exit",
+                idempotency_key=f"exit:{position_id}:{reason}:{order_id[:8]}",
+            ))
+            recorded_order_ids.append(order_id)
+        except Exception as exc:  # noqa: BLE001
+            journal.log_event("exit_order_record_failed", subject=position_id,
+                              payload={"error": str(exc), "broker_order_id": broker_order_id})
+
+    journal.update_position(position_id, state="closing", exit_reason=reason)
+    journal.log_event("exit_submitted", subject=position_id, payload={
+        "broker": "moomoo", "reason": reason,
+        "pre_close_spread_mid": pre_close_mid,
+        "leg_orders": recorded_order_ids,
+        "result": result,
+    })
+    return {**result, "pre_close_spread_mid": pre_close_mid, "exit_orders": recorded_order_ids}
+
+
+@app.post("/api/moomoo/flatten_all")
+async def moomoo_flatten_all():
+    """Kill switch — market-close every open moomoo position.
+
+    Mirrors /api/ibkr/flatten_all: iterates the journal's open moomoo
+    positions and fires broker.close_position on each.  Best-effort —
+    individual failures are returned in the results list but don't abort
+    the loop.  Telegram alert fires regardless of partial failures so
+    the operator gets a notification.
+    """
+    from core.broker import get_broker, BrokerNotConnected
+    from core.journal import get_journal, Order
+    import uuid
+
+    journal = get_journal()
+    try:
+        broker = get_broker("moomoo")
+    except BrokerNotConnected as exc:
+        return {"error": "broker_not_connected", "reason": str(exc)}
+
+    open_positions = [p for p in journal.list_open() if p.broker == "moomoo"]
+    if not open_positions:
+        return {"closed": 0, "msg": "No open moomoo positions."}
+
+    submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    results = []
+    for pos in open_positions:
+        if pos.state not in ("open", "closing"):
+            continue
+        try:
+            legs_list = [dict(leg) for leg in pos.legs]
+            # Best-effort pre-close mid for the audit trail.
+            try:
+                pre_mid = await broker.get_spread_mid(legs_list)
+            except Exception:
+                pre_mid = None
+            close_result = await broker.close_position(pos.id, legs_list)
+            recorded = []
+            for entry in (close_result.get("close_orders") or []):
+                leg = entry.get("leg") if isinstance(entry, dict) else None
+                broker_order_id = entry.get("order_id") if isinstance(entry, dict) else None
+                side = "SELL" if (leg or {}).get("side") == "long" else "BUY"
+                order_id = str(uuid.uuid4())
+                journal.record_order(Order(
+                    id=order_id,
+                    position_id=pos.id,
+                    broker="moomoo",
+                    broker_order_id=str(broker_order_id) if broker_order_id is not None else "",
+                    side=side,
+                    limit_price=None,
+                    status="submitted",
+                    submitted_at=submitted_at,
+                    kind="exit",
+                    idempotency_key=f"flatten:{pos.id}:{order_id[:8]}",
+                ))
+                recorded.append(order_id)
+            journal.update_position(pos.id, state="closing", exit_reason="manual_flatten")
+            journal.log_event("exit_submitted", subject=pos.id, payload={
+                "broker": "moomoo", "reason": "manual_flatten",
+                "pre_close_spread_mid": pre_mid, "leg_orders": recorded,
+            })
+            results.append({
+                "position_id": pos.id, "ok": True,
+                "leg_orders": recorded, "pre_close_mid": pre_mid,
+            })
+        except Exception as exc:  # noqa: BLE001
+            journal.log_event("exit_failed", subject=pos.id, payload={
+                "error": str(exc), "broker": "moomoo", "reason": "manual_flatten",
+            })
+            results.append({"position_id": pos.id, "ok": False, "error": str(exc)})
+
+    journal.log_event("flatten_all", payload={
+        "broker": "moomoo", "count": len(results),
+    })
+    try:
+        from core.telegram_bot import notify_alert
+        notify_alert("critical", f"MOOMOO FLATTEN ALL — {len(results)} position(s) closing")
+    except Exception:  # noqa: BLE001
+        pass
+    return {"closed": len(results), "results": results}
+
+
+@app.post("/api/moomoo/reconcile")
+async def moomoo_reconcile():
+    """Manually trigger the orphan-leg reconciler.
+
+    Compares moomoo broker positions against journal open positions.
+    Returns counts + any orphans (broker has, journal doesn't) and
+    phantoms (journal has, broker doesn't).  Phantoms older than 60s
+    are auto-closed with reason='reconcile_phantom'.
+    """
+    from core.moomoo_reconciler import reconcile_once
+    return await reconcile_once()
+
+
+@app.post("/api/moomoo/cancel")
+async def moomoo_cancel(payload: dict):
+    order_id = (payload or {}).get("order_id")
+    if not order_id:
+        return {"error": "missing_order_id"}
+    from core.broker import get_broker, BrokerNotConnected
+    try:
+        broker = get_broker("moomoo")
+        return await broker.cancel_order(order_id)
+    except BrokerNotConnected as exc:
+        return {"error": str(exc)}
+
+
+async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
+    """Live moomoo order path — mirrors _ibkr_execute_impl.
+
+    Steps: idempotency → connect check → account snapshot → chain resolution
+    → strike picking → sizing → risk gate → place_spread → journal → notify.
+    """
+    from core.broker import get_broker, BrokerNotConnected
+    from core.journal import get_journal
+    from core.risk import evaluate_pre_trade, AccountSnapshot
+    from core.chain import pick_bull_call_strikes, pick_nearest_expiry
+    from core.settings import SETTINGS
+    from core.broker import LegSpec, SpreadRequest
+    import uuid
+
+    client_id = req.client_order_id or str(uuid.uuid4())
+
+    # Idempotency guard
+    journal = get_journal()
+    if journal.get_order_by_idempotency(client_id):
+        return {"error": "duplicate", "reason": "idempotency_key_exists", "client_order_id": client_id}
+
+    # Broker check
+    try:
+        broker = get_broker("moomoo")
+    except BrokerNotConnected as exc:
+        return {"error": "broker_not_connected", "reason": str(exc)}
+
+    if not broker.is_alive():
+        return {"error": "broker_not_connected", "reason": "moomoo trader reports not alive"}
+
+    # Account snapshot
+    try:
+        acct = await broker.get_account_summary()
+    except Exception as exc:
+        return {"error": "account_fetch_failed", "reason": str(exc)}
+
+    snapshot = AccountSnapshot(
+        equity=acct.get("equity", 0.0),
+        buying_power=acct.get("buying_power", 0.0),
+        excess_liquidity=acct.get("excess_liquidity", 0.0),
+        daily_pnl=acct.get("realized_pnl", 0.0),
+    )
+
+    # Live price
+    try:
+        price_data = await broker.get_live_price(req.symbol)
+        underlying = float(price_data.get("last", 0))
+        if underlying <= 0:
+            return {"error": "bad_price", "reason": "live price <= 0"}
+    except Exception as exc:
+        return {"error": "price_fetch_failed", "reason": str(exc)}
+
+    # Option chain
+    from datetime import date as _date, timedelta
+    target_date = _date.today() + timedelta(days=req.target_dte)
+    expiry_str = target_date.strftime("%Y-%m-%d")
+    try:
+        chain_df = await broker.get_option_chain(req.symbol, expiry_str)
+    except Exception as exc:
+        return {"error": "chain_fetch_failed", "reason": str(exc)}
+
+    right = "C" if "bull" in req.direction else "P"
+    chain_sub = chain_df[chain_df["option_type"] == ("CALL" if right == "C" else "PUT")]
+    strike_grid = sorted(chain_sub["strike_price"].unique().tolist())
+    call_prices = {
+        float(row["strike_price"]): (float(row["bid_price"]), float(row["ask_price"]))
+        for _, row in chain_sub.iterrows()
+    }
+
+    # Strike selection
+    spread = pick_bull_call_strikes(
+        strike_grid=strike_grid,
+        underlying=underlying,
+        call_prices=call_prices,
+        target_debit=req.spread_cost_target,
+        otm_offset=req.otm_offset,
+    )
+    if not spread:
+        return {"error": "no_spread_found", "reason": "pick_bull_call_strikes returned None"}
+
+    # Pre-trade chain quality check — reject degenerate quotes BEFORE order
+    # submission.  Catches: zero bid/ask, crossed markets, blown-out spreads,
+    # near-zero debit, and (where data is available) low volume/OI.
+    from core.chain import validate_spread_quality
+    quality_lookup = {
+        float(row["strike_price"]): {
+            "volume": int(row.get("volume", 0) or 0),
+            "open_interest": int(row.get("open_interest", 0) or 0),
+        }
+        for _, row in chain_sub.iterrows()
+    }
+    quality_ok, quality_reason = validate_spread_quality(
+        spread,
+        max_bid_ask_pct=0.10,         # 10% bid/ask spread tolerance
+        min_mid=0.05,                  # debit must be ≥ $0.05 per contract
+        quality_lookup=quality_lookup,
+        min_volume=10,                 # at least 10 contracts traded today
+        min_open_interest=50,          # at least 50 contracts of OI
+    )
+    if not quality_ok:
+        journal.log_event("chain_quality_rejected", subject=req.symbol, payload={
+            "reason": quality_reason, "broker": "moomoo",
+            "K_long": spread.get("K_long"), "K_short": spread.get("K_short"),
+            "long_bid": spread.get("long_bid"), "long_ask": spread.get("long_ask"),
+            "short_bid": spread.get("short_bid"), "short_ask": spread.get("short_ask"),
+        })
+        return {
+            "error": "chain_quality_rejected",
+            "reason": quality_reason,
+            "K_long": spread.get("K_long"), "K_short": spread.get("K_short"),
+            "long_bid": spread.get("long_bid"), "long_ask": spread.get("long_ask"),
+            "short_bid": spread.get("short_bid"), "short_ask": spread.get("short_ask"),
+        }
+
+    # Position sizing — debit-per-contract is in $ (mid-leg dollars * 100).
+    from core.risk import size_position, RiskContext, RiskLimits
+    debit_per_contract_dollars = float(spread["debit_per_contract"]) * 100.0
+    margin_per_contract_dollars = debit_per_contract_dollars  # debit spread: max loss = debit
+    if req.contracts > 0:
+        contracts = req.contracts
+    else:
+        contracts = size_position(
+            equity=snapshot.equity,
+            debit_per_contract=debit_per_contract_dollars,
+            margin_per_contract=margin_per_contract_dollars,
+            mode=req.position_size_method or "fixed",
+            fixed_contracts=1,
+            risk_percent=req.risk_percent,
+            max_allocation_cap=req.max_allocation_cap,
+            excess_liquidity=snapshot.excess_liquidity,
+        )
+
+    if contracts <= 0:
+        return {"error": "sizing_zero", "reason": "position sizer returned 0 contracts"}
+
+    # Pre-trade risk gate.  Disable market-hours check for moomoo simulate
+    # accounts (they accept orders 24/7) but keep all other gates active.
+    # Allow callers to opt into bypassing the event-blackout gate for
+    # smoke-testing only (req.bypass_event_blackout); never set in scanner.
+    from core.calendar import load_event_calendar
+    is_simulate = getattr(broker, "_trd_env_int", 1) == 0
+    limits = RiskLimits.from_settings()
+    from dataclasses import replace
+    if is_simulate:
+        limits = replace(limits, require_market_open=False)
+    if req.bypass_event_blackout:
+        limits = replace(limits, block_on_events=False)
+        journal.log_event("bypass_event_blackout", subject=req.symbol, payload={
+            "broker": "moomoo", "client_order_id": client_id,
+            "warning": "test-only flag — production scanner must NOT set this",
+        })
+    ctx = RiskContext(
+        account=snapshot,
+        open_positions=len(journal.list_open()),
+        today_realized_pnl=journal.today_realized_pnl(),
+        debit_per_contract=debit_per_contract_dollars,
+        margin_per_contract=margin_per_contract_dollars,
+        contracts=contracts,
+        target_dte=req.target_dte,
+        limits=limits,
+        events=load_event_calendar(),
+    )
+    decision = evaluate_pre_trade(ctx)
+    if not decision.allowed:
+        journal.log_event("risk_rejected", subject=req.symbol, payload={
+            "reason": decision.reason, "broker": "moomoo", **decision.details,
+        })
+        return {"error": "risk_gate_blocked", "reason": decision.reason, **decision.details}
+
+    # Build spread request
+    expiry_ymd = target_date.strftime("%Y%m%d")
+    spread_req = SpreadRequest(
+        symbol=req.symbol,
+        long_leg=LegSpec(expiry=expiry_ymd, strike=spread["K_long"], right=right,
+                         price=round(spread["long_ask"], 2)),
+        short_leg=LegSpec(expiry=expiry_ymd, strike=spread["K_short"], right=right,
+                          price=round(spread["short_bid"], 2)),
+        qty=contracts,
+        net_debit_limit=round(spread["debit_per_contract"] * 100 * contracts, 2),
+        position_id=client_id,
+        client_order_id=client_id,
+    )
+
+    # Execute
+    try:
+        order_result = await broker.place_spread(spread_req)
+    except Exception as exc:
+        journal.log_event("order_failed", subject=req.symbol, payload={
+            "broker": "moomoo", "client_order_id": client_id, "error": str(exc),
+            "K_long": spread["K_long"], "K_short": spread["K_short"],
+        })
+        return {"error": "order_failed", "reason": str(exc)}
+
+    if order_result.get("status") != "ok":
+        # Log the broker's rejection (e.g., long_leg_timeout) so the audit
+        # trail shows what was attempted even when no position was opened.
+        journal.log_event("order_rejected", subject=req.symbol, payload={
+            "broker": "moomoo", "client_order_id": client_id,
+            "K_long": spread["K_long"], "K_short": spread["K_short"],
+            **order_result,
+        })
+        return {"error": "order_rejected", **order_result}
+
+    # Journal
+    from core.journal import PositionState
+    legs = [
+        {"expiry": expiry_ymd, "strike": spread["K_long"], "right": right,
+         "side": "long", "qty": contracts},
+        {"expiry": expiry_ymd, "strike": spread["K_short"], "right": right,
+         "side": "short", "qty": contracts},
+    ]
+    pos_id = journal.open_position(
+        symbol=req.symbol,
+        topology="vertical_spread",
+        direction=req.direction,
+        contracts=contracts,
+        entry_cost=spread["debit_per_contract"] * 100,
+        expiry=expiry_ymd,
+        legs=legs,
+        broker="moomoo",
+        broker_order_id=order_result.get("leg1_order_id", ""),
+        stop_loss_pct=req.stop_loss_pct,
+        take_profit_pct=req.take_profit_pct,
+        trailing_stop_pct=req.trailing_stop_pct,
+        idempotency_key=client_id,
+        meta={"broker": "moomoo", "legs": legs, **order_result},
+    )
+
+    # Notify
+    try:
+        from core.notifier import send_trade_alert
+        send_trade_alert(
+            symbol=req.symbol,
+            direction=req.direction,
+            contracts=contracts,
+            entry_cost=spread["debit_per_contract"] * 100,
+            broker="moomoo",
+        )
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "position_id": pos_id,
+        "contracts": contracts,
+        "K_long": spread["K_long"],
+        "K_short": spread["K_short"],
+        "debit_per_contract": spread["debit_per_contract"],
+        "leg1_order_id": order_result.get("leg1_order_id"),
+        "leg2_order_id": order_result.get("leg2_order_id"),
+        "client_order_id": client_id,
+    }
+
+
 # ── Journal API endpoints ─────────────────────────────────────────────────
 
 @app.get("/api/journal/positions")
@@ -1490,6 +2873,80 @@ def journal_events(limit: int = 50):
     return _safe_json({"events": get_journal().recent_events(limit)})
 
 
+@app.get("/api/journal/reconciliation")
+def journal_reconciliation(date: Optional[str] = None):
+    """EOD commission/slippage reconciliation report.
+
+    Optional query param ``?date=YYYY-MM-DD`` selects the day; defaults to today.
+    """
+    from core.journal import get_journal
+    return _safe_json(get_journal().daily_reconciliation_report(date))
+
+
+@app.post("/api/orders/cleanup-stale")
+def cleanup_stale_orders(max_age_hours: int = 24):
+    """Mark stale orders + their positions as cancelled.
+
+    Cleans:
+    - orders stuck in submitted/submitting/pending older than max_age_hours → cancelled
+    - positions in 'pending' state with no live order older than max_age_hours → closed
+
+    Useful when IBKR/moomoo was disconnected mid-fill, leaving rows that block
+    fresh trades (fill_watcher keeps polling, max_concurrent_positions blocks
+    new entries).
+    """
+    from core.journal import get_journal
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat(timespec="seconds")
+    j = get_journal()
+    with j._lock:
+        cur = j._conn.cursor()
+
+        # Stale orders
+        cur.execute(
+            "SELECT id, broker, broker_order_id, position_id, submitted_at FROM orders "
+            "WHERE status IN ('submitted','submitting','pending') AND submitted_at < ?",
+            (cutoff,),
+        )
+        stale_orders = [dict(r) for r in cur.fetchall()]
+
+        # Stale pending/closing positions
+        cur.execute(
+            "SELECT id, symbol, broker, state, entry_time FROM positions "
+            "WHERE state IN ('pending','closing') AND entry_time < ?",
+            (cutoff,),
+        )
+        stale_positions = [dict(r) for r in cur.fetchall()]
+
+        if stale_orders or stale_positions:
+            j._conn.execute("BEGIN")
+            try:
+                for r in stale_orders:
+                    j._conn.execute(
+                        "UPDATE orders SET status='cancelled' WHERE id=?",
+                        (r["id"],),
+                    )
+                for r in stale_positions:
+                    j._conn.execute(
+                        "UPDATE positions SET state='closed', "
+                        "exit_reason=COALESCE(exit_reason,'stale_cleanup'), "
+                        "exit_time=COALESCE(exit_time, ?) "
+                        "WHERE id=?",
+                        (datetime.now(timezone.utc).isoformat(timespec="seconds"), r["id"]),
+                    )
+                j._conn.execute("COMMIT")
+            except Exception:
+                j._conn.execute("ROLLBACK")
+                raise
+    return {
+        "cleaned_orders": len(stale_orders),
+        "cleaned_positions": len(stale_positions),
+        "orders": stale_orders,
+        "positions": stale_positions,
+        "cutoff": cutoff,
+    }
+
+
 def _pos_to_dict(p) -> dict:
     return {
         "id": p.id, "symbol": p.symbol, "topology": p.topology,
@@ -1509,8 +2966,43 @@ def _pos_to_dict(p) -> dict:
 _last_monitor_tick_iso: Optional[str] = None
 
 
+def _has_ibkr_work() -> bool:
+    """True if the journal has any IBKR position open or order pending.
+
+    Used by monitor/fill_watcher schedulers to skip the IBKR connection
+    attempt when only moomoo work exists — avoids flooding the log with
+    'Connection refused' errors when TWS isn't running.
+    """
+    try:
+        from core.journal import get_journal
+        j = get_journal()
+        # Check for any open IBKR position or pending IBKR order.
+        with j._lock:
+            cur = j._conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM positions WHERE state='open' AND broker='ibkr' LIMIT 1"
+            )
+            if cur.fetchone():
+                return True
+            cur.execute(
+                "SELECT 1 FROM orders WHERE broker='ibkr' "
+                "AND status IN ('submitted','submitting','pending') LIMIT 1"
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        # If we can't query, fall back to "yes, try" so we don't lose orders.
+        return True
+
+
 def _run_monitor_tick():
-    """Sync wrapper that drives the async monitor tick from APScheduler."""
+    """Sync wrapper that drives the async monitor tick from APScheduler.
+
+    Builds the ``defaults`` dict explicitly — including the strategy-aware
+    ``bars_fetcher`` — so the monitor's ``_resolve_strategy_exit`` actually
+    has bars to evaluate. Without this, only stop/profit/trailing/expiry
+    gates fire; the strategy's own ``check_exit`` (e.g. consecutive-day
+    reversal) is dead code.
+    """
     import asyncio as _aio
     from core.monitor import tick
     from core.settings import SETTINGS
@@ -1520,25 +3012,76 @@ def _run_monitor_tick():
     if not is_leader():
         return
 
+    # Skip IBKR connection entirely when no IBKR work is queued.  Monitor
+    # still runs (so moomoo positions are evaluated) but with a None trader.
+    skip_ibkr = not _has_ibkr_work()
+
     async def _factory():
+        if skip_ibkr:
+            return None
         creds = SETTINGS.ibkr.as_dict()
         trader, _ = await get_ib_connection(creds)
         return trader
 
+    defaults = {
+        "stop_loss_pct": SETTINGS.risk.default_stop_loss_pct,
+        "take_profit_pct": SETTINGS.risk.default_take_profit_pct,
+        "trailing_stop_pct": SETTINGS.risk.default_trailing_stop_pct,
+        "dte_exit_at": 0,
+        "haircut_pct": SETTINGS.risk.limit_price_haircut,
+        # Wire the strategy-aware bars fetcher so check_exit() has data.
+        "bars_fetcher": _preset_bars_fetcher,
+    }
+
     global _last_monitor_tick_iso
+    loop = _MAIN_LOOP
+    if loop is None or not loop.is_running():
+        return  # app not fully started yet
     try:
-        loop = _aio.get_event_loop()
-        if loop.is_running():
-            _aio.ensure_future(tick(_factory))
-        else:
-            loop.run_until_complete(tick(_factory))
-        # I10: record successful drive (scheduling counts as a heartbeat).
+        future = _aio.run_coroutine_threadsafe(
+            tick(_factory, defaults=defaults), loop,
+        )
+        future.result(timeout=55)  # block until done; propagates exceptions
         _last_monitor_tick_iso = datetime.now(timezone.utc).isoformat(
             timespec="seconds"
         )
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning("monitor tick failed: %s", e)
+
+
+def _run_moomoo_reconcile():
+    """Sync wrapper that drives the moomoo orphan-leg reconciler.
+
+    Detects mismatches between OpenD's position_list_query and our journal:
+    - Orphan broker legs (broker has, journal doesn't) → CRITICAL alert
+    - Phantom journal positions (journal has, broker doesn't) → auto-close
+    """
+    import asyncio as _aio
+    from core.leader import is_leader
+    if not is_leader():
+        return
+    # No moomoo work? skip.
+    try:
+        from core.broker import _registry
+        if "moomoo" not in _registry:
+            return
+    except Exception:  # noqa: BLE001
+        return
+
+    async def _go():
+        from core.moomoo_reconciler import reconcile_once
+        return await reconcile_once()
+
+    loop = _MAIN_LOOP
+    if loop is None or not loop.is_running():
+        return
+    try:
+        future = _aio.run_coroutine_threadsafe(_go(), loop)
+        future.result(timeout=30)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("moomoo reconcile failed: %s", e)
 
 
 def _run_fill_reconcile():
@@ -1552,18 +3095,37 @@ def _run_fill_reconcile():
     if not is_leader():
         return
 
+    # Skip entirely when no broker reconciliation work is pending.
+    # fill_watcher routes per-order to the right broker registry so a None
+    # IBKR trader is fine — moomoo orders still reconcile via register_broker.
+    if not _has_ibkr_work():
+        # Still call reconcile_once with a None trader so any moomoo orders
+        # in the queue get reconciled via the broker registry path.
+        async def _go():
+            await reconcile_once(None, timeout_seconds=SETTINGS.risk.fill_timeout_seconds)
+        loop = _MAIN_LOOP
+        if loop is None or not loop.is_running():
+            return
+        try:
+            future = _aio.run_coroutine_threadsafe(_go(), loop)
+            future.result(timeout=55)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("fill reconcile (moomoo-only) failed: %s", e)
+        return
+
     async def _go():
         creds = SETTINGS.ibkr.as_dict()
         trader, _ = await get_ib_connection(creds)
         if trader:
-            await reconcile_once(trader)
+            await reconcile_once(trader, timeout_seconds=SETTINGS.risk.fill_timeout_seconds)
 
+    loop = _MAIN_LOOP
+    if loop is None or not loop.is_running():
+        return  # app not fully started yet
     try:
-        loop = _aio.get_event_loop()
-        if loop.is_running():
-            _aio.ensure_future(_go())
-        else:
-            loop.run_until_complete(_go())
+        future = _aio.run_coroutine_threadsafe(_go(), loop)
+        future.result(timeout=55)
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning("fill reconcile failed: %s", e)
@@ -1597,13 +3159,18 @@ def start_monitor(interval: int = 15):
 
     # Remove existing monitor jobs if re-registering
     for job in scheduler.get_jobs():
-        if job.id in ("live_monitor", "fill_watcher"):
+        if job.id in ("live_monitor", "fill_watcher", "moomoo_reconcile"):
             job.remove()
 
     scheduler.add_job(_run_monitor_tick, "interval", seconds=secs,
                       id="live_monitor", replace_existing=True)
     scheduler.add_job(_run_fill_reconcile, "interval", seconds=secs,
                       id="fill_watcher", replace_existing=True)
+    # Moomoo orphan-leg reconciler — runs at 4× monitor interval (e.g. every
+    # 60s if monitor is 15s) since it's read-only and doesn't need to be
+    # synchronous with fill polling.
+    scheduler.add_job(_run_moomoo_reconcile, "interval", seconds=max(secs * 4, 60),
+                      id="moomoo_reconcile", replace_existing=True)
 
     # I2: daily digest at 16:05 ET (after market close) — best-effort, no-op
     # when NOTIFY_WEBHOOK_URL is not configured.
@@ -1619,8 +3186,40 @@ def start_monitor(interval: int = 15):
         replace_existing=True,
     )
 
+    # Telegram bot polling — dormant unless TELEGRAM_BOT_TOKEN + CHAT_ID
+    # are set. Stateless poll; 3s default interval is responsive enough
+    # for human commands without hammering Telegram's API.
+    try:
+        from core.telegram_bot import configured as _tg_configured
+        from core.settings import SETTINGS
+        if _tg_configured():
+            tg_secs = max(int(SETTINGS.telegram.poll_interval_seconds), 1)
+            for job in scheduler.get_jobs():
+                if job.id == "telegram_bot":
+                    job.remove()
+            scheduler.add_job(_run_telegram_poll, "interval", seconds=tg_secs,
+                              id="telegram_bot", replace_existing=True)
+            log_event(_startup_log, "telegram_bot_registered",
+                      poll_interval_seconds=tg_secs)
+    except Exception as e:  # noqa: BLE001
+        log_event(_startup_log, "telegram_bot_register_failed",
+                  level=_logging.WARNING, error=str(e))
+
     log_event(_startup_log, "monitor_started", interval_seconds=secs)
     return {"status": "started", "interval_seconds": secs, "leader": True}
+
+
+def _run_telegram_poll():
+    """APScheduler wrapper — drain pending Telegram updates and dispatch
+    any registered slash-command handlers. No-op when not configured."""
+    try:
+        from core.telegram_bot import poll_once, configured as _tg_configured
+        if not _tg_configured():
+            return
+        poll_once()
+    except Exception as e:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).warning("telegram poll failed: %s", e)
 
 
 def _run_daily_digest():
@@ -1880,6 +3479,66 @@ def trigger_digest():
     digest = build_daily_digest(journal)
     sent = send_daily_digest(journal)
     return {"sent": sent, "digest": digest}
+
+
+@app.get("/api/telegram/status")
+def telegram_status():
+    """Report whether the Telegram bot is configured and active.
+
+    Returns whether ``TELEGRAM_BOT_TOKEN`` + ``TELEGRAM_CHAT_ID`` are set,
+    the masked chat id (so the operator can verify they didn't typo it),
+    and which slash commands are registered.
+    """
+    from core.telegram_bot import configured, list_commands
+    from core.settings import SETTINGS
+    poll_job = next(
+        (j for j in scheduler.get_jobs() if j.id == "telegram_bot"), None,
+    )
+    chat_id = SETTINGS.telegram.chat_id
+    masked_chat = (chat_id[:3] + "…" + chat_id[-3:]) if chat_id and len(chat_id) > 6 else (chat_id or "")
+    return {
+        "configured": configured(),
+        "chat_id_masked": masked_chat,
+        "poll_interval_seconds": SETTINGS.telegram.poll_interval_seconds,
+        "polling_active": poll_job is not None,
+        "commands": list_commands(),
+    }
+
+
+@app.post("/api/telegram/test")
+def telegram_test_message(payload: Optional[dict] = None):
+    """Send a test message to the configured chat.
+
+    Body optional: ``{"text": "..."}`` to override the default. Used by
+    the UI to confirm the token + chat id are working.
+    """
+    from core.telegram_bot import notify, configured
+    if not configured():
+        return {
+            "sent": False,
+            "error": "telegram_not_configured",
+            "detail": "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars and restart.",
+        }
+    text = (payload or {}).get("text") or (
+        "✅ *SPY Spread Bot test message*\n"
+        "If you can read this, your Telegram bot is wired up correctly. "
+        "Send /help for the command list."
+    )
+    sent = notify(text)
+    return {"sent": sent}
+
+
+@app.post("/api/telegram/poll_once")
+def telegram_poll_once_endpoint():
+    """Force one Telegram update poll. Useful for tests + manual debugging.
+
+    Normally polling runs every few seconds via APScheduler, but this lets
+    you drain pending updates synchronously without waiting for the next tick.
+    """
+    from core.telegram_bot import poll_once, configured
+    if not configured():
+        return {"error": "telegram_not_configured", "processed": 0}
+    return {"processed": poll_once()}
 
 
 @app.post("/api/monitor/stop")
