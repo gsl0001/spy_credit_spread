@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Trading Platform Wireframes</title>
+<style>
+  /* ── Reset / base ── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Courier New', Courier, monospace;
+    background: #fff;
+    color: #111;
+    padding: 40px 24px;
+  }
+
+  h1 {
+    text-align: center;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 36px;
+  }
+
+  /* ── Two-dashboard side-by-side ── */
+  .dashboards {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 32px;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+
+  /* ── Dashboard chrome ── */
+  .dashboard {
+    border: 2px solid #111;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .dash-title {
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    padding: 6px 10px 8px;
+    border-bottom: 2px solid #111;
+    text-transform: uppercase;
+  }
+  .dash-title u { text-decoration: underline; }
+
+  /* ── Generic wf-block ── */
+  .wf-block {
+    border: 1px solid #111;
+    padding: 8px 10px;
+    font-size: 11px;
+    position: relative;
+    min-height: 44px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  .wf-block .label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 2px;
+  }
+  .wf-block .sub {
+    font-size: 9px;
+    color: #555;
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  /* ── LIVE DASHBOARD rows ── */
+
+  /* Row 1: Account Info | IBKR Connection */
+  .live-r1 {
+    display: grid;
+    grid-template-columns: 1fr auto;
+  }
+  .live-r1 .ibkr { min-width: 110px; }
+
+  /* Row 2: Monitor | Kill | Alerts */
+  .live-r2 {
+    display: grid;
+    grid-template-columns: auto auto 1fr;
+  }
+  .live-r2 .monitor { width: 96px; }
+  .live-r2 .kill    { width: 64px; }
+
+  /* Row 3: Scanner | Scanning Shows */
+  .live-r3 { display: grid; grid-template-columns: 1fr 1fr; }
+
+  /* Row 4: Signals | Positions */
+  .live-r4 { display: grid; grid-template-columns: 1fr 1fr; }
+
+  /* Row 5: Order Ticket full-width */
+  .live-r5 {}
+  .live-r5 .wf-block { min-height: 52px; }
+
+  /* Row 6: blank lower area (as per wireframe) */
+  .live-r6 .wf-block { min-height: 80px; border-top: none; }
+
+  /* ── BACK-TESTER rows ── */
+
+  /* Row 0: Header KPIs */
+  .bt-header .wf-block { min-height: 40px; }
+
+  /* Main grid: left-rail | center | right */
+  .bt-main {
+    display: grid;
+    grid-template-columns: 100px 1fr 80px;
+    grid-template-rows: auto auto auto auto auto;
+  }
+
+  /* Strategy & Capital — spans rows 1-2 */
+  .bt-strategy {
+    grid-column: 1;
+    grid-row: 1 / 3;
+  }
+  .bt-strategy .wf-block { height: 100%; min-height: 120px; }
+
+  /* Historic chart — spans rows 1-2, col 2 */
+  .bt-chart {
+    grid-column: 2;
+    grid-row: 1 / 3;
+  }
+  .bt-chart .wf-block { height: 100%; min-height: 120px; justify-content: center; text-align: center; }
+
+  /* Equity drawdown — col 3, rows 1-2 */
+  .bt-equity {
+    grid-column: 3;
+    grid-row: 1 / 3;
+  }
+  .bt-equity .wf-block { height: 100%; min-height: 120px; text-align: center; }
+
+  /* Stats — col 1, row 3 */
+  .bt-stats {
+    grid-column: 1;
+    grid-row: 3;
+  }
+
+  /* Stats chart area — col 2-3, row 3 */
+  .bt-stats-chart {
+    grid-column: 2 / 4;
+    grid-row: 3;
+  }
+
+  /* Filters — col 1, rows 4-5 */
+  .bt-filters {
+    grid-column: 1;
+    grid-row: 4 / 6;
+  }
+  .bt-filters .wf-block { height: 100%; min-height: 80px; }
+
+  /* Trades list — col 2-3, row 4 */
+  .bt-trades {
+    grid-column: 2 / 4;
+    grid-row: 4;
+  }
+  .bt-trades .wf-block { min-height: 70px; }
+
+  /* Analytics — col 1 row 5 (empty, fills via bt-filters) */
+  /* Analytics label row — col 2, row 5 */
+  .bt-analytics {
+    grid-column: 2;
+    grid-row: 5;
+  }
+
+  /* Optimiser — col 3, row 5 */
+  .bt-optimiser {
+    grid-column: 3;
+    grid-row: 5;
+  }
+</style>
+</head>
+<body>
+
+<h1>Trading Platform Wireframes</h1>
+
+<div class="dashboards">
+
+  <!-- ══════════════ LIVE DASHBOARD ══════════════ -->
+  <div>
+    <div class="dashboard">
+      <div class="dash-title"><u>LIVE</u> DASHBOARD</div>
+
+      <!-- Row 1: Account Info | IBKR Connection -->
+      <div class="live-r1">
+        <div class="wf-block">
+          <div class="label">Account Info</div>
+          <div class="sub">Equity · Buying Power · Cash · Day P&amp;L</div>
+        </div>
+        <div class="wf-block ibkr">
+          <div class="label">IBKR</div>
+          <div class="label">Connection</div>
+          <div class="label">Section</div>
+        </div>
+      </div>
+
+      <!-- Row 2: Monitor | Kill | Alerts -->
+      <div class="live-r2">
+        <div class="wf-block monitor">
+          <div class="label">Monitor</div>
+          <div class="label">Heartbeat</div>
+          <div class="sub">▮▮▯▮▮</div>
+        </div>
+        <div class="wf-block kill">
+          <div class="label">Kill</div>
+          <div class="label">Switch</div>
+        </div>
+        <div class="wf-block">
+          <div class="label">Alerts</div>
+          <div class="sub">risk breach · rejected orders</div>
+        </div>
+      </div>
+
+      <!-- Row 3: Scanner | Scanning Shows -->
+      <div class="live-r3">
+        <div class="wf-block">
+          <div class="label">Scanner –</div>
+          <div class="label">Load Presets</div>
+          <div class="sub">▾ select · Start · Stop</div>
+        </div>
+        <div class="wf-block">
+          <div class="label">Scanning Shows</div>
+          <div class="sub">(Preset info)</div>
+          <div class="sub">active preset · last tick · count</div>
+        </div>
+      </div>
+
+      <!-- Row 4: Signals | Positions -->
+      <div class="live-r4">
+        <div class="wf-block">
+          <div class="label">Signals Log.</div>
+          <div class="sub">time · sym · side · qty</div>
+        </div>
+        <div class="wf-block">
+          <div class="label">Positions.</div>
+          <div class="sub">sym · side · qty · entry · P&amp;L</div>
+        </div>
+      </div>
+
+      <!-- Row 5: Order Ticket -->
+      <div class="live-r5">
+        <div class="wf-block">
+          <div class="label">Order Ticket</div>
+          <div class="sub">symbol · topology · width · DTE · contracts · est. cost</div>
+          <div class="sub">chain preview &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; [ Preview ] &nbsp; [ Submit ]</div>
+        </div>
+      </div>
+
+      <!-- Row 6: blank area -->
+      <div class="live-r6">
+        <div class="wf-block" style="min-height:80px;border-top:none;">
+          <div class="sub" style="color:#bbb;text-align:center;">&nbsp;</div>
+        </div>
+      </div>
+
+    </div><!-- .dashboard -->
+  </div>
+
+
+  <!-- ══════════════ BACK-TESTER DASHBOARD ══════════════ -->
+  <div>
+    <div class="dashboard">
+      <div class="dash-title">BACK-TESTER DASHBOARD</div>
+
+      <!-- Header KPIs -->
+      <div class="bt-header">
+        <div class="wf-block">
+          <div class="label">Header &nbsp;(Keep Same)</div>
+          <div class="sub">Total Return · Sharpe · Max DD · Win Rate · Trades</div>
+        </div>
+      </div>
+
+      <!-- Main grid -->
+      <div class="bt-main">
+
+        <!-- Strategy & Capital (col 1, rows 1-2) -->
+        <div class="bt-strategy">
+          <div class="wf-block">
+            <div class="label">Strategy</div>
+            <div class="label">and</div>
+            <div class="label">Capital</div>
+            <div class="sub" style="margin-top:4px;">ticker · capital · sizing method · strategy engine · params</div>
+          </div>
+        </div>
+
+        <!-- Historic chart (col 2, rows 1-2) -->
+        <div class="bt-chart">
+          <div class="wf-block">
+            <div class="label" style="text-align:center;">Historic Chrt<br>With Trades</div>
+            <div class="sub" style="text-align:center;margin-top:6px;">price · entries · exits</div>
+          </div>
+        </div>
+
+        <!-- Equity drawdown (col 3, rows 1-2) -->
+        <div class="bt-equity">
+          <div class="wf-block">
+            <div class="label">Equity</div>
+            <div class="label">draw</div>
+            <div class="label">down</div>
+            <div class="sub" style="margin-top:4px;">under-water curve</div>
+          </div>
+        </div>
+
+        <!-- Stats (col 1, row 3) -->
+        <div class="bt-stats">
+          <div class="wf-block">
+            <div class="label">Stats</div>
+            <div class="sub">PF · avg P&amp;L</div>
+          </div>
+        </div>
+
+        <!-- Stats chart area (col 2-3, row 3) -->
+        <div class="bt-stats-chart">
+          <div class="wf-block" style="min-height:44px;">
+            <div class="sub" style="color:#bbb;text-align:center;">&nbsp;</div>
+          </div>
+        </div>
+
+        <!-- Filters (col 1, rows 4-5) -->
+        <div class="bt-filters">
+          <div class="wf-block">
+            <div class="label">Filters</div>
+            <div class="sub">RSI · EMA · SMA200 · Volume · VIX · Regime</div>
+            <div style="margin-top:8px;">
+              <div class="label">Analytics</div>
+              <div class="sub">MC · Walk-fwd</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Trades list (col 2-3, row 4) -->
+        <div class="bt-trades">
+          <div class="wf-block">
+            <div class="label">Trades &nbsp;(List)</div>
+            <div class="sub">date · side · qty · entry · exit · P&amp;L · tag</div>
+          </div>
+        </div>
+
+        <!-- Analytics (col 2, row 5) -->
+        <div class="bt-analytics">
+          <div class="wf-block">
+            <div class="label">Analytics</div>
+            <div class="sub">rolling sharpe · drawdown dist · MC histogram</div>
+          </div>
+        </div>
+
+        <!-- Optimiser (col 3, row 5) -->
+        <div class="bt-optimiser">
+          <div class="wf-block">
+            <div class="label">Optimiser</div>
+            <div class="sub">param X/Y heatmap</div>
+          </div>
+        </div>
+
+      </div><!-- .bt-main -->
+    </div><!-- .dashboard -->
+  </div>
+
+</div><!-- .dashboards -->
+
+
+</body>
+</html>
