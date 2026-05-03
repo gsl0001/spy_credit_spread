@@ -129,6 +129,28 @@ export function MoomooView() {
     localStorage.setItem('moomoo_sec_firm', secFirm);
   };
 
+  // Refresh helpers — must be defined BEFORE any callback that lists
+  // them in its dependency array.  JS const declarations aren't hoisted
+  // as initialized, so referencing them earlier throws ReferenceError
+  // and the whole view renders blank.
+  const refreshAccount = useCallback(async () => {
+    if (!connected) return;
+    try {
+      const res = await api.moomoo.account();
+      if (!res?.error) setAccount(res);
+    } catch (_) {}
+  }, [connected]);
+
+  const refreshPositions = useCallback(async () => {
+    // Pull from journal so we have position_id + legs for Close.
+    // Filter to moomoo so we don't show IBKR positions in the moomoo view.
+    try {
+      const res = await api.openPositions();
+      const all = res?.positions || [];
+      setPositions(all.filter(p => (p.broker || 'ibkr') === 'moomoo'));
+    } catch (_) {}
+  }, []);
+
   const doConnect = useCallback(async () => {
     if (connBusy) return;
     persistConn();
@@ -296,24 +318,6 @@ export function MoomooView() {
       setScannerBusy(false);
     }
   }, [scannerBusy]);
-
-  const refreshAccount = useCallback(async () => {
-    if (!connected) return;
-    try {
-      const res = await api.moomoo.account();
-      if (!res?.error) setAccount(res);
-    } catch (_) {}
-  }, [connected]);
-
-  const refreshPositions = useCallback(async () => {
-    // Pull from journal so we have position_id + legs for Close.
-    // Filter to moomoo so we don't show IBKR positions in the moomoo view.
-    try {
-      const res = await api.openPositions();
-      const all = res?.positions || [];
-      setPositions(all.filter(p => (p.broker || 'ibkr') === 'moomoo'));
-    } catch (_) {}
-  }, []);
 
   useEffect(() => {
     // Always poll journal positions (so user sees what was opened even if
