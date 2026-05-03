@@ -1,16 +1,79 @@
+import { useState, useCallback } from 'react';
 import { Ico } from './icons.jsx';
 import { Pill, Sparkline } from './primitives.jsx';
+
+const LS_IBKR_AUTO = 'spy_ibkr_auto_reconnect';
+const LS_MOOMOO_AUTO = 'spy_moomoo_auto_reconnect';
+
+function BrokerPill({ label, icon, status, reconnecting, attempt, autoOn, onToggleAuto }) {
+  const statusLabel = reconnecting
+    ? `RECON #${attempt}`
+    : status === 'live' ? 'ON'
+    : status === 'warn' ? 'STALE'
+    : 'OFF';
+
+  const kind = reconnecting ? 'warn' : status;
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+      <Pill kind={kind}>
+        <Ico name={icon} size={11} /> {label} {statusLabel}
+      </Pill>
+      <button
+        onClick={onToggleAuto}
+        title={`Auto-reconnect: ${autoOn ? 'ON — click to disable' : 'OFF — click to enable'}`}
+        style={{
+          background: 'none',
+          border: `1px solid ${autoOn ? 'var(--pos)' : 'var(--border-soft)'}`,
+          borderRadius: 4,
+          padding: '3px 4px',
+          cursor: 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: autoOn ? 'var(--pos)' : 'var(--text-3)',
+          transition: 'all .2s',
+          opacity: autoOn ? 1 : 0.5,
+        }}
+      >
+        <Ico name="refresh" size={12} />
+      </button>
+    </div>
+  );
+}
 
 export function Topbar({ view, mkt, spy, conn, onPanic, leader, onBell, alertCount }) {
   const titles = {
     live:     ['Live Trading',      'IBKR · SPY Bull Call Spreads'],
     paper:    ['Paper Trading',     'Alpaca · Signal Surrogate'],
+    moomoo:   ['Moomoo Trading',    'moomoo OpenD · legged spreads'],
     backtest: ['Backtest',          'Strategy Research & Parameter Sweep'],
     journal:  ['Trade Journal',     'Positions, Orders, P&L History'],
     risk:     ['Risk & Guardrails', 'Pre-trade gates, sizing, event blackout'],
     scanner:  ['Scanner',           'Signal Feed with Persistence'],
   };
   const [title, sub] = titles[view] || ['', ''];
+
+  const [ibkrAuto, setIbkrAuto] = useState(() => localStorage.getItem(LS_IBKR_AUTO) !== 'false');
+  const [moomooAuto, setMoomooAuto] = useState(() => localStorage.getItem(LS_MOOMOO_AUTO) !== 'false');
+
+  const toggleIbkrAuto = useCallback(() => {
+    setIbkrAuto(prev => {
+      const next = !prev;
+      localStorage.setItem(LS_IBKR_AUTO, String(next));
+      return next;
+    });
+  }, []);
+
+  const toggleMoomooAuto = useCallback(() => {
+    setMoomooAuto(prev => {
+      const next = !prev;
+      localStorage.setItem(LS_MOOMOO_AUTO, String(next));
+      return next;
+    });
+  }, []);
+
+  const moo = conn.moomoo || { status: 'off', reconnecting: false, attempt: 0 };
 
   return (
     <header className="topbar">
@@ -41,9 +104,25 @@ export function Topbar({ view, mkt, spy, conn, onPanic, leader, onBell, alertCou
         <Ico name="lock" size={11} /> {leader.is_leader ? 'LEADER' : 'FOLLOWER'}
       </Pill>
 
-      <Pill kind={conn.ibkr}>
-        <Ico name="server" size={11} /> IBKR {conn.ibkr === 'live' ? 'LIVE' : conn.ibkr === 'warn' ? 'RECON' : 'OFF'}
-      </Pill>
+      <BrokerPill
+        label="IBKR"
+        icon="server"
+        status={conn.ibkr}
+        reconnecting={false}
+        attempt={0}
+        autoOn={ibkrAuto}
+        onToggleAuto={toggleIbkrAuto}
+      />
+
+      <BrokerPill
+        label="MOOMOO"
+        icon="zap"
+        status={moo.status}
+        reconnecting={moo.reconnecting}
+        attempt={moo.attempt}
+        autoOn={moomooAuto}
+        onToggleAuto={toggleMoomooAuto}
+      />
 
       <button className="btn ghost icon" onClick={onBell} style={{ position: 'relative' }}>
         <Ico name="bell" size={16} />

@@ -258,7 +258,7 @@ async def resolve_bull_call_spread(
     a live order" rather than retrying forever.
     """
     try:
-        from ibkr_trading import Option, Stock
+        from brokers.ibkr_trading import Option, Stock
     except ImportError:
         return None
 
@@ -401,7 +401,7 @@ async def resolve_bull_call_spread_with_diagnostics(
     (spread_or_None, diagnostics)
     """
     try:
-        from ibkr_trading import Option, Stock
+        from brokers.ibkr_trading import Option, Stock
     except ImportError:
         return None, {"error": "ib_insync not available"}
 

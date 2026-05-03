@@ -292,7 +292,7 @@ def _cmd_help(_args):
 def _cmd_status(_args):
     try:
         from core.journal import get_journal
-        from ibkr_trading import _ib_instances
+        from brokers.ibkr_trading import _ib_instances
         from core.settings import SETTINGS
         from core.calendar import is_market_open
         j = get_journal()

@@ -12,7 +12,7 @@ export function LiveView() {
   const [port, setPort] = useState(IBKR_CREDS.port);
   const [clientId, setClientId] = useState(IBKR_CREDS.client_id);
   const [ibkrAccount, setIbkrAccount] = useState(null);
-  const [ibkrPositions, setIbkrPositions] = useState([]);
+
   const [journalPositions, setJournalPositions] = useState([]);
   const [connectMsg, setConnectMsg] = useState('');
   const [ticketMsg, setTicketMsg] = useState('');
@@ -54,8 +54,8 @@ export function LiveView() {
       if (res?.connected) {
         setIbkrAccount(res.summary);
         setConnectMsg(`Connected · ${res.summary?.account_id || ''}`);
-        const [p, j] = await Promise.all([safe(api.ibkrPositions), safe(api.openPositions)]);
-        if (p?.positions) setIbkrPositions(p.positions);
+        const [, j] = await Promise.all([safe(api.ibkrPositions), safe(api.openPositions)]);
+
         if (j?.positions) setJournalPositions(j.positions);
       } else {
         setConnectMsg(res?.error || 'Connect failed');
@@ -66,7 +66,7 @@ export function LiveView() {
 
   const disconnect = useCallback(() => {
     setIbkrAccount(null);
-    setIbkrPositions([]);
+
     setJournalPositions([]);
     setConnectMsg('Disconnected');
   }, []);
@@ -84,14 +84,13 @@ export function LiveView() {
     (async () => {
       const hb = await safe(api.heartbeat);
       if (cancelled || !hb?.alive) return;
-      const [a, p, j] = await Promise.all([
+      const [a, , j] = await Promise.all([
         safe(api.ibkrConnect),
         safe(api.ibkrPositions),
         safe(api.openPositions),
       ]);
       if (cancelled) return;
       if (a?.connected) setIbkrAccount(a.summary);
-      if (p?.positions) setIbkrPositions(p.positions);
       if (j?.positions) setJournalPositions(j.positions);
       setConnectMsg(`Connected · ${a?.summary?.account_id || ''}`);
     })();
@@ -108,7 +107,7 @@ export function LiveView() {
         }
         return;
       }
-      const [a, p, j] = await Promise.all([
+      const [a, , j] = await Promise.all([
         safe(api.ibkrConnect),
         safe(api.ibkrPositions),
         safe(api.openPositions),
@@ -118,7 +117,6 @@ export function LiveView() {
         setIbkrAccount(a.summary);
         setConnectMsg(`Connected · ${a.summary?.account_id || ''}`);
       }
-      if (p?.positions) setIbkrPositions(p.positions);
       if (j?.positions) setJournalPositions(j.positions);
     };
 
@@ -224,7 +222,9 @@ export function LiveView() {
   }, [activePreset]);
 
   const stopPreset = useCallback(async () => {
-    try { await api.presetScannerStop(); } catch (_) {}
+    try { await api.presetScannerStop(); } catch {
+      // Ignored
+    }
     setScannerRunning(false);
     setScannerMsg('Stopped');
   }, []);
@@ -512,7 +512,7 @@ export function LiveView() {
         <Card title="Positions" icon="dashboard"
               subtitle={connected ? `${journalPositions.length} tracked` : 'not connected'}
               flush
-              actions={connected && <Btn variant="ghost" size="sm" icon="refresh" onClick={async()=>{ const p=await safe(api.ibkrPositions); if(p?.positions) setIbkrPositions(p.positions); const j=await safe(api.openPositions); if(j?.positions) setJournalPositions(j.positions); }} />}>
+              actions={connected && <Btn variant="ghost" size="sm" icon="refresh" onClick={async()=>{ const j=await safe(api.openPositions); if(j?.positions) setJournalPositions(j.positions); }} />}>
           <div style={{ maxHeight: 220, overflowY: 'auto' }}>
             {!connected ? (
               <div style={{padding:60,textAlign:'center',color:'var(--text-3)',fontSize:12}}>
@@ -528,7 +528,7 @@ export function LiveView() {
                   {journalPositions.length === 0 && (
                     <tr><td colSpan="4" style={{textAlign:'center',padding:40,color:'var(--text-3)',fontSize:12}}>No open journal positions</td></tr>
                   )}
-                  {journalPositions.map((p,i)=>(
+                  {journalPositions.map((p)=>(
                     <tr key={p.id}>
                       <td>
                         <div className="mono" style={{fontSize:11.5,fontWeight:600}}>{p.symbol}</div>

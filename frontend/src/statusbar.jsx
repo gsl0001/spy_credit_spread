@@ -64,8 +64,14 @@ function TelegramPill() {
   );
 }
 
-export function Statusbar({ online, ibkr, mkt, positions, dailyPnl, openPositions }) {
+export function Statusbar({ online, ibkr, moomoo, mkt, positions, dailyPnl, openPositions }) {
   const ibkrLabel = ibkr === 'live' ? 'LIVE' : ibkr === 'warn' ? 'RECON' : 'OFF';
+  const mooStatus = moomoo?.status || 'off';
+  const mooLabel = moomoo?.reconnecting
+    ? `RECON #${moomoo.attempt || 0}`
+    : mooStatus === 'live' ? 'ON'
+    : mooStatus === 'warn' ? 'STALE'
+    : 'OFF';
   const pnlPos = dailyPnl >= 0;
 
   return (
@@ -80,6 +86,13 @@ export function Statusbar({ online, ibkr, mkt, positions, dailyPnl, openPosition
       <div className="sb__group">
         <span className={`sb__dot ${ibkr}`} />
         <span className="sb__label">IBKR {ibkrLabel}</span>
+      </div>
+
+      <div className="sb__sep" />
+
+      <div className="sb__group">
+        <span className={`sb__dot ${mooStatus}`} />
+        <span className="sb__label">MOOMOO {mooLabel}</span>
       </div>
 
       <div className="sb__sep" />

@@ -14,7 +14,7 @@ const C = {
   btn:        { background: '#f97316', color: '#000', border: 'none' },
 };
 
-const OCard = ({ title, icon, subtitle, children, flush, right }) => (
+const OCard = ({ title, subtitle, children, flush, right }) => (
   <div style={{
     background: C.cardBg, border: `1px solid ${C.cardBorder}`,
     borderRadius: 10, overflow: 'hidden',
@@ -121,13 +121,19 @@ export function MoomooView() {
   const [scannerBusy, setScannerBusy] = useState(false);
   const [scannerMsg, setScannerMsg] = useState('');
 
-  const persistConn = () => {
+  // 0DTE Order Flow Bot state
+  const [zeroDteActive, setZeroDteActive] = useState(false);
+  const [zeroDteMsg, setZeroDteMsg] = useState('');
+  const [zeroDteBusy, setZeroDteBusy] = useState(false);
+  const [zeroDteInfo, setZeroDteInfo] = useState(null);
+
+const persistConn = useCallback(() => {
     localStorage.setItem('moomoo_host', host);
     localStorage.setItem('moomoo_port', port);
     localStorage.setItem('moomoo_pwd', tradePwd);
     localStorage.setItem('moomoo_trd_env', String(trdEnv));
     localStorage.setItem('moomoo_sec_firm', secFirm);
-  };
+  }, [host, port, tradePwd, trdEnv, secFirm]);
 
   // Refresh helpers — must be defined BEFORE any callback that lists
   // them in its dependency array.  JS const declarations aren't hoisted
@@ -138,7 +144,9 @@ export function MoomooView() {
     try {
       const res = await api.moomoo.account();
       if (!res?.error) setAccount(res);
-    } catch (_) {}
+    } catch {
+      // Ignored
+    }
   }, [connected]);
 
   const refreshPositions = useCallback(async () => {
@@ -148,7 +156,9 @@ export function MoomooView() {
       const res = await api.openPositions();
       const all = res?.positions || [];
       setPositions(all.filter(p => (p.broker || 'ibkr') === 'moomoo'));
-    } catch (_) {}
+    } catch {
+      // Ignored
+    }
   }, []);
 
   const doConnect = useCallback(async () => {
@@ -176,19 +186,23 @@ export function MoomooView() {
         try {
           const p = await api.moomoo.probe({ host, port: Number(port) });
           if (p?.ok) setProbedAccounts(p.accounts || []);
-        } catch (_) {}
+        } catch {
+          // Ignored
+        }
       }
     } catch (e) {
       setConnMsg(`✗ ${e.message}`);
     } finally {
       setConnBusy(false);
     }
-  }, [connBusy, host, port, tradePwd, trdEnv, secFirm]);
+  }, [connBusy, host, port, tradePwd, trdEnv, secFirm, persistConn]);
 
   const doDisconnect = useCallback(async () => {
     try {
       await api.moomoo.disconnect();
-    } catch (_) {}
+    } catch {
+      // Ignored
+    }
     setConnected(false);
     setAccId('');
     setAccount(null);
@@ -253,7 +267,9 @@ export function MoomooView() {
       if (moomooOnly.length && !moomooOnly.find(p => p.name === selectedPreset)) {
         setSelectedPreset(moomooOnly[0].name);
       }
-    } catch (_) {}
+    } catch {
+      // Ignored
+    }
   }, [selectedPreset]);
 
   const refreshScannerStatus = useCallback(async () => {
@@ -261,7 +277,9 @@ export function MoomooView() {
       const s = await api.presetScannerStatus();
       setScannerActive(!!s?.active);
       setScannerPreset(s?.preset || null);
-    } catch (_) {}
+    } catch {
+      // Ignored
+    }
   }, []);
 
   const doScannerStart = useCallback(async () => {
@@ -319,6 +337,50 @@ export function MoomooView() {
     }
   }, [scannerBusy]);
 
+  const doZeroDteStart = useCallback(async () => {
+    if (zeroDteBusy) return;
+    setZeroDteBusy(true);
+    setZeroDteMsg('Starting 0DTE Bot…');
+    try {
+      const res = await api.moomoo.zeroDteStart();
+      if (res?.error) {
+        setZeroDteMsg(`✗ ${res.error}`);
+      } else {
+        setZeroDteActive(true);
+        setZeroDteMsg('✓ Subscribed to tick flow');
+      }
+    } catch (e) {
+      setZeroDteMsg(`✗ ${e.message}`);
+    } finally {
+      setZeroDteBusy(false);
+    }
+  }, [zeroDteBusy]);
+
+  const doZeroDteStop = useCallback(async () => {
+    if (zeroDteBusy) return;
+    setZeroDteBusy(true);
+    try {
+      await api.moomoo.zeroDteStop();
+      setZeroDteActive(false);
+      setZeroDteInfo(null);
+      setZeroDteMsg('Stopped');
+    } catch (e) {
+      setZeroDteMsg(`✗ ${e.message}`);
+    } finally {
+      setZeroDteBusy(false);
+    }
+  }, [zeroDteBusy]);
+
+  const refreshZeroDteStatus = useCallback(async () => {
+    try {
+      const s = await api.moomoo.zeroDteStatus();
+      setZeroDteActive(!!s?.running);
+      setZeroDteInfo(s);
+    } catch {
+      // Ignored
+    }
+  }, []);
+
   useEffect(() => {
     // Always poll journal positions (so user sees what was opened even if
     // they reload before reconnecting).  Account refresh requires connect.
@@ -333,9 +395,13 @@ export function MoomooView() {
   useEffect(() => {
     loadPresets();
     refreshScannerStatus();
-    const id = setInterval(refreshScannerStatus, 10000);
+    refreshZeroDteStatus();
+    const id = setInterval(() => {
+      refreshScannerStatus();
+      refreshZeroDteStatus();
+    }, 10000);
     return () => clearInterval(id);
-  }, [loadPresets, refreshScannerStatus]);
+  }, [loadPresets, refreshScannerStatus, refreshZeroDteStatus]);
 
   const doExecute = useCallback(async () => {
     if (execBusy) return;
@@ -626,6 +692,58 @@ export function MoomooView() {
               ORB strategy trades only on Mon/Wed/Fri when VIX is 15-25, the OR range
               ≥ 0.05% of price, and the day is not a scheduled high-impact news day
               (FOMC, NFP, CPI). Today (2026-04-29) is FOMC and will be skipped.
+            </div>
+          </OCard>
+
+          {/* ── 0DTE Order Flow Bot ── */}
+          <OCard title="0DTE Order Flow Bot" subtitle="Native tick-level SPY absorption & delta signals">
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
+              {!zeroDteActive ? (
+                <OBtn onClick={doZeroDteStart} disabled={!connected || zeroDteBusy}>
+                  {zeroDteBusy ? '…' : 'Start Engine'}
+                </OBtn>
+              ) : (
+                <OBtn onClick={doZeroDteStop} disabled={zeroDteBusy} danger>
+                  {zeroDteBusy ? '…' : 'Stop Engine'}
+                </OBtn>
+              )}
+              
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                background: zeroDteActive ? 'rgba(56,189,248,.15)' : 'rgba(100,100,100,.15)',
+                border: `1px solid ${zeroDteActive ? 'rgba(56,189,248,.4)' : 'rgba(100,100,100,.3)'}`,
+                borderRadius: 20, padding: '3px 10px', fontWeight: 600, fontSize: 12,
+                color: zeroDteActive ? '#38bdf8' : 'var(--text-3)',
+              }}>
+                <span style={{ width: 7, height: 7, borderRadius: '50%', background: zeroDteActive ? '#38bdf8' : '#6b7280' }} />
+                {zeroDteActive ? 'Engine running' : 'Engine idle'}
+              </span>
+
+              {zeroDteMsg && (
+                <span style={{ fontSize: 12, color: zeroDteMsg.startsWith('✓') ? C.pos : zeroDteMsg.startsWith('✗') ? C.neg : 'var(--text-3)' }}>
+                  {zeroDteMsg}
+                </span>
+              )}
+              {!connected && (
+                <span style={{ fontSize: 12, color: C.neg }}>Connect to moomoo first.</span>
+              )}
+            </div>
+
+            {zeroDteInfo?.state && zeroDteActive && (
+              <div style={{ marginTop: 12, display: 'flex', gap: 16, fontSize: 12, color: 'var(--text-1)' }}>
+                <span>Cum. Delta: <strong style={{ color: zeroDteInfo.state.cumulative_delta > 0 ? C.pos : C.neg }}>{zeroDteInfo.state.cumulative_delta}</strong></span>
+                <span>Bars Built: <strong>{zeroDteInfo.state.bars_count}</strong></span>
+                {zeroDteInfo.state.latest_bar && (
+                  <span>Last Absorption: <strong>{Number(zeroDteInfo.state.latest_bar.absorption).toFixed(1)}</strong></span>
+                )}
+                {zeroDteInfo.last_signal && (
+                  <span style={{ color: C.warn }}>Last Signal: <strong>{zeroDteInfo.last_signal}</strong></span>
+                )}
+              </div>
+            )}
+            <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-3)', lineHeight: 1.5 }}>
+              Executes ATM 0DTE options upon Absorption Bull/Bear or Delta Divergence.
+              Monitors ticks natively. Trades use OCO (-50% stop, +100% target).
             </div>
           </OCard>
 

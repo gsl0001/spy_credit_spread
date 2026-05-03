@@ -101,6 +101,9 @@ export const api = {
     exit:       (body)         => post('/api/moomoo/exit', body, 90000),
     cancel:     (body)         => post('/api/moomoo/cancel', body),
     flattenAll: ()             => post('/api/moomoo/flatten_all', {}, 90000),
+    zeroDteStart:  ()          => post('/api/moomoo/0dte/start'),
+    zeroDteStop:   ()          => post('/api/moomoo/0dte/stop'),
+    zeroDteStatus: ()          => get('/api/moomoo/0dte/status'),
   },
 };
 

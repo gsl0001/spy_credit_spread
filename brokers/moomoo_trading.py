@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 _POLL_INTERVAL_S = 0.5
 _LEG_TIMEOUT_S = 30.0
 
+# Retry backoff state for ensure_connected
+_RETRY_DELAYS = [5, 10, 20, 40, 60]  # seconds
+
 
 def _accounts_to_dicts(acc_data) -> list[dict[str, Any]]:
     """Normalise acc_list DataFrame rows to plain dicts (lists JSON-friendly)."""
@@ -92,6 +95,14 @@ class MoomooTrader:
         # and the OpenD-staleness alert.  Updated on every successful API
         # round-trip.
         self._last_healthy_iso: str | None = None
+
+        # ── Auto-reconnect state ──────────────────────────────────────
+        self._auto_reconnect = True
+        self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_attempt = 0
+        self._max_reconnect_backoff = 60  # seconds
+        self._reconnecting = False
+        self._intentional_disconnect = False
 
     def _mark_healthy(self) -> None:
         """Stamp now() as the last successful OpenD call timestamp."""
@@ -281,6 +292,8 @@ class MoomooTrader:
         }
 
     def disconnect(self) -> None:
+        self._intentional_disconnect = True
+        self._cancel_reconnect()
         if self._trd_ctx:
             try:
                 self._trd_ctx.close()
@@ -299,6 +312,134 @@ class MoomooTrader:
 
     def is_alive(self) -> bool:
         return self._connected and self._trd_ctx is not None
+
+    # ── Auto-reconnect ────────────────────────────────────────────────────
+
+    @property
+    def reconnecting(self) -> bool:
+        return self._reconnecting
+
+    @property
+    def reconnect_attempt(self) -> int:
+        return self._reconnect_attempt
+
+    def _cancel_reconnect(self) -> None:
+        """Cancel any pending reconnect task."""
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+        self._reconnect_task = None
+        self._reconnecting = False
+        self._reconnect_attempt = 0
+
+    async def _reconnect_loop(self) -> None:
+        """Background coroutine: exponential backoff reconnect.
+
+        Retries connect() with delays: 2s, 4s, 8s, 16s, … max 60s.
+        Sends Telegram alerts on each attempt and on success/failure.
+        """
+        self._reconnecting = True
+        self._reconnect_attempt = 0
+
+        def _notify(msg: str, level: str = "warning") -> None:
+            try:
+                from core.notifier import notify_alert
+                notify_alert(level, msg)
+            except Exception:
+                pass
+
+        _notify("⚠️ OpenD connection lost — auto-reconnect starting", "warning")
+        logger.warning("Auto-reconnect: OpenD connection lost, starting backoff loop")
+
+        while not self._intentional_disconnect:
+            self._reconnect_attempt += 1
+            delay = min(2 ** self._reconnect_attempt, self._max_reconnect_backoff)
+            logger.info("Auto-reconnect: attempt #%d in %ds", self._reconnect_attempt, delay)
+
+            await asyncio.sleep(delay)
+
+            if self._intentional_disconnect:
+                break
+
+            try:
+                result = await self.connect()
+                if result.get("connected"):
+                    _notify(
+                        f"✅ OpenD reconnected after {self._reconnect_attempt} attempt(s)",
+                        "info",
+                    )
+                    logger.info(
+                        "Auto-reconnect: SUCCESS after %d attempt(s)",
+                        self._reconnect_attempt,
+                    )
+                    self._reconnecting = False
+                    self._reconnect_attempt = 0
+                    return
+            except Exception as exc:
+                logger.warning(
+                    "Auto-reconnect: attempt #%d failed: %s",
+                    self._reconnect_attempt, exc,
+                )
+
+            # Alert every 5 attempts
+            if self._reconnect_attempt % 5 == 0:
+                _notify(
+                    f"🔴 OpenD still down after {self._reconnect_attempt} reconnect attempts",
+                    "critical",
+                )
+
+        self._reconnecting = False
+        logger.info("Auto-reconnect: loop stopped (intentional disconnect)")
+
+    def schedule_reconnect(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
+        """Schedule a reconnect task if not already running.
+
+        Called from the health check / monitor tick when is_alive() == False
+        and intentional_disconnect is False.
+        """
+        if self._intentional_disconnect:
+            return
+        if self._reconnecting:
+            return  # already trying
+        if self.is_alive():
+            return  # still connected
+
+        target_loop = loop or asyncio.get_event_loop()
+        self._reconnect_task = target_loop.create_task(self._reconnect_loop())
+
+    # ── ensure_connected (IBKR-parity) ────────────────────────────────────────
+
+    async def ensure_connected(self) -> dict[str, Any]:
+        """Reconnect if the connection dropped, with exponential backoff.
+
+        Mirrors IBKRTrader.ensure_connected() so callers don't need
+        to pre-check is_alive() before every API call.
+        """
+        if self.is_alive():
+            return {"success": True, "msg": "Already connected"}
+
+        if self._intentional_disconnect:
+            return {"success": False, "msg": "Intentionally disconnected"}
+
+        # Exponential backoff
+        idx = min(self._reconnect_attempt, len(_RETRY_DELAYS) - 1)
+        if self._reconnect_attempt > 0:
+            delay = _RETRY_DELAYS[idx]
+            elapsed = _time_module.monotonic() - getattr(self, "_last_retry_time", 0)
+            if elapsed < delay:
+                wait = round(delay - elapsed, 1)
+                return {"success": False, "msg": f"Backoff: waiting {wait}s before retry"}
+
+        self._reconnect_attempt += 1
+        self._last_retry_time = _time_module.monotonic()
+
+        try:
+            result = await self.connect()
+            if result.get("connected"):
+                self._reconnect_attempt = 0
+                return {"success": True, "msg": "Reconnected"}
+            return {"success": False, "msg": result.get("error", "Connect failed")}
+        except Exception as exc:
+            return {"success": False, "msg": str(exc)}
 
     # ── Account ───────────────────────────────────────────────────────────────
 
@@ -331,7 +472,7 @@ class MoomooTrader:
         }
 
     async def get_account_summary(self) -> dict[str, Any]:
-        self._require_connected()
+        await self.ensure_connected()
         import moomoo as ft
         loop = asyncio.get_event_loop()
 
@@ -350,7 +491,7 @@ class MoomooTrader:
     # ── Positions ─────────────────────────────────────────────────────────────
 
     async def get_positions(self) -> list[dict[str, Any]]:
-        self._require_connected()
+        await self.ensure_connected()
         import moomoo as ft
         loop = asyncio.get_event_loop()
 
@@ -369,7 +510,7 @@ class MoomooTrader:
     # ── Live price ────────────────────────────────────────────────────────────
 
     async def get_live_price(self, symbol: str) -> dict[str, Any]:
-        self._require_connected()
+        await self.ensure_connected()
         loop = asyncio.get_event_loop()
         code = f"US.{symbol}"
 
@@ -734,6 +875,116 @@ class MoomooTrader:
 
         return await loop.run_in_executor(None, _place)
 
+    # ── Historical bars (IBKR-parity) ─────────────────────────────────────────
+
+    async def get_historical_bars(
+        self, symbol: str, duration_days: int = 30, bar_size: str = "1D"
+    ) -> list[dict[str, Any]]:
+        """Fetch historical OHLCV bars from moomoo.
+
+        Mirrors IBKRTrader.get_historical_bars() for parity.
+        bar_size: 1D, 1W, 1M, 1m, 5m, 15m, 60m (or moomoo K_* constants)
+        """
+        await self.ensure_connected()
+        import moomoo as ft
+        from datetime import datetime, timedelta
+        loop = asyncio.get_event_loop()
+
+        bar_map = {
+            "1D": ft.KLType.K_DAY, "K_DAY": ft.KLType.K_DAY,
+            "1W": ft.KLType.K_WEEK, "K_WEEK": ft.KLType.K_WEEK,
+            "1M": ft.KLType.K_MON, "K_MON": ft.KLType.K_MON,
+            "1m": ft.KLType.K_1M, "K_1M": ft.KLType.K_1M,
+            "5m": ft.KLType.K_5M, "K_5M": ft.KLType.K_5M,
+            "15m": ft.KLType.K_15M, "K_15M": ft.KLType.K_15M,
+            "60m": ft.KLType.K_60M, "K_60M": ft.KLType.K_60M,
+        }
+        kl_type = bar_map.get(bar_size, ft.KLType.K_DAY)
+        code = f"US.{symbol}"
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=duration_days)).strftime("%Y-%m-%d")
+
+        def _fetch():
+            ret, data, _ = self._quote_ctx.request_history_kline(
+                code, start=start, end=end, ktype=kl_type, max_count=500
+            )
+            if ret != ft.RET_OK:
+                raise RuntimeError(f"request_history_kline: {data}")
+            return data.to_dict(orient="records")
+
+        result = await loop.run_in_executor(None, _fetch)
+        self._mark_healthy()
+        return [
+            {
+                "Date": r.get("time_key", ""),
+                "Open": r.get("open", 0),
+                "High": r.get("high", 0),
+                "Low": r.get("low", 0),
+                "Close": r.get("close", 0),
+                "Volume": r.get("volume", 0),
+            }
+            for r in result
+        ]
+
+    # ── Active orders (IBKR-parity) ───────────────────────────────────────────
+
+    async def get_active_orders(self) -> list[dict[str, Any]]:
+        """Return all pending/submitted orders. Mirrors IBKRTrader.get_active_orders()."""
+        await self.ensure_connected()
+        import moomoo as ft
+        loop = asyncio.get_event_loop()
+
+        def _fetch():
+            ret, data = self._trd_ctx.order_list_query(
+                trd_env=self._ft_trd_env, acc_id=self._acc_id,
+                status_filter_list=[
+                    ft.OrderStatus.SUBMITTING,
+                    ft.OrderStatus.SUBMITTED,
+                    ft.OrderStatus.WAITING_SUBMIT,
+                    ft.OrderStatus.FILLED_PART,
+                ],
+            )
+            if ret != ft.RET_OK:
+                raise RuntimeError(f"order_list_query: {data}")
+            return data.to_dict(orient="records")
+
+        result = await loop.run_in_executor(None, _fetch)
+        self._mark_healthy()
+        return [
+            {
+                "orderId": str(r.get("order_id", "")),
+                "symbol": r.get("code", ""),
+                "action": r.get("trd_side", ""),
+                "qty": int(r.get("qty", 0)),
+                "type": r.get("order_type", ""),
+                "lmtPrice": float(r.get("price", 0)),
+                "status": r.get("order_status", ""),
+                "filled": int(r.get("dealt_qty", 0)),
+                "avgFillPrice": float(r.get("dealt_avg_price", 0)),
+                "createTime": r.get("create_time", ""),
+            }
+            for r in result
+        ]
+
+    # ── Daily P&L (IBKR-parity) ──────────────────────────────────────────────
+
+    @property
+    def daily_pnl(self) -> float:
+        """Best-effort daily P&L from account info. Returns 0 if unavailable."""
+        if not self.is_alive():
+            return 0.0
+        try:
+            import moomoo as ft
+            ret, data = self._trd_ctx.accinfo_query(
+                trd_env=self._ft_trd_env, acc_id=self._acc_id, currency="USD",
+            )
+            if ret != ft.RET_OK:
+                return 0.0
+            row = data.iloc[0].to_dict()
+            return self._safe_float(row.get("realized_pl", 0)) + self._safe_float(row.get("unrealized_pl", 0))
+        except Exception:
+            return 0.0
+
 
 def _format_accounts(accounts: list[dict[str, Any]]) -> str:
     """Pretty-print account list for diagnostic error messages."""
@@ -749,3 +1000,43 @@ def _format_accounts(accounts: list[dict[str, Any]]) -> str:
             f"status={a.get('acc_status')}"
         )
     return "\n".join(lines)
+
+
+# ── Singleton connection manager (IBKR-parity) ───────────────────────────────
+
+_moomoo_instances: dict[str, MoomooTrader] = {}
+
+
+async def get_moomoo_connection(
+    host: str = "127.0.0.1",
+    port: int = 11111,
+    trade_password: str = "",
+    trd_env: int = 0,
+    security_firm: str = "NONE",
+    filter_trdmarket: str = "NONE",
+) -> tuple[MoomooTrader | None, str]:
+    """Mirrors get_ib_connection() — returns (trader, status_msg).
+
+    Reuses existing trader instances by host:port key, auto-reconnecting
+    if the connection dropped.
+    """
+    key = f"{host}:{port}:{trd_env}"
+
+    if key not in _moomoo_instances:
+        _moomoo_instances[key] = MoomooTrader(
+            host=host, port=port, trade_password=trade_password,
+            trd_env=trd_env, security_firm=security_firm,
+            filter_trdmarket=filter_trdmarket,
+        )
+
+    trader = _moomoo_instances[key]
+    if not trader.is_alive():
+        try:
+            result = await trader.connect()
+            if not result.get("connected"):
+                return None, result.get("error", "Connect failed")
+        except Exception as exc:
+            return None, str(exc)
+
+    return trader, "OK"
+

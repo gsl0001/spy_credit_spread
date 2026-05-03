@@ -11,7 +11,6 @@ const POLL_MS = {
   scanner:   3000,
   positions: 10000,
   pnl:       30000,
-  events:    15000,
   orders:    10000,
   spy:       15000,
   chain:     60000,
@@ -181,11 +180,6 @@ function mergeScanner(src, res) {
   };
 }
 
-function mergeEvents(res) {
-  if (!res?.events) return [];
-  return res.events;
-}
-
 function deriveIbkrStatus(hb) {
   if (!hb) return 'off';
   if (hb.ibkr_dropped || hb.alive === false) return 'off';
@@ -194,10 +188,18 @@ function deriveIbkrStatus(hb) {
   return 'off';
 }
 
+function deriveMoomooStatus(hb) {
+  if (!hb) return { status: 'off', reconnecting: false, attempt: 0 };
+  if (hb.moomoo_reconnecting) return { status: 'warn', reconnecting: true, attempt: hb.moomoo_reconnect_attempt || 0 };
+  if (hb.moomoo_connected) return { status: hb.moomoo_stalled ? 'warn' : 'live', reconnecting: false, attempt: 0 };
+  return { status: 'off', reconnecting: false, attempt: 0 };
+}
+
 export function DataProvider({ children }) {
   const [data, setData] = useState(MOCK);
   const [online, setOnline] = useState(false);
   const [ibkr, setIbkr] = useState('off');
+  const [moomoo, setMoomoo] = useState({ status: 'off', reconnecting: false, attempt: 0 });
   const timersRef = useRef([]);
 
   useEffect(() => {
@@ -209,6 +211,7 @@ export function DataProvider({ children }) {
         if (!mounted) return;
         setOnline(!!hb);
         setIbkr(deriveIbkrStatus(hb));
+        setMoomoo(deriveMoomooStatus(hb));
         setData(d => ({
           ...d,
           account: mergeAccount(d.account, hb),
@@ -223,12 +226,11 @@ export function DataProvider({ children }) {
         setData(d => ({ ...d, scanner: mergeScanner(d.scanner, s) }));
       },
       positions: async () => {
-        const open = await safe(api.openPositions);
-        const all = await safe(api.allPositions);
+        const [, open, all] = await Promise.all([safe(api.ibkrConnect), safe(api.openPositions), safe(api.allPositions)]);
         if (!mounted) return;
         setData(d => ({
           ...d,
-          positions: mergePositions(d.positions, open) || d.positions,
+          positions: open ? mergePositions(d.positions, open) : d.positions,
           closed: all ? mergeClosed(all) : d.closed,
         }));
       },
@@ -265,7 +267,7 @@ export function DataProvider({ children }) {
   }, []);
 
   return (
-    <DataContext.Provider value={{ ...data, __online: online, __ibkr: ibkr }}>
+    <DataContext.Provider value={{ ...data, __online: online, __ibkr: ibkr, __moomoo: moomoo }}>
       {children}
     </DataContext.Provider>
   );

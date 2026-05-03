@@ -37,7 +37,7 @@ from strategies.dryrun import DryRunStrategy
 from strategies.builder import OptionTopologyBuilder, bs_call_price, bs_put_price
 
 # Trading & Scheduler imports
-from ibkr_trading import get_ib_connection
+from brokers.ibkr_trading import get_ib_connection
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timezone
 import asyncio
@@ -713,7 +713,7 @@ async def spy_intraday(host: str = None, port: int = None, client_id: int = None
     
     # 1. Try to get live price from IBKR if creds provided and connection exists
     if host and port and client_id:
-        from ibkr_trading import _ib_instances
+        from brokers.ibkr_trading import _ib_instances
         key = f"{host}:{port}:{client_id}"
         trader = _ib_instances.get(key)
         if trader and trader.is_alive():
@@ -851,27 +851,27 @@ class PaperScanRequest(BaseModel):
 
 @app.post("/api/paper/connect")
 def paper_connect(creds: PaperCredentials):
-    from paper_trading import check_connection
+    from brokers.paper_trading import check_connection
     return check_connection(creds.api_key, creds.api_secret)
 
 @app.post("/api/paper/positions")
 def paper_positions(creds: PaperCredentials):
-    from paper_trading import get_positions
+    from brokers.paper_trading import get_positions
     return {"positions": get_positions(creds.api_key, creds.api_secret)}
 
 @app.post("/api/paper/orders")
 def paper_orders(creds: PaperCredentials):
-    from paper_trading import get_orders
+    from brokers.paper_trading import get_orders
     return {"orders": get_orders(creds.api_key, creds.api_secret)}
 
 @app.post("/api/paper/execute")
 def paper_execute(req: PaperOrderRequest):
-    from paper_trading import place_equity_order
+    from brokers.paper_trading import place_equity_order
     return place_equity_order(req.api_key, req.api_secret, req.symbol, req.qty, req.side)
 
 @app.post("/api/paper/scan")
 def paper_scan(req: PaperScanRequest):
-    from paper_trading import scan_signal
+    from brokers.paper_trading import scan_signal
     return scan_signal(req.api_key, req.api_secret, req.config)
 
 
@@ -898,7 +898,7 @@ def run_market_scan():
     mode = scanner_state.get("mode", "paper")
 
     try:
-        from paper_trading import scan_signal
+        from brokers.paper_trading import scan_signal
         from core.filters import apply_filters
         # Perform the scan using the logic in paper_trading (which is generic)
         res = scan_signal("", "", config) # Alpaca keys not needed for just scanning YF data
@@ -980,7 +980,7 @@ def run_market_scan():
                         "duplicate scan signal suppressed (key=%s)", _idem_key
                     )
                 else:
-                    from paper_trading import place_equity_order
+                    from brokers.paper_trading import place_equity_order
                     side = "sell" if config.get("direction", "bull") == "bear" else "buy"
                     place_equity_order(creds["api_key"], creds["api_secret"],
                                        _scan_symbol,
@@ -1230,7 +1230,7 @@ def _preset_bars_fetcher(symbol: str, strategy_name: Optional[str] = None):
     live_price = None
     trader = None
     try:
-        from ibkr_trading import _ib_instances
+        from brokers.ibkr_trading import _ib_instances
         creds = SETTINGS.ibkr.as_dict()
         key = f"{creds.get('host', '127.0.0.1')}:{creds.get('port', 7497)}:{creds.get('client_id', 1)}"
         trader = _ib_instances.get(key)
@@ -2068,7 +2068,7 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
     UI-facing alert flags: daily-loss consumption, monitor-tick staleness,
     and dropped-socket signal. The UI surfaces these as banners.
     """
-    from ibkr_trading import _ib_instances, HAS_IBSYNC
+    from brokers.ibkr_trading import _ib_instances, HAS_IBSYNC
     from core.journal import get_journal
     from core.leader import is_leader, current_leader_info
     from core.risk import RiskLimits
@@ -2099,6 +2099,9 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
         "moomoo_last_healthy_iso": None,
         "moomoo_seconds_since_healthy": None,
         "moomoo_stalled": False,
+        "moomoo_reconnecting": False,
+        "moomoo_reconnect_attempt": 0,
+        "zero_dte_bot": None,
         "alerts": [],
     }
 
@@ -2152,6 +2155,14 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
     except Exception:
         pass
 
+    # 0DTE Bot status
+    try:
+        global _zero_dte_bot
+        if _zero_dte_bot is not None:
+            result["zero_dte_bot"] = _zero_dte_bot.status()
+    except Exception:
+        pass
+
     # I10: monitor-tick staleness. Only meaningful when monitor is registered.
     if result["monitor_registered"] and _last_monitor_tick_iso:
         try:
@@ -2202,6 +2213,16 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
                         "code": "moomoo_stalled",
                         "message": f"OpenD silent for {int(delta)}s — connection may be dead",
                     })
+        elif _moomoo_trader is not None and not _moomoo_trader.is_alive():
+            # Connection dropped — trigger auto-reconnect if available
+            result["moomoo_connected"] = False
+            if hasattr(_moomoo_trader, "schedule_reconnect"):
+                _moomoo_trader.schedule_reconnect(_MAIN_LOOP)
+            if hasattr(_moomoo_trader, "reconnecting") and _moomoo_trader.reconnecting:
+                result["moomoo_reconnecting"] = True
+                result["moomoo_reconnect_attempt"] = getattr(
+                    _moomoo_trader, "reconnect_attempt", 0
+                )
     except Exception:  # noqa: BLE001
         pass
 
@@ -2242,7 +2263,7 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
 @app.post("/api/ibkr/reconnect")
 async def ibkr_reconnect(req: IBKRConnectRequest):
     """Force-reconnect an existing IBKR session."""
-    from ibkr_trading import _ib_instances
+    from brokers.ibkr_trading import _ib_instances
     key = f"{req.host}:{req.port}:{req.client_id}"
     if key in _ib_instances:
         try:
@@ -2305,7 +2326,7 @@ _moomoo_trader = None
 @app.post("/api/moomoo/connect")
 async def moomoo_connect(req: MoomooConnectRequest):
     global _moomoo_trader
-    from moomoo_trading import MoomooTrader
+    from brokers.moomoo_trading import MoomooTrader
     from core.broker import register_broker
     trader = MoomooTrader(
         host=req.host,
@@ -2332,7 +2353,7 @@ async def moomoo_probe(req: MoomooProbeRequest):
     security_firm / trdmarket_auth values they have, so they can pick the
     right combo before calling /connect.
     """
-    from moomoo_trading import MoomooTrader
+    from brokers.moomoo_trading import MoomooTrader
     return await MoomooTrader.probe(host=req.host, port=req.port)
 
 
@@ -2588,6 +2609,41 @@ async def moomoo_cancel(payload: dict):
         return await broker.cancel_order(order_id)
     except BrokerNotConnected as exc:
         return {"error": str(exc)}
+
+
+# ── Moomoo 0DTE Bot ─────────────────────────────────────────────────────────
+
+_zero_dte_bot = None
+
+@app.post("/api/moomoo/0dte/start")
+async def moomoo_0dte_start():
+    global _zero_dte_bot
+    from core.broker import get_broker, BrokerNotConnected
+    from strategies.order_flow_0dte import ZeroDTEOrderFlowBot, ZeroDTEConfig
+
+    try:
+        broker = get_broker("moomoo")
+    except BrokerNotConnected as exc:
+        return {"error": str(exc)}
+
+    if _zero_dte_bot is None:
+        _zero_dte_bot = ZeroDTEOrderFlowBot(broker, ZeroDTEConfig())
+    
+    return await _zero_dte_bot.start()
+
+@app.post("/api/moomoo/0dte/stop")
+async def moomoo_0dte_stop():
+    global _zero_dte_bot
+    if _zero_dte_bot is None:
+        return {"error": "Bot not initialized"}
+    return await _zero_dte_bot.stop()
+
+@app.get("/api/moomoo/0dte/status")
+async def moomoo_0dte_status():
+    global _zero_dte_bot
+    if _zero_dte_bot is None:
+        return {"running": False, "msg": "Not initialized"}
+    return _zero_dte_bot.status()
 
 
 async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:

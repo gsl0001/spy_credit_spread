@@ -93,7 +93,10 @@ export default function App() {
         view={view}
         mkt={{ open: backend.risk.market_open, next: backend.risk.next_close || '—' }}
         spy={backend.spy}
-        conn={{ ibkr: backend.__online ? backend.__ibkr : 'off' }}
+        conn={{
+          ibkr: backend.__online ? backend.__ibkr : 'off',
+          moomoo: backend.__moomoo || { status: 'off', reconnecting: false, attempt: 0 },
+        }}
         leader={{ is_leader: backend.monitor.is_leader }}
         alertCount={alertCount}
         onBell={() => setBellOpen(b => !b)}
@@ -176,6 +179,7 @@ export default function App() {
       <Statusbar
         online={backend.__online}
         ibkr={backend.__ibkr}
+        moomoo={backend.__moomoo}
         mkt={{ open: backend.risk.market_open, next: backend.risk.next_close || '—' }}
         openPositions={backend.positions.length}
         dailyPnl={backend.account.daily_pnl}

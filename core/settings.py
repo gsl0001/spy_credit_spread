@@ -111,6 +111,12 @@ class RiskSettings:
     daily_loss_limit_pct: float = field(
         default_factory=lambda: _env_float("DAILY_LOSS_LIMIT_PCT", 2.0)
     )
+    daily_loss_limit_abs: float = field(
+        default_factory=lambda: _env_float("DAILY_LOSS_LIMIT_ABS", 0.0)
+    )
+    max_orders_per_day: int = field(
+        default_factory=lambda: _env_int("MAX_ORDERS_PER_DAY", 0)  # 0=unlimited
+    )
     default_stop_loss_pct: float = field(
         default_factory=lambda: _env_float("DEFAULT_STOP_LOSS_PCT", 50.0)
     )

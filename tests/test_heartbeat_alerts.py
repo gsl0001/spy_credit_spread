@@ -202,7 +202,7 @@ class TestIBKRDropped:
     def test_disconnected_trader_flags_dropped(self, client, monkeypatch):
         """A registered trader whose socket reports False → dropped alert."""
         # Only meaningful when HAS_IBSYNC is True.
-        from ibkr_trading import HAS_IBSYNC, _ib_instances
+        from brokers.ibkr_trading import HAS_IBSYNC, _ib_instances
         if not HAS_IBSYNC:
             pytest.skip("ib_insync not available")
 

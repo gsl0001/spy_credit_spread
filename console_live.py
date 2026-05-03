@@ -34,7 +34,7 @@ from core.journal import get_journal, Journal, Position, Order
 from core.settings import SETTINGS
 from core.logger import configure_root_logging, log_event
 from core.leader import try_acquire_leadership, release_leadership, is_leader
-from ibkr_trading import get_ib_connection
+from brokers.ibkr_trading import get_ib_connection
 
 from core.monitor import tick as monitor_tick
 from core.fill_watcher import reconcile_once
@@ -554,7 +554,7 @@ def cmd_broker(args: list[str]) -> None:
             pwd = console.input("  Trade password: ").strip()
             console.print("  Connecting to moomoo OpenD…")
             try:
-                from moomoo_trading import MoomooTrader
+                from brokers.moomoo_trading import MoomooTrader
                 from core.broker import register_broker
 
                 async def _connect():

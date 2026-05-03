@@ -52,6 +52,7 @@ class RiskLimits:
         return cls(
             max_concurrent_positions=risk_settings.max_concurrent_positions,
             daily_loss_limit_pct=risk_settings.daily_loss_limit_pct,
+            daily_loss_limit_abs=getattr(risk_settings, "daily_loss_limit_abs", 0.0),
         )
 
 

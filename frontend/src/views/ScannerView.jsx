@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useData } from '../useBackendData.jsx';
 import { Card, Btn, Pill, Switch, Chip } from '../primitives.jsx';
-import { api, safe, IBKR_CREDS } from '../api.js';
+import { api, IBKR_CREDS } from '../api.js';
 import { loadConfig } from '../backtestConfig.js';
 
 const TIMING_OPTIONS = [

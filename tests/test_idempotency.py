@@ -76,7 +76,7 @@ def test_first_fire_submits_order(tmp_path):
 
     with patch("main.scanner_state", _scanner_state_for(config)):
         with patch("core.journal._JOURNAL", journal):
-            with patch("paper_trading.place_equity_order") as mock_place:
+            with patch("brokers.paper_trading.place_equity_order") as mock_place:
                 mock_place.return_value = {"status": "ok"}
 
                 # Simulate the idempotency check that run_market_scan now does
@@ -179,7 +179,7 @@ def test_run_market_scan_auto_execute_idempotency(tmp_path, monkeypatch):
 
     # Stub scan_signal to always return a buy signal
     fake_scan = MagicMock(return_value={"signal": True, "price": 500.0, "rsi": 25.0, "row_data": {}})
-    monkeypatch.setattr("paper_trading.scan_signal", fake_scan, raising=False)
+    monkeypatch.setattr("brokers.paper_trading.scan_signal", fake_scan, raising=False)
 
     # Stub place_equity_order
     order_calls: list[tuple] = []
@@ -188,7 +188,7 @@ def test_run_market_scan_auto_execute_idempotency(tmp_path, monkeypatch):
         order_calls.append((symbol, qty, side))
         return {"status": "ok"}
 
-    monkeypatch.setattr("paper_trading.place_equity_order", _fake_place, raising=False)
+    monkeypatch.setattr("brokers.paper_trading.place_equity_order", _fake_place, raising=False)
 
     # Stub apply_filters to always allow
     monkeypatch.setattr("core.filters.apply_filters", lambda row, cfg: (True, ""), raising=False)

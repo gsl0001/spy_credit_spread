@@ -67,16 +67,16 @@ def _make_trader(ib: MagicMock | None = None):
         ib = _make_mock_ib()
 
     with (
-        patch("ibkr_trading.HAS_IBSYNC", True),
-        patch("ibkr_trading.IB", return_value=ib),
-        patch("ibkr_trading.Stock", MagicMock()),
-        patch("ibkr_trading.Option", MagicMock()),
-        patch("ibkr_trading.ComboLeg", MagicMock()),
-        patch("ibkr_trading.Bag", MagicMock()),
-        patch("ibkr_trading.LimitOrder", MagicMock()),
-        patch("ibkr_trading.MarketOrder", MagicMock()),
+        patch("brokers.ibkr_trading.HAS_IBSYNC", True),
+        patch("brokers.ibkr_trading.IB", return_value=ib),
+        patch("brokers.ibkr_trading.Stock", MagicMock()),
+        patch("brokers.ibkr_trading.Option", MagicMock()),
+        patch("brokers.ibkr_trading.ComboLeg", MagicMock()),
+        patch("brokers.ibkr_trading.Bag", MagicMock()),
+        patch("brokers.ibkr_trading.LimitOrder", MagicMock()),
+        patch("brokers.ibkr_trading.MarketOrder", MagicMock()),
     ):
-        from ibkr_trading import IBKRTrader
+        from brokers.ibkr_trading import IBKRTrader
         trader = IBKRTrader.__new__(IBKRTrader)
         trader.host = "127.0.0.1"
         trader.port = 7497
@@ -103,16 +103,16 @@ class TestIBKRTraderInstantiation:
         """IBKRTrader can be created when HAS_IBSYNC=True."""
         mock_ib_instance = _make_mock_ib()
         with (
-            patch("ibkr_trading.HAS_IBSYNC", True),
-            patch("ibkr_trading.IB", return_value=mock_ib_instance),
-            patch("ibkr_trading.Stock", MagicMock()),
-            patch("ibkr_trading.Option", MagicMock()),
-            patch("ibkr_trading.ComboLeg", MagicMock()),
-            patch("ibkr_trading.Bag", MagicMock()),
-            patch("ibkr_trading.LimitOrder", MagicMock()),
-            patch("ibkr_trading.MarketOrder", MagicMock()),
+            patch("brokers.ibkr_trading.HAS_IBSYNC", True),
+            patch("brokers.ibkr_trading.IB", return_value=mock_ib_instance),
+            patch("brokers.ibkr_trading.Stock", MagicMock()),
+            patch("brokers.ibkr_trading.Option", MagicMock()),
+            patch("brokers.ibkr_trading.ComboLeg", MagicMock()),
+            patch("brokers.ibkr_trading.Bag", MagicMock()),
+            patch("brokers.ibkr_trading.LimitOrder", MagicMock()),
+            patch("brokers.ibkr_trading.MarketOrder", MagicMock()),
         ):
-            from ibkr_trading import IBKRTrader
+            from brokers.ibkr_trading import IBKRTrader
             trader = IBKRTrader(host="127.0.0.1", port=7497, client_id=1)
             assert trader.host == "127.0.0.1"
             assert trader.port == 7497
@@ -121,8 +121,8 @@ class TestIBKRTraderInstantiation:
 
     def test_instantiation_raises_when_ibsync_missing(self):
         """IBKRTrader raises RuntimeError when HAS_IBSYNC=False."""
-        with patch("ibkr_trading.HAS_IBSYNC", False):
-            from ibkr_trading import IBKRTrader
+        with patch("brokers.ibkr_trading.HAS_IBSYNC", False):
+            from brokers.ibkr_trading import IBKRTrader
             with pytest.raises(RuntimeError, match="ib_insync"):
                 IBKRTrader()
 
@@ -260,10 +260,10 @@ class TestGetComboMidpoint:
         trader = _make_trader(ib)
         with (
             patch.object(trader, "is_alive", return_value=True),
-            patch("ibkr_trading.pd", _pd),
-            patch("ibkr_trading.Option", MagicMock()),
-            patch("ibkr_trading.ComboLeg", MagicMock()),
-            patch("ibkr_trading.Bag", MagicMock()),
+            patch("brokers.ibkr_trading.pd", _pd),
+            patch("brokers.ibkr_trading.Option", MagicMock()),
+            patch("brokers.ibkr_trading.ComboLeg", MagicMock()),
+            patch("brokers.ibkr_trading.Bag", MagicMock()),
         ):
             mid = _run(trader.get_combo_midpoint("SPY", self._build_legs()))
 
@@ -284,10 +284,10 @@ class TestGetComboMidpoint:
         trader = _make_trader(ib)
         with (
             patch.object(trader, "is_alive", return_value=True),
-            patch("ibkr_trading.pd", _pd),
-            patch("ibkr_trading.Option", MagicMock()),
-            patch("ibkr_trading.ComboLeg", MagicMock()),
-            patch("ibkr_trading.Bag", MagicMock()),
+            patch("brokers.ibkr_trading.pd", _pd),
+            patch("brokers.ibkr_trading.Option", MagicMock()),
+            patch("brokers.ibkr_trading.ComboLeg", MagicMock()),
+            patch("brokers.ibkr_trading.Bag", MagicMock()),
         ):
             mid = _run(trader.get_combo_midpoint("SPY", self._build_legs()))
 
@@ -315,10 +315,10 @@ class TestPlaceComboOrder:
         trader = _make_trader(ib)
         with (
             patch.object(trader, "is_alive", return_value=True),
-            patch("ibkr_trading.Option", MagicMock()),
-            patch("ibkr_trading.ComboLeg", MagicMock()),
-            patch("ibkr_trading.Bag", MagicMock()),
-            patch("ibkr_trading.LimitOrder", MagicMock(return_value=MagicMock())),
+            patch("brokers.ibkr_trading.Option", MagicMock()),
+            patch("brokers.ibkr_trading.ComboLeg", MagicMock()),
+            patch("brokers.ibkr_trading.Bag", MagicMock()),
+            patch("brokers.ibkr_trading.LimitOrder", MagicMock(return_value=MagicMock())),
         ):
             result = _run(
                 trader.place_combo_order("SPY", self._build_legs(), sc=1, side="BUY", lmtPrice=1.30)
@@ -342,11 +342,11 @@ class TestPlaceComboOrder:
         trader = _make_trader(ib)
         with (
             patch.object(trader, "is_alive", return_value=True),
-            patch("ibkr_trading.Option", MagicMock()),
-            patch("ibkr_trading.ComboLeg", MagicMock()),
-            patch("ibkr_trading.Bag", MagicMock()),
-            patch("ibkr_trading.LimitOrder", mock_limit_order_cls),
-            patch("ibkr_trading.MarketOrder", MagicMock()),
+            patch("brokers.ibkr_trading.Option", MagicMock()),
+            patch("brokers.ibkr_trading.ComboLeg", MagicMock()),
+            patch("brokers.ibkr_trading.Bag", MagicMock()),
+            patch("brokers.ibkr_trading.LimitOrder", mock_limit_order_cls),
+            patch("brokers.ibkr_trading.MarketOrder", MagicMock()),
         ):
             _run(
                 trader.place_combo_order("SPY", self._build_legs(), sc=1, side="BUY", lmtPrice=1.30)
@@ -494,8 +494,8 @@ class TestPlaceTestOrder:
         trader = _make_trader(ib)
         with (
             patch.object(trader, "is_alive", return_value=True),
-            patch("ibkr_trading.Stock", MagicMock(return_value=mock_contract)),
-            patch("ibkr_trading.LimitOrder", MagicMock(return_value=MagicMock())),
+            patch("brokers.ibkr_trading.Stock", MagicMock(return_value=mock_contract)),
+            patch("brokers.ibkr_trading.LimitOrder", MagicMock(return_value=MagicMock())),
             # Avoid the asyncio.sleep(0.5) inside place_test_order
             patch("asyncio.sleep", AsyncMock()),
         ):
@@ -513,7 +513,7 @@ class TestPlaceTestOrder:
         trader = _make_trader(ib)
         with (
             patch.object(trader, "is_alive", return_value=True),
-            patch("ibkr_trading.Stock", MagicMock()),
+            patch("brokers.ibkr_trading.Stock", MagicMock()),
         ):
             result = _run(trader.place_test_order())
 
@@ -526,11 +526,11 @@ class TestPlaceTestOrder:
 class TestGetIbConnection:
     def test_returns_none_when_ibsync_missing(self):
         """get_ib_connection() returns (None, error_msg) when ib_insync is unavailable."""
-        from ibkr_trading import get_ib_connection
+        from brokers.ibkr_trading import get_ib_connection
         # Patch _try_load_ibsync to report failure and set the import error message
         with (
-            patch("ibkr_trading._try_load_ibsync", return_value=False),
-            patch("ibkr_trading._IBSYNC_IMPORT_ERROR", "ModuleNotFoundError: No module named 'ib_insync'"),
+            patch("brokers.ibkr_trading._try_load_ibsync", return_value=False),
+            patch("brokers.ibkr_trading._IBSYNC_IMPORT_ERROR", "ModuleNotFoundError: No module named 'ib_insync'"),
         ):
             result, msg = _run(get_ib_connection({"host": "127.0.0.1", "port": 7497, "client_id": 1}))
         assert result is None
@@ -538,7 +538,7 @@ class TestGetIbConnection:
 
     def test_returns_trader_when_alive(self):
         """get_ib_connection() returns existing connected trader without reconnecting."""
-        from ibkr_trading import _ib_instances
+        from brokers.ibkr_trading import _ib_instances
 
         mock_ib = _make_mock_ib(connected=True)
         fake_trader = _make_trader(mock_ib)
@@ -549,10 +549,10 @@ class TestGetIbConnection:
 
         try:
             with (
-                patch("ibkr_trading.HAS_IBSYNC", True),
-                patch("ibkr_trading._try_load_ibsync", return_value=True),
+                patch("brokers.ibkr_trading.HAS_IBSYNC", True),
+                patch("brokers.ibkr_trading._try_load_ibsync", return_value=True),
             ):
-                from ibkr_trading import get_ib_connection
+                from brokers.ibkr_trading import get_ib_connection
                 trader, msg = _run(
                     get_ib_connection({"host": "127.0.0.1", "port": 7497, "client_id": 1})
                 )

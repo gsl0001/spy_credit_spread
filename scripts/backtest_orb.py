@@ -94,7 +94,7 @@ def _print_report(report: dict, sample_n: int = 10) -> None:
     print(f"Avg win  / loss:     +{s['avg_win_pct']:.2f}% / {s['avg_loss_pct']:.2f}%")
     print(f"Expectancy / trade:  {s['expectancy_pct']:+.2f}%")
     print(f"Total P&L:           ${s['total_pnl']:+,.2f}")
-    print(f"Capital:             ${s['starting_capital']:,.2f} → ${s['ending_capital']:,.2f}")
+    print(f"Capital:             ${s['starting_capital']:,.2f} -> ${s['ending_capital']:,.2f}")
     print(f"Max drawdown:        {s['max_drawdown_pct']:.2f}%")
     print(f"Sharpe (annualized): {s['sharpe']:.2f}")
     print(f"Exits by reason:     {s['exits_by_reason']}")
