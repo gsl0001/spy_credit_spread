@@ -35,6 +35,9 @@ frontend/build/
 *.log
 *.bak
 
+# Claude Code (local worktrees should not be tracked)
+.claude/worktrees/
+
 # IDE
 .vscode/
 .idea/
