@@ -2292,6 +2292,11 @@ class MoomooOrderRequest(BaseModel):
     take_profit_pct: float = 50.0
     trailing_stop_pct: float = 0.0
     client_order_id: Optional[str] = None
+    # Test-only escape hatch: skip the event-blackout gate so smoke
+    # tests can fire orders during news days.  NEVER set True in
+    # production scanner code paths — the news filter exists for a
+    # reason (NFP/FOMC/CPI move SPY 2-3% in seconds).
+    bypass_event_blackout: bool = False
 
 
 _moomoo_trader = None
@@ -2722,12 +2727,20 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
 
     # Pre-trade risk gate.  Disable market-hours check for moomoo simulate
     # accounts (they accept orders 24/7) but keep all other gates active.
+    # Allow callers to opt into bypassing the event-blackout gate for
+    # smoke-testing only (req.bypass_event_blackout); never set in scanner.
     from core.calendar import load_event_calendar
     is_simulate = getattr(broker, "_trd_env_int", 1) == 0
     limits = RiskLimits.from_settings()
+    from dataclasses import replace
     if is_simulate:
-        from dataclasses import replace
         limits = replace(limits, require_market_open=False)
+    if req.bypass_event_blackout:
+        limits = replace(limits, block_on_events=False)
+        journal.log_event("bypass_event_blackout", subject=req.symbol, payload={
+            "broker": "moomoo", "client_order_id": client_id,
+            "warning": "test-only flag — production scanner must NOT set this",
+        })
     ctx = RiskContext(
         account=snapshot,
         open_positions=len(journal.list_open()),
@@ -2764,9 +2777,20 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
     try:
         order_result = await broker.place_spread(spread_req)
     except Exception as exc:
+        journal.log_event("order_failed", subject=req.symbol, payload={
+            "broker": "moomoo", "client_order_id": client_id, "error": str(exc),
+            "K_long": spread["K_long"], "K_short": spread["K_short"],
+        })
         return {"error": "order_failed", "reason": str(exc)}
 
     if order_result.get("status") != "ok":
+        # Log the broker's rejection (e.g., long_leg_timeout) so the audit
+        # trail shows what was attempted even when no position was opened.
+        journal.log_event("order_rejected", subject=req.symbol, payload={
+            "broker": "moomoo", "client_order_id": client_id,
+            "K_long": spread["K_long"], "K_short": spread["K_short"],
+            **order_result,
+        })
         return {"error": "order_rejected", **order_result}
 
     # Journal

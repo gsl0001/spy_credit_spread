@@ -630,12 +630,20 @@ class MoomooTrader:
 
     @staticmethod
     def _option_code(symbol: str, expiry: str, right: str, strike: float) -> str:
-        """Build moomoo option code: US.SPY260425C580000"""
+        """Build moomoo option code: US.SPY260425C580000
+
+        moomoo uses ``int(strike * 1000)`` with NO leading-zero padding.
+        SPY 580.00 → "580000".  SPY 950.00 → "950000".  We confirmed this
+        empirically against /api/moomoo/chain — every returned code uses
+        6 digits naturally for SPY's 500-950 range.  Earlier versions
+        zero-padded to 8 digits which produced codes like
+        "00721000" that moomoo rejected as "Cannot find <code> in US Stocks".
+        """
         yy = expiry[2:4]
         mm = expiry[4:6]
         dd = expiry[6:8]
         strike_int = int(round(strike * 1000))
-        return f"US.{symbol}{yy}{mm}{dd}{right}{strike_int:08d}"
+        return f"US.{symbol}{yy}{mm}{dd}{right}{strike_int}"
 
     async def _place_single_leg(
         self, leg: LegSpec, side: str, qty: int, client_ref: str
