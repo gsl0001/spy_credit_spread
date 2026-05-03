@@ -1,28 +1,21 @@
-# Session Checkpoint — 2026-05-02 20:56
+# Session Checkpoint — 2026-05-03 12:35
 
 ## Working Directory
 /Users/gsl0001/Downloads/spy_credit_spread
 
 ## Recent Commits
+026a670 fix: 3 critical bugs in 0DTE order flow bot
+cda2a97 feat: implement native moomoo 0dte order flow engine & safety audit verification
+67499c4 chore(git): stop tracking Claude worktree path; ignore .claude/worktrees
+0a36b81 new moomoo trading
 6248f72 fix: moomoo option-code padding + audit gaps + smoke-test script
-b3bf7a7 fix(moomoo view): hoist refreshAccount/refreshPositions above doFlattenAll
-cb827c3 feat: ORB backtest harness — pure-function engine, CLI runner, 12 tests
-485c74b feat: live-trading hardening — P&L fix, kill switch, reconciler, heartbeat, tests
-3f0636a fix: order ticket 'Load failed' — multiple latent bugs in moomoo execute path
 
 ## Uncommitted Changes
-?? .claude/
-?? TODO.md
-?? docs/wireframe.html
-?? frontend/TODO.md
-?? frontend/src/TODO.md
-?? latest_plan.md
-?? package-lock.json
-?? trading_strategies_doc/
-?? upgrade/
+ M TODO.md
+?? docs/MULTI_STRATEGY_PLAN.md
 
 ## Modified Files (unstaged)
-none
+TODO.md
 
 ## Staged Files
 none
