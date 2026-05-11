@@ -63,6 +63,9 @@ def list_strategy_classes() -> dict:
         from strategies.cumulative_rsi import CumulativeRsiStrategy
         from strategies.r3 import R3Strategy
         from strategies.williams_r import WilliamsRStrategy
+        from strategies.monday_spread import MondaySpreadStrategy
+        from strategies.fomc_pre import FomcPreStrategy
+        from strategies.spy_pcs import SpyPcsStrategy
     except Exception:  # noqa: BLE001
         return {}
     return {
@@ -93,6 +96,9 @@ def list_strategy_classes() -> dict:
         "cumulative_rsi": CumulativeRsiStrategy,
         "r3": R3Strategy,
         "williams_r": WilliamsRStrategy,
+        "monday_spread": MondaySpreadStrategy,
+        "fomc_pre": FomcPreStrategy,
+        "spy_pcs": SpyPcsStrategy,
     }
 
 
