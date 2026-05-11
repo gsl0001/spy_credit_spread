@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core.broker import BrokerNotConnected, get_broker
-from core.journal import get_journal
+from core.journal import Position, get_journal
 
 logger = logging.getLogger(__name__)
 
@@ -176,15 +176,87 @@ async def reconcile_once() -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("reconcile: close phantom %s failed: %s", ph["position_id"], exc)
 
+    # Auto-record orphans as ``single_leg_orphan`` positions so the monitor
+    # MTM/exit loop can manage them. Without this, broker-side orphans bleed
+    # silently — exactly the failure mode that produced the 2026-05-07 mess.
+    # We use a deterministic claim_key so re-runs of the reconciler don't
+    # double-record the same orphan.
+    orphans_recorded: list[str] = []
+    for orphan in orphans:
+        # Skip 'good' deltas: journal already has more than broker (= phantom
+        # leg, handled below) or qty matches (delta=0 — shouldn't reach here).
+        delta = int(orphan.get("delta", 0))
+        if delta == 0:
+            continue
+        # delta > 0 = broker has more longs than journal (orphan long)
+        # delta < 0 = broker has more shorts than journal (orphan short)
+        side = "long" if delta > 0 else "short"
+        qty = abs(delta)
+        symbol, strike, right, expiry = (
+            orphan["symbol"], float(orphan["strike"]),
+            orphan["right"], orphan["expiry"],
+        )
+        # Deterministic dedup key: same (symbol,K,right,expiry,side,qty)
+        # produces the same key, so successive reconciler ticks see the
+        # already-claimed event and skip.
+        claim_key = f"reconcile_orphan:{symbol}:{strike}:{right}:{expiry}:{side}:{qty}"
+        if journal.has_event_claim(claim_key, kind="reconcile_orphan_recorded"):
+            continue
+        legs = [{"expiry": expiry, "strike": strike, "right": right,
+                 "side": side, "qty": qty}]
+        try:
+            pos_id = journal.open_position(Position(
+                id=claim_key,
+                symbol=symbol,
+                topology="single_leg_orphan",
+                direction="bull" if side == "long" else "bear",
+                contracts=qty,
+                entry_cost=0.0,  # unknown; monitor will MTM via get_spread_mid
+                entry_time=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                expiry=expiry,
+                state="open",
+                legs=tuple(legs),
+                broker="moomoo",
+                meta={
+                    "broker": "moomoo",
+                    "orphan": True,
+                    "source": "reconciler",
+                    "broker_order_id": "",
+                    "stop_loss_pct": 50.0,
+                    "take_profit_pct": 50.0,
+                    "trailing_stop_pct": 0.0,
+                    "idempotency_key": claim_key,
+                },
+            ))
+            journal.log_event(
+                "reconcile_orphan_recorded",
+                subject=pos_id,
+                claim_key=claim_key,
+                payload={"orphan": orphan, "position_id": pos_id},
+            )
+            orphans_recorded.append(pos_id)
+            logger.info("reconcile: recorded orphan %s as %s", orphan, pos_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reconcile: record orphan %s failed: %s", orphan, exc)
+            journal.log_event(
+                "reconcile_orphan_failed", payload={
+                    "orphan": orphan, "error": str(exc),
+                },
+            )
+
     if orphans:
-        journal.log_event("reconcile_orphans_detected", payload={"orphans": orphans})
+        journal.log_event("reconcile_orphans_detected", payload={
+            "orphans": orphans,
+            "recorded_position_ids": orphans_recorded,
+        })
         try:
             from core.telegram_bot import notify_alert
             count = len(orphans)
+            recorded = len(orphans_recorded)
             notify_alert(
                 "critical",
-                f"MOOMOO RECONCILE — {count} orphan leg(s) at broker not in journal. "
-                f"Investigate: {orphans[:3]}",
+                f"MOOMOO RECONCILE — {count} orphan leg(s) detected; {recorded} "
+                f"auto-recorded for monitor pickup. First 3: {orphans[:3]}",
             )
         except Exception:  # noqa: BLE001
             pass
@@ -193,6 +265,7 @@ async def reconcile_once() -> dict[str, Any]:
         "broker_legs": len(broker_legs),
         "journal_open_positions": len(open_journal),
         "orphans": orphans,
+        "orphans_recorded": orphans_recorded,
         "phantoms": phantoms,
         "phantoms_closed": closed_phantoms,
     }

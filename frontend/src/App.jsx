@@ -29,7 +29,7 @@ const VIEWS = {
 
 const VIEW_TITLES = {
   live: { title: 'Live Trading', sub: 'IBKR TWS · SPY credit spreads' },
-  paper: { title: 'Paper Trading', sub: 'Alpaca · equity surrogate' },
+  paper: { title: 'Paper Trials', sub: 'multi-preset moomoo paper gate · skill Step 10' },
   moomoo: { title: 'Moomoo Trading', sub: 'moomoo OpenD · legged spreads · CA' },
   backtest: { title: 'Backtest Engine', sub: 'historical simulation' },
   journal: { title: 'Trade Journal', sub: 'orders · fills · events' },
@@ -52,11 +52,29 @@ export default function App() {
     setPanicBusy(true);
     setPanicMsg('Submitting…');
     try {
-      const res = await api.flatten();
-      if (res?.error) {
-        setPanicMsg(`Error: ${res.error}`);
+      const [ibkr, moomoo] = await Promise.allSettled([
+        api.flatten(),
+        api.moomoo.flattenAll(),
+      ]);
+      const errors = [];
+      const parts = [];
+
+      if (ibkr.status === 'fulfilled' && !ibkr.value?.error) {
+        parts.push(`IBKR ${ibkr.value?.closed ?? 0}`);
       } else {
-        setPanicMsg(`✓ ${res?.closed ?? 0} position(s) closing`);
+        errors.push(`IBKR: ${ibkr.value?.error || ibkr.reason?.message || 'flatten failed'}`);
+      }
+
+      if (moomoo.status === 'fulfilled' && !moomoo.value?.error) {
+        parts.push(`Moomoo ${moomoo.value?.closed ?? 0}`);
+      } else {
+        errors.push(`Moomoo: ${moomoo.value?.error || moomoo.reason?.message || 'flatten failed'}`);
+      }
+
+      if (errors.length) {
+        setPanicMsg(`Error: ${errors.join(' · ')}`);
+      } else {
+        setPanicMsg(`✓ Closing submitted: ${parts.join(' · ')}`);
         // Auto-close the dialog on success after a brief confirmation pause.
         setTimeout(() => { setPanicOpen(false); setPanicMsg(''); }, 1800);
       }
@@ -82,7 +100,6 @@ export default function App() {
   }, []);
 
   const ViewComponent = VIEWS[view] || LiveView;
-  const { title, sub } = VIEW_TITLES[view] || VIEW_TITLES.live;
   const alertCount = backend.alerts.filter(a => !a.ack).length;
 
   return (
@@ -152,7 +169,7 @@ export default function App() {
             </div>
             <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 8 }}>Flatten All Positions?</div>
             <div style={{ color: 'var(--text-2)', fontSize: 13, marginBottom: 16, lineHeight: 1.5 }}>
-              This will immediately submit market orders to close all {backend.positions.length} open spread(s). Action cannot be undone.
+              This will immediately submit market orders to close all known IBKR and Moomoo positions. Action cannot be undone.
             </div>
             {panicMsg && (
               <div style={{

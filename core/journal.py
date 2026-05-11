@@ -143,6 +143,7 @@ CREATE TABLE IF NOT EXISTS events (
     time        TEXT NOT NULL,
     kind        TEXT NOT NULL,
     subject     TEXT,
+    claim_key   TEXT,                        -- nullable structured idempotency key
     payload_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -161,7 +162,17 @@ CREATE INDEX IF NOT EXISTS idx_positions_state    ON positions(state);
 CREATE INDEX IF NOT EXISTS idx_orders_position    ON orders(position_id);
 CREATE INDEX IF NOT EXISTS idx_fills_order        ON fills(order_id);
 CREATE INDEX IF NOT EXISTS idx_events_time        ON events(time);
+CREATE INDEX IF NOT EXISTS idx_events_kind        ON events(kind);
 CREATE INDEX IF NOT EXISTS idx_scanner_logs_time  ON scanner_logs(time);
+"""
+
+# Indexes that reference columns added via migration must run after
+# ``_migrate()`` so existing DBs don't fail with "no such column".
+_POST_MIGRATE_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_claim_key
+    ON events(claim_key) WHERE claim_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_exec_id
+    ON fills(exec_id) WHERE exec_id IS NOT NULL;
 """
 
 
@@ -196,6 +207,27 @@ class Journal:
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+        self._conn.executescript(_POST_MIGRATE_INDEXES)
+
+    def _migrate(self) -> None:
+        """Apply backwards-compatible column adds to existing DBs.
+
+        ``CREATE TABLE IF NOT EXISTS`` doesn't add new columns to a table that
+        already exists, so any column added after the initial release needs a
+        manual ALTER. SQLite is forgiving — duplicate-column errors are caught.
+        """
+        migrations = (
+            "ALTER TABLE events ADD COLUMN claim_key TEXT",
+        )
+        for sql in migrations:
+            try:
+                self._conn.execute(sql)
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if "duplicate column" in msg or "already exists" in msg:
+                    continue
+                raise
 
     # ── low-level helpers ──────────────────────────────────────────────────
 
@@ -381,10 +413,16 @@ class Journal:
     # ── fills ──────────────────────────────────────────────────────────────
 
     def record_fill(self, fill: Fill) -> int:
+        """Insert a fill row. ``exec_id`` is a broker-provided execution
+        identifier; if supplied and already present in the table, the insert
+        is silently dropped to prevent double-counting P&L when broker
+        webhooks retry. Fills with a NULL ``exec_id`` (manual entries) are
+        always accepted. Returns the new row id, or 0 if deduped.
+        """
         with self._tx() as c:
             cur = c.execute(
                 """
-                INSERT INTO fills (order_id, qty, price, time, exec_id, commission)
+                INSERT OR IGNORE INTO fills (order_id, qty, price, time, exec_id, commission)
                 VALUES (?,?,?,?,?,?)
                 """,
                 (
@@ -434,7 +472,19 @@ class Journal:
 
     # ── audit trail ────────────────────────────────────────────────────────
 
-    def log_event(self, kind: str, subject: str = "", payload: Optional[dict] = None) -> None:
+    def log_event(
+        self,
+        kind: str,
+        subject: str = "",
+        payload: Optional[dict] = None,
+        claim_key: Optional[str] = None,
+    ) -> None:
+        """Insert an audit event row.
+
+        ``claim_key`` is an optional indexed dedup token. Pass an order's
+        ``client_order_id`` so a later ``has_event_claim()`` lookup can detect
+        retries without scanning ``payload_json`` with LIKE.
+        """
         # Sanitise payload before storage: IEEE-754 NaN/Inf are truthy in Python
         # but json.dumps() serialises them as bare `NaN`/`Infinity` tokens which
         # violate RFC 8259 and cause json.loads() to fail on read-back.
@@ -452,9 +502,30 @@ class Journal:
         safe_payload = _sanitise(payload or {})
         with self._tx() as c:
             c.execute(
-                "INSERT INTO events (time, kind, subject, payload_json) VALUES (?,?,?,?)",
-                (_utc_now_iso(), kind, subject, json.dumps(safe_payload)),
+                "INSERT INTO events (time, kind, subject, claim_key, payload_json) "
+                "VALUES (?,?,?,?,?)",
+                (_utc_now_iso(), kind, subject, claim_key,
+                 json.dumps(safe_payload)),
             )
+
+    def has_event_claim(self, claim_key: str, kind: Optional[str] = None) -> bool:
+        """Indexed dedup lookup. Returns True if any event row already holds
+        ``claim_key`` (optionally filtered by ``kind``)."""
+        if not claim_key:
+            return False
+        with self._lock:
+            cur = self._conn.cursor()
+            if kind:
+                cur.execute(
+                    "SELECT 1 FROM events WHERE claim_key = ? AND kind = ? LIMIT 1",
+                    (claim_key, kind),
+                )
+            else:
+                cur.execute(
+                    "SELECT 1 FROM events WHERE claim_key = ? LIMIT 1",
+                    (claim_key,),
+                )
+            return cur.fetchone() is not None
 
     def recent_events(self, limit: int = 100) -> list[dict]:
         with self._lock:

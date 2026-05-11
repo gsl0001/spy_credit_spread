@@ -47,6 +47,10 @@ export const api = {
   liveChain:      (t = 'SPY') => get(`/api/live_chain?ticker=${t}`),
   strategies:     ()     => get('/api/strategies'),
 
+  // Connection auto-reconnect toggles
+  connectionAutoGet: ()                     => get('/api/connection/auto'),
+  connectionAutoSet: (broker, enabled)      => post('/api/connection/auto', { broker, enabled }),
+
   // IBKR
   heartbeat:      ()     => post('/api/ibkr/heartbeat', IBKR_CREDS),
   ibkrConnect:    ()     => post('/api/ibkr/connect', IBKR_CREDS),
@@ -58,12 +62,14 @@ export const api = {
   reconnect:      ()     => post('/api/ibkr/reconnect', IBKR_CREDS),
   ibkrCancel:     (orderId) => post('/api/ibkr/cancel', { ...IBKR_CREDS, orderId }),
 
-  // Paper (Alpaca)
-  paperConnect:   (creds) => post('/api/paper/connect', creds),
-  paperPositions: (creds) => post('/api/paper/positions', creds),
-  paperOrders:    (creds) => post('/api/paper/orders', creds),
-  paperExecute:   (payload) => post('/api/paper/execute', payload),
-  paperScan:      (payload) => post('/api/paper/scan', payload),
+  // Paper Trials — automated multi-preset paper-trading gate
+  paperTrialsList:    (status)        => get(`/api/paper_trials${status ? `?status=${status}` : ''}`),
+  paperTrialStart:    (payload)       => post('/api/paper_trials/start', payload),
+  paperTrialEvaluate: ()              => post('/api/paper_trials/evaluate_now'),
+  paperTrialStop:     (presetName)    => post(`/api/paper_trials/${encodeURIComponent(presetName)}/stop`),
+  paperTrialPromote:  (presetName)    => post(`/api/paper_trials/${encodeURIComponent(presetName)}/promote`),
+  paperTrialDelete:   (presetName)    => fetch(`${API}/api/paper_trials/${encodeURIComponent(presetName)}`,
+                                              { method: 'DELETE' }).then(r => r.json()),
 
   // Backtest / optimizer
   runBacktest:    (cfg = {}) => post('/api/backtest', cfg, 120000),
@@ -109,5 +115,5 @@ export const api = {
 
 export async function safe(fn, fallback = null) {
   try { return await fn(); }
-  catch (_e) { return fallback; }
+  catch { return fallback; }
 }

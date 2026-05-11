@@ -3,6 +3,8 @@ import numpy as np
 from strategies.base import BaseStrategy
 
 class ComboSpreadStrategy(BaseStrategy):
+    VETTING_RESULT: str = "shipped"
+
     @property
     def name(self) -> str:
         return "Combo Spread"

@@ -86,8 +86,8 @@ def _fetch_vix_cached() -> float | None:
         if value is not None and (_time_module.monotonic() - fetched_at) < _VIX_TTL:
             return value
         try:
-            import yfinance as yf
-            fetched = yf.Ticker("^VIX").fast_info.get("lastPrice")
+            from core.yf_safe import safe_fast_info
+            fetched = safe_fast_info("^VIX").get("lastPrice")
             if fetched is not None:
                 _vix_cache = (float(fetched), _time_module.monotonic())
                 return float(fetched)
@@ -102,6 +102,7 @@ class OrbStrategy(BaseStrategy):
     # Intraday — 5-min bars so the OR window (9:30–9:35 ET) is one bar.
     BAR_SIZE: str = "5 mins"
     HISTORY_PERIOD: str = "5d"
+    VETTING_RESULT: str = "shipped"
 
     @property
     def name(self) -> str:

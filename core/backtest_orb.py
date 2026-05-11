@@ -46,6 +46,8 @@ class OrbBacktestConfig:
     map 1:1 to live trading.
     """
     or_minutes: int = 5
+    or_start_time: time = time(9, 30)
+    fade_mode: bool = False  # If True, invert direction post-breakout (fade)
     offset_points: float = 1.50
     width_points: int = 5
     min_range_pct: float = 0.05      # 0.05% of price
@@ -201,8 +203,8 @@ def run_orb_backtest(
         if v is not None and (v < config.vix_min or v > config.vix_max):
             continue
 
-        # 4. Identify the OR window (9:30 to 9:30+or_minutes)
-        or_start = time(9, 30)
+        # 4. Identify the OR window (configurable start to start+or_minutes)
+        or_start = config.or_start_time
         or_end = (
             pd.Timestamp.combine(day, or_start)
             + pd.Timedelta(minutes=config.or_minutes)
@@ -244,6 +246,8 @@ def run_orb_backtest(
         if breakout is None:
             continue
         direction, entry_price, entry_ts = breakout
+        if config.fade_mode:
+            direction = "bear" if direction == "bull" else "bull"
 
         # 7. Strike selection — long at entry ± offset, rounded to dollar
         if direction == "bull":
@@ -440,6 +444,7 @@ def _trade_dict(t: _Trade) -> dict:
         "exit_reason": t.exit_reason,
         "pnl_pct": round(t.pnl_pct, 2),
         "pnl_dollars": round(t.pnl_dollars, 2),
+        "spread_value_at_exit": round(t.spread_value_at_exit * 100, 2),
     }
 
 

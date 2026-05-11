@@ -1,5 +1,8 @@
 import contextlib
 import functools
+import os
+import sqlite3
+from dataclasses import asdict
 import time as _time
 from typing import List, Optional, Any
 
@@ -28,7 +31,7 @@ import numpy as np
 import scipy.stats as si
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 # Strategy imports
 from strategies.consecutive_days import ConsecutiveDaysStrategy
@@ -57,12 +60,68 @@ async def _lifespan(application):
     global _MAIN_LOOP
     _MAIN_LOOP = asyncio.get_running_loop()
 
-    # I6: Auto-connect to IBKR on startup if configured
+    # Startup hardening: raise FD limit + reset corrupted yfinance cache so
+    # the long-running scheduler doesn't hit "Too many open files" or stale
+    # SQLite "unable to open database file" errors mid-session.
+    try:
+        from core.yf_safe import raise_fd_limit, reset_cache as _yf_reset
+        raise_fd_limit(8192)
+        _yf_reset()
+    except Exception as exc:  # pragma: no cover - best effort
+        _startup_log.warning("startup hardening skipped: %s", exc)
+
+    # I6: Auto-connect to IBKR on startup if configured AND header toggle ON
     from core.settings import SETTINGS
+    from core.connection_flags import is_auto_enabled
     ib_cfg = SETTINGS.ibkr.as_dict()
-    if ib_cfg.get("host") and ib_cfg.get("port"):
+    if ib_cfg.get("host") and ib_cfg.get("port") and is_auto_enabled("ibkr"):
         _startup_log.info("auto-connecting to IBKR at %s:%s...", ib_cfg["host"], ib_cfg["port"])
         asyncio.create_task(get_ib_connection(ib_cfg))
+    elif not is_auto_enabled("ibkr"):
+        _startup_log.info("IBKR auto-reconnect disabled by header toggle; skipping startup connect")
+
+    # Telegram bot polling: register on startup if configured, so /help etc.
+    # work without first calling /api/monitor/start. Idempotent — replaces
+    # any existing telegram_bot job.
+    try:
+        from core.telegram_bot import configured as _tg_configured
+        if _tg_configured():
+            tg_secs = max(int(SETTINGS.telegram.poll_interval_seconds), 1)
+            scheduler.add_job(
+                _run_telegram_poll, "interval", seconds=tg_secs,
+                id="telegram_bot", replace_existing=True,
+                max_instances=1, coalesce=True,
+            )
+            _startup_log.info("telegram bot polling registered (every %ds)", tg_secs)
+    except Exception as exc:  # pragma: no cover - best effort
+        _startup_log.warning("telegram startup register skipped: %s", exc)
+
+    # Daily paper-trading-gate evaluator at 16:30 ET (after US RTH close).
+    # Iterates active trials, marks pass/fail when sample-size minimums met.
+    try:
+        scheduler.add_job(
+            _run_paper_gate_evaluator, "cron",
+            hour=16, minute=30, day_of_week="mon-fri",
+            id="paper_gate_evaluator", replace_existing=True,
+            max_instances=1, coalesce=True,
+        )
+        _startup_log.info("paper gate evaluator registered (16:30 ET, Mon-Fri)")
+    except Exception as exc:  # pragma: no cover - best effort
+        _startup_log.warning("paper gate evaluator register skipped: %s", exc)
+
+    # Boot-time moomoo reconciler. Runs after a 10s grace period so any UI
+    # auto-reconnect has time to land; logs broker vs journal drift, auto-
+    # records broker orphans as ``single_leg_orphan`` positions for the MTM
+    # monitor to manage. Best-effort — errors are logged and ignored.
+    async def _boot_reconcile_after_delay():
+        try:
+            await asyncio.sleep(10)
+            from core.moomoo_reconciler import reconcile_once
+            result = await reconcile_once()
+            _startup_log.info("boot reconcile result: %s", result)
+        except Exception as exc:  # pragma: no cover - best effort
+            _startup_log.warning("boot reconcile failed: %s", exc)
+    asyncio.create_task(_boot_reconcile_after_delay())
 
     yield
     _MAIN_LOOP = None
@@ -195,6 +254,17 @@ class BacktestRequest(BaseModel):
     # I9: bid-ask haircut — fraction of mid-price paid as spread on each fill.
     # 0.02 = 2% adverse fill (mid ± half spread).  Default 0.0 for backward compat.
     bid_ask_haircut: float = 0.0
+    strategy_params: dict = Field(default_factory=dict)
+
+    # Intraday / ORB params. The frontend's schema form sends these flat so
+    # keep them first-class while also accepting nested strategy_params.
+    or_minutes: int = 5
+    offset: float = 1.50
+    width: int = 5
+    min_range_pct: float = 0.05
+    time_exit_hhmm: str = "15:30"
+    allowed_days: str = "MWF"
+    skip_news_days: bool = True
 
 class OptimizerRequest(BaseModel):
     base_config: BacktestRequest = BacktestRequest()
@@ -222,22 +292,43 @@ class StrategyFactory:
     @staticmethod
     def get_all_strategies():
         return [
-            {"id": k, "name": v().name, "schema": v.get_schema()}
+            {
+                "id": k,
+                "name": v().name,
+                "schema": v.get_schema(),
+                "bar_size": getattr(v, "BAR_SIZE", "1 day"),
+                "history_period": getattr(v, "HISTORY_PERIOD", "1mo"),
+                "vetting_result": getattr(v, "VETTING_RESULT", "pending"),
+            }
             for k, v in StrategyFactory._registry().items()
         ]
 
 
 # ── Data fetching ──────────────────────────────────────────────────────────
 @_ttl_cache(300)
-def fetch_historical_data(ticker: str, years: int):
-    period = f"{years}y"
-    df = yf.download(ticker, period=period, progress=False)
+def fetch_historical_data(ticker: str, years: int, strategy_id: str = ""):
+    bar_size, history_period = _resolve_bar_spec(strategy_id) if strategy_id else ("1 day", "1mo")
+    is_intraday = bar_size != "1 day"
+    interval = _YF_INTERVAL_MAP.get(bar_size, "1d") if is_intraday else "1d"
+    if is_intraday:
+        period = _YF_INTRADAY_CAP.get(interval, history_period or "60d")
+    else:
+        period = f"{years}y"
+    df = yf.download(ticker, period=period, interval=interval, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.reset_index(inplace=True)
-    if 'Date' not in df.columns and 'index' in df.columns:
-        df.rename(columns={'index': 'Date'}, inplace=True)
+    if 'Date' not in df.columns:
+        if 'Datetime' in df.columns:
+            df.rename(columns={'Datetime': 'Date'}, inplace=True)
+        elif 'index' in df.columns:
+            df.rename(columns={'index': 'Date'}, inplace=True)
     if hasattr(df['Date'].dt, 'tz') and df['Date'].dt.tz is not None:
+        if is_intraday:
+            try:
+                df['Date'] = df['Date'].dt.tz_convert("America/New_York")
+            except Exception:
+                pass
         df['Date'] = df['Date'].dt.tz_localize(None)
     return df
 
@@ -650,6 +741,225 @@ def run_walk_forward(req, df):
     return results
 
 
+def _param(req: BacktestRequest, key: str, default):
+    params = getattr(req, "strategy_params", {}) or {}
+    return params.get(key, getattr(req, key, default))
+
+
+def _parse_hhmm(value: str):
+    from datetime import time as _time_cls
+    try:
+        hour, minute = (int(part) for part in str(value).split(":", 1))
+        return _time_cls(hour, minute)
+    except Exception:
+        return _time_cls(15, 30)
+
+
+def _allowed_days_to_weekdays(value: str) -> tuple[int, ...]:
+    value = str(value or "MWF").upper()
+    if value in {"ALL", "MON-FRI", "WEEKDAYS"}:
+        return (0, 1, 2, 3, 4)
+    mapping = {"M": 0, "T": 1, "W": 2, "R": 3, "F": 4}
+    days = tuple(mapping[ch] for ch in value if ch in mapping)
+    return days or (0, 2, 4)
+
+
+def _orb_config_from_request(req: BacktestRequest):
+    from core.backtest_orb import OrbBacktestConfig
+    is_ldm = req.strategy_id in ("ldm_0dte", "ldm_fade_0dte")
+    is_fade = req.strategy_id == "ldm_fade_0dte"
+    default_or_minutes = 15 if is_ldm else 5
+    default_or_start = "14:00" if is_ldm else "09:30"
+    default_offset = 0.50 if is_ldm else 1.50
+    default_allowed = "MTWRF" if is_ldm else "MWF"
+    default_min_range = 0.05
+    default_entry_cutoff = "15:30"
+    default_time_exit = "15:55" if is_ldm else "15:30"
+    default_vix_min = 12.0 if is_ldm else float(req.vix_min)
+    default_vix_max = 30.0 if is_ldm else float(req.vix_max)
+    return OrbBacktestConfig(
+        or_minutes=int(_param(req, "or_minutes", default_or_minutes)),
+        or_start_time=_parse_hhmm(_param(req, "or_start_hhmm", default_or_start)),
+        fade_mode=is_fade,
+        offset_points=float(_param(req, "offset", default_offset)),
+        width_points=int(_param(req, "width", req.strike_width or 5)),
+        min_range_pct=float(_param(req, "min_range_pct", default_min_range)),
+        vix_min=float(_param(req, "vix_min", default_vix_min)),
+        vix_max=float(_param(req, "vix_max", default_vix_max)),
+        allowed_weekdays=_allowed_days_to_weekdays(_param(req, "allowed_days", default_allowed)),
+        skip_news_days=bool(_param(req, "skip_news_days", True)),
+        take_profit_pct=float(req.take_profit_pct),
+        stop_loss_pct=float(req.stop_loss_pct),
+        time_exit=_parse_hhmm(_param(req, "time_exit_hhmm", default_time_exit)),
+        entry_cutoff=_parse_hhmm(_param(req, "entry_cutoff_hhmm", default_entry_cutoff)),
+        capital=float(req.capital_allocation),
+        contracts_per_trade=int(req.contracts_per_trade),
+        spread_cost_per_contract=float(req.spread_cost_target),
+        commission_per_contract=float(req.commission_per_contract),
+    )
+
+
+def _raw_bars_to_orb_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
+    bars = raw_df.copy()
+    if "Date" not in bars.columns and isinstance(bars.index, pd.DatetimeIndex):
+        bars["Date"] = bars.index
+    rename = {
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Volume": "volume",
+    }
+    bars = bars.rename(columns=rename)
+    required = ["Date", "open", "high", "low", "close"]
+    missing = [col for col in required if col not in bars.columns]
+    if missing:
+        raise ValueError(f"ORB backtest missing columns: {', '.join(missing)}")
+    bars["Date"] = pd.to_datetime(bars["Date"])
+    bars = bars.set_index("Date", drop=False)
+    keep = ["open", "high", "low", "close"]
+    if "volume" in bars.columns:
+        keep.append("volume")
+    return bars[keep]
+
+
+def _orb_vix_series(req: BacktestRequest):
+    if not req.use_vix_filter:
+        return None
+    vix_df = fetch_vix_data(req.years_history)
+    if vix_df.empty:
+        return pd.Series(dtype=float)
+    series = vix_df.copy()
+    series["Date"] = pd.to_datetime(series["Date"]).dt.normalize()
+    return series.set_index("Date")["VIX"]
+
+
+def _orb_events(req: BacktestRequest) -> set[str] | None:
+    if not bool(_param(req, "skip_news_days", True)):
+        return None
+    from core.calendar import load_event_calendar
+    return {ev.date for ev in load_event_calendar() if ev.severity in ("high", "medium")}
+
+
+def _adapt_orb_report(report: dict, raw_df: pd.DataFrame, req: BacktestRequest) -> dict:
+    stats = report.get("stats", {})
+    trades = []
+    for t in report.get("trades", []):
+        entry_date = str(t.get("date") or t.get("entry_time", ""))[:10]
+        exit_date = str(t.get("exit_time", ""))[:10] or entry_date
+        trades.append({
+            "entry_date": entry_date,
+            "exit_date": exit_date,
+            "entry_spy": t.get("entry_price", 0),
+            "exit_spy": t.get("exit_price", 0),
+            "side": "BUY",
+            "spread_cost": req.spread_cost_target * req.contracts_per_trade,
+            "spread_exit": t.get("spread_value_at_exit", 0),
+            "pnl": t.get("pnl_dollars", 0),
+            "contracts": req.contracts_per_trade,
+            "days_held": 0,
+            "commission": req.commission_per_contract * 4 * req.contracts_per_trade,
+            "win": (t.get("pnl_dollars", 0) > 0),
+            "stopped_out": t.get("exit_reason") == "stop_loss",
+            "reason": t.get("exit_reason", "time_exit"),
+            "regime": "intraday",
+            "topology": req.topology,
+        })
+
+    price_history = raw_df.copy()
+    if "Date" not in price_history.columns and isinstance(price_history.index, pd.DatetimeIndex):
+        price_history["Date"] = price_history.index
+    if not price_history.empty:
+        price_history["time"] = pd.to_datetime(price_history["Date"]).dt.strftime("%Y-%m-%d %H:%M")
+        price_history = price_history.rename(columns={
+            "Open": "open", "High": "high", "Low": "low", "Close": "close",
+        })
+        price_history = price_history[["time", "open", "high", "low", "close"]]
+        for col in ["open", "high", "low", "close"]:
+            price_history[col] = price_history[col].astype(float).round(2)
+
+    # Compute profit_factor / avg_hold_days / max_consec_losses from the
+    # trade list so intraday strategies can be evaluated against the same
+    # skill bar as daily strategies (skill Step 7).
+    pnls = [float(t.get("pnl", 0) or 0) for t in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = round(gross_win / gross_loss, 3) if gross_loss > 0 else (
+        float("inf") if gross_win > 0 else 0.0
+    )
+    # Intraday hold reported as fraction of a session day for legibility
+    # (e.g. 0.25 = ~1.6h held). The trade rows from the ORB engine carry
+    # entry_time/exit_time inside the original report; pull from there.
+    raw_trades = report.get("trades", [])
+    hold_fracs = []
+    for t in raw_trades:
+        try:
+            entry_ts = pd.to_datetime(t.get("entry_time"))
+            exit_ts = pd.to_datetime(t.get("exit_time"))
+            if pd.notna(entry_ts) and pd.notna(exit_ts):
+                hours = (exit_ts - entry_ts).total_seconds() / 3600.0
+                if hours >= 0:
+                    hold_fracs.append(hours / 6.5)  # 6.5h regular session
+        except Exception:
+            continue
+    avg_hold_days = round(sum(hold_fracs) / len(hold_fracs), 3) if hold_fracs else 0.0
+    # Max consecutive losses
+    max_consec, cur_consec = 0, 0
+    for p in pnls:
+        if p < 0:
+            cur_consec += 1
+            max_consec = max(max_consec, cur_consec)
+        else:
+            cur_consec = 0
+    # Recovery factor: |total_pnl| / |max_drawdown_dollars|. Engine reports
+    # max_drawdown_pct (% of starting equity), so reconstruct dollar DD.
+    capital = float(getattr(req, "capital_allocation", 10000) or 10000)
+    dd_pct = float(stats.get("max_drawdown_pct", 0) or 0)
+    dd_dollars = abs(dd_pct) / 100.0 * capital if capital > 0 else 0.0
+    total_pnl = float(stats.get("total_pnl", 0) or 0)
+    recovery_factor = round(total_pnl / dd_dollars, 3) if dd_dollars > 0 else 0.0
+
+    metrics = {
+        "total_trades": stats.get("total_trades", 0),
+        "win_rate": round(float(stats.get("win_rate", 0)) * 100, 2),
+        "total_pnl": total_pnl,
+        "avg_pnl": round(total_pnl / max(int(stats.get("total_trades", 0)), 1), 2),
+        "sharpe_ratio": stats.get("sharpe", 0),
+        "max_drawdown": stats.get("max_drawdown_pct", 0),
+        "profit_factor": profit_factor,
+        "recovery_factor": recovery_factor,
+        "avg_hold_days": avg_hold_days,
+        "max_consec_losses": max_consec,
+    }
+
+    return _safe_json({
+        "metrics": metrics,
+        "trades": trades,
+        "equity_curve": report.get("equity_curve", []),
+        "price_history": price_history.to_dict(orient="records") if not price_history.empty else [],
+        "heatmap": [],
+        "monte_carlo": None,
+        "walk_forward": [],
+        "duration_dist": [],
+        "regime_stats": {},
+        "regime_timeline": [],
+    })
+
+
+def _run_orb_endpoint_backtest(req: BacktestRequest, raw_df: pd.DataFrame) -> dict:
+    from core.backtest_orb import run_orb_backtest
+    bars = _raw_bars_to_orb_frame(raw_df)
+    report = run_orb_backtest(
+        bars,
+        vix=_orb_vix_series(req),
+        events=_orb_events(req),
+        config=_orb_config_from_request(req),
+    )
+    return _adapt_orb_report(report, raw_df, req)
+
+
 @app.get("/api/strategies")
 def get_strategies():
     all_strats = StrategyFactory.get_all_strategies()
@@ -661,9 +971,21 @@ def get_strategies():
 @app.post("/api/backtest")
 def backtest(req: BacktestRequest):
     try:
-        raw_df = fetch_historical_data(req.ticker, req.years_history)
+        raw_df = fetch_historical_data(req.ticker, req.years_history, req.strategy_id)
         df = raw_df.copy() # Indicators computed inside engine now per strategy
         if len(df) == 0: return {"error": "No data returned."}
+
+        # Route any intraday strategy through the ORB intraday harness.
+        # The harness handles "5 mins"/"15 mins"/"1 hour" via or_minutes
+        # and or_start_time knobs; daily strategies fall through to
+        # run_backtest_engine. Dispatch on the class invariant rather
+        # than a hardcoded id list so adding a new intraday strategy
+        # doesn't require touching this branch.
+        from core.scanner import resolve_strategy_class as _resolve_cls
+        _cls = _resolve_cls(req.strategy_id)
+        _bar_size = getattr(_cls, "BAR_SIZE", "1 day") if _cls else "1 day"
+        if _bar_size != "1 day":
+            return _run_orb_endpoint_backtest(req, raw_df)
 
         # Merge VIX data if filter enabled
         if req.use_vix_filter:
@@ -727,8 +1049,9 @@ async def spy_intraday(host: str = None, port: int = None, client_id: int = None
 
     # 2. Fetch history from yfinance (with prepost=True for extended hours)
     try:
+        from core.yf_safe import safe_download, safe_fast_info
         # Use 2d period to ensure we have context for overnight/pre-market moves
-        df = yf.download("SPY", period="2d", interval="1m", progress=False, prepost=True)
+        df = safe_download("SPY", period="2d", interval="1m", progress=False, prepost=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.reset_index(inplace=True)
@@ -749,7 +1072,7 @@ async def spy_intraday(host: str = None, port: int = None, client_id: int = None
             
             # Use yfinance ticker info to get an accurate previous close
             try:
-                ticker_info = yf.Ticker("SPY").fast_info
+                ticker_info = safe_fast_info("SPY")
                 prev_close = ticker_info.get("previousClose") or data[0]["close"]
             except Exception:
                 prev_close = data[0]["close"]
@@ -1037,10 +1360,8 @@ def start_scanner(req: ScannerConfigRequest):
     scanner_state["config"] = req.config
     scanner_state["auto_execute"] = req.auto_execute
 
-    # Remove existing scan jobs
-    for job in scheduler.get_jobs():
-        if job.id.startswith("market_scan"):
-            job.remove()
+    # Remove existing scanner jobs while preserving monitor/telegram jobs.
+    _remove_market_scan_jobs()
 
     if req.timing_mode == "interval":
         secs = max(req.timing_value, 10)
@@ -1072,7 +1393,7 @@ def start_scanner(req: ScannerConfigRequest):
 @app.post("/api/scanner/stop")
 def stop_scanner():
     scanner_state["active"] = False
-    scheduler.remove_all_jobs()
+    _remove_market_scan_jobs()
     return {"status": "stopped"}
 
 @app.get("/api/scanner/status")
@@ -1246,7 +1567,8 @@ def _preset_bars_fetcher(symbol: str, strategy_name: Optional[str] = None):
 
     if not live_price and not is_intraday:
         try:
-            live_price = yf.Ticker(symbol).fast_info.get("lastPrice")
+            from core.yf_safe import safe_fast_info
+            live_price = safe_fast_info(symbol).get("lastPrice")
         except Exception:
             pass
 
@@ -1268,7 +1590,8 @@ def _preset_bars_fetcher(symbol: str, strategy_name: Optional[str] = None):
             pass
 
     # ── 3. yfinance fallback (free, no subscription) ──────────────────
-    df = yf.download(symbol, period=yf_period, interval=yf_interval, progress=False)
+    from core.yf_safe import safe_download as _yf_safe_download
+    df = _yf_safe_download(symbol, period=yf_period, interval=yf_interval, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     if len(df) == 0:
@@ -1340,9 +1663,12 @@ def _run_preset_tick():
                     if not (sig.fired and sig.signal_type == "entry"):
                         continue
 
-                    # Per-day idempotency: same symbol + preset can only fire once/day
-                    _date = datetime.now().strftime("%Y-%m-%d")
-                    _idem_key = f"scan:{_date}:{sig.symbol}:{p.name}"
+                    # Per-bar idempotency: same symbol + preset can only fire once
+                    # per entry bar. sig.time is the bar timestamp from the
+                    # strategy, so re-ticks within the same bar are deduped
+                    # but the next bar can fire normally.
+                    _bar_ts = (sig.time or datetime.now().strftime("%Y-%m-%d"))[:19]
+                    _idem_key = f"scan:{_bar_ts}:{sig.symbol}:{p.name}"
                     if _gj().get_order_by_idempotency(_idem_key):
                         log_event(_startup_log, "preset_scan_duplicate_suppressed",
                                   key=_idem_key)
@@ -1359,6 +1685,10 @@ def _run_preset_tick():
                         try:
                             order_req = MoomooOrderRequest(
                                 symbol=sig.symbol or p.ticker,
+                                # direction = "bull_call" | "bear_put"; threaded
+                                # through to _moomoo_execute_impl which branches
+                                # the strike picker (pick_bull_call_strikes vs
+                                # pick_bear_put_strikes) on "bear" in direction.
                                 direction=p.strategy_type,
                                 contracts=int(getattr(sig, "contracts", 0) or 0),
                                 strike_width=int(p.strike_width),
@@ -1372,11 +1702,53 @@ def _run_preset_tick():
                                 trailing_stop_pct=float(p.trailing_stop_pct),
                                 otm_offset=float(p.strategy_params.get("offset", 0.0)),
                                 client_order_id=_idem_key,
+                                chain_max_bid_ask_pct=float(p.strategy_params.get("chain_max_bid_ask_pct", 0.25)),
+                                chain_min_volume=int(p.strategy_params.get("chain_min_volume", 0) or 0),
+                                chain_min_open_interest=int(p.strategy_params.get("chain_min_open_interest", 0) or 0),
+                                # Smoke-test presets (dryrun) need to bypass the
+                                # event-blackout gate; production strategies must
+                                # leave this False so CPI/FOMC/NFP keep blocking.
+                                # Server-side opt-in gate: preset's flag is
+                                # only honored when ALLOW_BYPASS_EVENT_BLACKOUT=1.
+                                # Same env gate as the public API so a stray
+                                # preset can't quietly disable news filters.
+                                bypass_event_blackout=(
+                                    bool(getattr(p, "bypass_event_blackout", False))
+                                    and os.environ.get("ALLOW_BYPASS_EVENT_BLACKOUT", "0") == "1"
+                                ),
+                                preset_name=p.name,
                             )
                         except Exception as e:
                             log_event(_startup_log, "preset_auto_execute_build_failed",
                                       error=str(e), preset=p.name)
                             continue
+                        # Paper-trading-gate pre-fire check. If the preset is
+                        # under an active trial, enforce per-trial position
+                        # cap and conservative sizing so the trial sample
+                        # stays apples-to-apples with the backtest.
+                        try:
+                            from core.paper_gate import (
+                                get_paper_gate_store, trial_allows_fire,
+                                STATUS_TRIALING,
+                            )
+                            allowed, reason = trial_allows_fire(p.name)
+                            if not allowed:
+                                log_event(_startup_log, "paper_trial_blocked",
+                                          preset=p.name, reason=reason)
+                                continue
+                            _trial = get_paper_gate_store().get(p.name)
+                            if _trial and _trial.status == STATUS_TRIALING:
+                                # Override sizing to fixed 1 contract — skill
+                                # rule: "fixed_contracts: 1 for first-time
+                                # presets; switch to dynamic_risk only after
+                                # the live paper run confirms".
+                                order_req = order_req.model_copy(update={
+                                    "contracts": 1,
+                                    "position_size_method": "fixed",
+                                })
+                        except Exception as _exc:  # pragma: no cover
+                            _startup_log.warning(
+                                "paper gate pre-fire check failed: %s", _exc)
                         coro = _moomoo_execute_impl(order_req)
                     else:
                         # IBKR path (default)
@@ -1448,6 +1820,13 @@ def _run_preset_tick():
         log_event(_startup_log, "preset_tick_failed", error=str(e))
 
 
+def _remove_market_scan_jobs() -> None:
+    """Remove scanner jobs without touching monitor/telegram/digest jobs."""
+    for job in scheduler.get_jobs():
+        if str(job.id).startswith("market_scan"):
+            job.remove()
+
+
 @app.post("/api/scanner/preset/start")
 def start_preset_scanner(payload: dict):
     name = (payload or {}).get("name")
@@ -1465,7 +1844,7 @@ def start_preset_scanner(payload: dict):
         scanner_state["config"] = preset.to_dict()
         scanner_state["timing_mode"] = preset.timing_mode
         scanner_state["timing_value"] = preset.timing_value
-        scheduler.remove_all_jobs()
+        _remove_market_scan_jobs()
 
         if preset.timing_mode == "interval":
             secs = max(preset.timing_value, 10)
@@ -1517,7 +1896,7 @@ def tick_preset_scanner():
 def stop_preset_scanner():
     _preset_scanner.stop()
     scanner_state["active"] = False
-    scheduler.remove_all_jobs()
+    _remove_market_scan_jobs()
     return {"stopped": True}
 
 
@@ -1536,8 +1915,77 @@ class IBKRConnectRequest(BaseModel):
     port: int = 7497
     client_id: int = 1
 
+
+# ── Connection auto-reconnect toggles (header pills) ──────────────────────
+class ConnectionAutoRequest(BaseModel):
+    broker: str  # "ibkr" or "moomoo"
+    enabled: bool
+
+
+@app.get("/api/connection/auto")
+async def connection_auto_get():
+    from core.connection_flags import snapshot
+    return snapshot()
+
+
+@app.post("/api/connection/auto")
+async def connection_auto_set(req: ConnectionAutoRequest):
+    from core.connection_flags import set_auto_enabled, snapshot
+    try:
+        set_auto_enabled(req.broker, req.enabled)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    # Side-effects when toggling off: cancel any in-flight reconnect work,
+    # disconnect the live trader so the strategy doesn't keep dialing.
+    if not req.enabled:
+        if req.broker == "ibkr":
+            try:
+                from brokers.ibkr_trading import _ib_instances
+                for trader in list(_ib_instances.values()):
+                    try:
+                        trader.disconnect()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        elif req.broker == "moomoo":
+            try:
+                global _moomoo_trader
+                from core.broker import unregister_broker
+                if _moomoo_trader is not None:
+                    try:
+                        _moomoo_trader.disconnect()
+                    except Exception:
+                        pass
+                    _moomoo_trader = None
+                try:
+                    unregister_broker("moomoo")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    # Side-effect when toggling on: kick a fresh connect attempt so the user
+    # gets immediate feedback instead of waiting for the next scheduler tick.
+    if req.enabled:
+        if req.broker == "ibkr":
+            try:
+                from core.settings import SETTINGS
+                ib_cfg = SETTINGS.ibkr.as_dict()
+                if ib_cfg.get("host") and ib_cfg.get("port"):
+                    asyncio.create_task(get_ib_connection(ib_cfg))
+            except Exception:
+                pass
+
+    return {"ok": True, "flags": snapshot()}
+
+
 @app.post("/api/ibkr/connect")
 async def ibkr_connect(req: IBKRConnectRequest):
+    # No force=True: this endpoint is also the frontend's 10s heartbeat poll
+    # (useBackendData.positions). When the header IBKR toggle is OFF the gate
+    # in get_ib_connection() must short-circuit so we don't dial TWS.
     trader, msg = await get_ib_connection(req.model_dump())
     if trader:
         summary = await trader.get_account_summary()
@@ -2102,8 +2550,25 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
         "moomoo_reconnecting": False,
         "moomoo_reconnect_attempt": 0,
         "zero_dte_bot": None,
+        "market_open": False,
+        "market_reason": "unknown",
+        "minutes_to_close": None,
+        "next_close": "unknown",
         "alerts": [],
     }
+
+    # Market-hours status for the header/status bar. Keep this independent of
+    # broker connectivity so the UI can explain closed-market states cleanly.
+    try:
+        from core.calendar import is_market_open, minutes_to_close
+        market_open, market_reason = is_market_open()
+        mtc = minutes_to_close()
+        result["market_open"] = bool(market_open)
+        result["market_reason"] = market_reason
+        result["minutes_to_close"] = mtc
+        result["next_close"] = f"{mtc}m to close" if market_open and mtc >= 0 else market_reason.replace("_", " ")
+    except Exception:
+        pass
 
     # Journal health + daily-loss consumption (I10).
     try:
@@ -2195,6 +2660,7 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
     try:
         if _moomoo_trader is not None and _moomoo_trader.is_alive():
             result["moomoo_connected"] = True
+            result["moomoo_acc_id"] = getattr(_moomoo_trader, "_acc_id", None)
             last_iso = getattr(_moomoo_trader, "last_healthy_iso", None)
             result["moomoo_last_healthy_iso"] = last_iso
             if last_iso:
@@ -2214,9 +2680,10 @@ async def ibkr_heartbeat(req: IBKRConnectRequest):
                         "message": f"OpenD silent for {int(delta)}s — connection may be dead",
                     })
         elif _moomoo_trader is not None and not _moomoo_trader.is_alive():
-            # Connection dropped — trigger auto-reconnect if available
+            # Connection dropped — trigger auto-reconnect if header toggle ON
             result["moomoo_connected"] = False
-            if hasattr(_moomoo_trader, "schedule_reconnect"):
+            from core.connection_flags import is_auto_enabled
+            if is_auto_enabled("moomoo") and hasattr(_moomoo_trader, "schedule_reconnect"):
                 _moomoo_trader.schedule_reconnect(_MAIN_LOOP)
             if hasattr(_moomoo_trader, "reconnecting") and _moomoo_trader.reconnecting:
                 result["moomoo_reconnecting"] = True
@@ -2317,7 +2784,32 @@ class MoomooOrderRequest(BaseModel):
     # tests can fire orders during news days.  NEVER set True in
     # production scanner code paths — the news filter exists for a
     # reason (NFP/FOMC/CPI move SPY 2-3% in seconds).
+    #
+    # Security: this flag arrives over the wire but is honored ONLY when the
+    # server-side env var ALLOW_BYPASS_EVENT_BLACKOUT=1 is also set. A
+    # field-level validator (below) zeroes it otherwise so a malicious or
+    # misconfigured client can't disable the blackout gate.
     bypass_event_blackout: bool = False
+
+    @field_validator("bypass_event_blackout", mode="before")
+    @classmethod
+    def _gate_bypass_event_blackout(cls, v: Any) -> bool:
+        # Server-side opt-in via env var. Defaults to "0" → False.
+        import os as _os
+        if _os.environ.get("ALLOW_BYPASS_EVENT_BLACKOUT", "0") != "1":
+            return False
+        return bool(v)
+    # Chain-quality gate tolerance overrides. moomoo OpenD NBBO is sparser
+    # than IBKR's, so the per-leg bid/ask % default is more permissive than
+    # the validate_spread_quality() default. Set via preset.strategy_params.
+    chain_max_bid_ask_pct: float = 0.25
+    chain_min_volume: int = 0
+    chain_min_open_interest: int = 0
+    # Skill Step 10 / paper-validation hook: when the auto-execute path
+    # builds this request from a preset, it threads the preset name so the
+    # journal can later filter positions per-preset for live-vs-backtest
+    # comparison in /api/paper_validation.
+    preset_name: Optional[str] = None
 
 
 _moomoo_trader = None
@@ -2338,8 +2830,28 @@ async def moomoo_connect(req: MoomooConnectRequest):
     )
     try:
         result = await trader.connect()
+        # H6: cleanly disconnect any prior trader before swapping in the new
+        # one so we don't leak OpenD socket contexts on reconnect.
+        if _moomoo_trader is not None and _moomoo_trader is not trader:
+            try:
+                _moomoo_trader.disconnect()
+            except Exception:
+                pass
         _moomoo_trader = trader
         register_broker("moomoo", trader)
+        # Post-reconnect drift check: catch positions that opened/closed at
+        # the broker while we were disconnected. Fire-and-forget so the
+        # /connect response isn't blocked.
+        async def _reconcile_after_connect():
+            try:
+                await asyncio.sleep(2)
+                from core.moomoo_reconciler import reconcile_once
+                rec = await reconcile_once()
+                if rec.get("orphans") or rec.get("phantoms"):
+                    _startup_log.info("post-reconnect reconcile: %s", rec)
+            except Exception as exc:
+                _startup_log.warning("post-reconnect reconcile failed: %s", exc)
+        asyncio.create_task(_reconcile_after_connect())
         return result
     except Exception as exc:
         return {"connected": False, "error": str(exc)}
@@ -2503,6 +3015,95 @@ async def moomoo_exit(payload: dict):
     return {**result, "pre_close_spread_mid": pre_close_mid, "exit_orders": recorded_order_ids}
 
 
+@app.post("/api/moomoo/close_one")
+async def moomoo_close_one(req: dict):
+    """Single-leg broker-direct market close. Body: {code, qty, side: 'buy'|'sell'}."""
+    from core.broker import get_broker, BrokerNotConnected
+    try:
+        broker = get_broker("moomoo")
+    except BrokerNotConnected as exc:
+        return {"error": "broker_not_connected", "reason": str(exc)}
+    import asyncio as _aio_local
+    loop = _aio_local.get_event_loop()
+    code = req["code"]; qty = int(req["qty"]); side = req["side"]
+
+    def _go():
+        import moomoo as ft
+        from brokers.moomoo_trading import _close_session_kwargs
+        trd_side = ft.TrdSide.BUY if side == "buy" else ft.TrdSide.SELL
+        ret, data = broker._trd_ctx.place_order(
+            price=0.0, qty=qty, code=code, trd_side=trd_side,
+            order_type=ft.OrderType.MARKET,
+            trd_env=broker._ft_trd_env, acc_id=broker._acc_id,
+            remark="close_one",
+            **_close_session_kwargs(ft),
+        )
+        if ret != ft.RET_OK:
+            return {"error": str(data)}
+        return {"order_id": str(data["order_id"].iloc[0])}
+
+    try:
+        return await loop.run_in_executor(None, _go)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@app.post("/api/moomoo/flatten_broker")
+async def moomoo_flatten_broker():
+    """Emergency broker-direct flatten: pulls live positions from moomoo OpenD
+    (bypassing the journal) and submits MARKET close orders for each. Used
+    when the journal has drifted from broker reality."""
+    from core.broker import get_broker, BrokerNotConnected
+    try:
+        broker = get_broker("moomoo")
+    except BrokerNotConnected as exc:
+        return {"error": "broker_not_connected", "reason": str(exc)}
+
+    import asyncio as _aio_local
+    loop = _aio_local.get_event_loop()
+
+    def _list_broker_positions():
+        import moomoo as ft
+        ret, data = broker._trd_ctx.position_list_query(
+            trd_env=broker._ft_trd_env, acc_id=broker._acc_id,
+        )
+        if ret != ft.RET_OK:
+            raise RuntimeError(f"position_list_query failed: {data}")
+        return data.to_dict(orient="records")
+
+    rows = await loop.run_in_executor(None, _list_broker_positions)
+    spy_legs = [r for r in rows if str(r.get("code", "")).startswith("US.SPY")]
+
+    def _close_leg(row):
+        import moomoo as ft
+        from brokers.moomoo_trading import _close_session_kwargs
+        qty = int(abs(float(row["qty"])))
+        if qty == 0:
+            return {"code": row["code"], "skipped": "zero qty"}
+        # qty > 0 → long → SELL to close. qty < 0 → short → BUY to close.
+        side = ft.TrdSide.SELL if float(row["qty"]) > 0 else ft.TrdSide.BUY
+        ret, data = broker._trd_ctx.place_order(
+            price=0.0, qty=qty, code=row["code"], trd_side=side,
+            order_type=ft.OrderType.MARKET,
+            trd_env=broker._ft_trd_env, acc_id=broker._acc_id,
+            remark="flatten_broker",
+            **_close_session_kwargs(ft),
+        )
+        if ret != ft.RET_OK:
+            return {"code": row["code"], "qty": qty, "error": str(data)}
+        return {"code": row["code"], "qty": qty, "order_id": str(data["order_id"].iloc[0])}
+
+    results = []
+    for row in spy_legs:
+        try:
+            res = await loop.run_in_executor(None, _close_leg, row)
+        except Exception as exc:
+            res = {"code": row.get("code"), "error": str(exc)}
+        results.append(res)
+
+    return {"closed": len([r for r in results if r.get("order_id")]), "results": results}
+
+
 @app.post("/api/moomoo/flatten_all")
 async def moomoo_flatten_all():
     """Kill switch — market-close every open moomoo position.
@@ -2655,17 +3256,50 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
     from core.broker import get_broker, BrokerNotConnected
     from core.journal import get_journal
     from core.risk import evaluate_pre_trade, AccountSnapshot
-    from core.chain import pick_bull_call_strikes, pick_nearest_expiry
+    from core.chain import pick_bull_call_strikes, pick_bear_put_strikes, pick_nearest_expiry
     from core.settings import SETTINGS
     from core.broker import LegSpec, SpreadRequest
     import uuid
 
     client_id = req.client_order_id or str(uuid.uuid4())
 
-    # Idempotency guard
+    # Idempotency guard — claim the key in an `events` row BEFORE the broker
+    # call so that retries with the same key (timeout retries from the UI,
+    # scanner re-ticks within the same bar, etc.) are deduped even when the
+    # first attempt got rejected before journaling a position. The events
+    # table is append-only; a successful position later writes the orders
+    # row too, but the events row alone is enough to claim the key.
     journal = get_journal()
     if journal.get_order_by_idempotency(client_id):
         return {"error": "duplicate", "reason": "idempotency_key_exists", "client_order_id": client_id}
+    # Indexed dedup against events.claim_key — catches failed prior attempts
+    # that never wrote an orders row. UNIQUE index on claim_key turns a former
+    # full-table LIKE-scan into an O(log n) equality probe.
+    try:
+        if journal.has_event_claim(client_id, kind="moomoo_execute_claim"):
+            return {"error": "duplicate",
+                    "reason": "idempotency_key_claimed",
+                    "client_order_id": client_id}
+        journal.log_event(
+            "moomoo_execute_claim",
+            subject=req.symbol,
+            claim_key=client_id,
+            payload={
+                "client_order_id": client_id,
+                "symbol": req.symbol,
+                "direction": req.direction,
+            },
+        )
+    except sqlite3.IntegrityError:
+        # UNIQUE(claim_key) violation = parallel submitter beat us; defer.
+        return {"error": "duplicate",
+                "reason": "idempotency_key_claimed",
+                "client_order_id": client_id}
+    except Exception as exc:  # pragma: no cover - fail open, but log it
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "idempotency claim failed for %s: %s", client_id, exc,
+        )
 
     # Broker check
     try:
@@ -2698,33 +3332,94 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
     except Exception as exc:
         return {"error": "price_fetch_failed", "reason": str(exc)}
 
-    # Option chain
+    # Option chain — pick the expiry closest to (today + target_dte) using
+    # moomoo's authoritative expiry list (handles weekends + market holidays
+    # automatically). Falls back to the calendar-walk hack if the SDK call
+    # fails so we don't regress.
     from datetime import date as _date, timedelta
-    target_date = _date.today() + timedelta(days=req.target_dte)
-    expiry_str = target_date.strftime("%Y-%m-%d")
+    chain_df = None
+    expiry_str = None
+    last_err = None
+    target_anchor = _date.today() + timedelta(days=max(0, req.target_dte))
+    expiries: list[str] = []
     try:
-        chain_df = await broker.get_option_chain(req.symbol, expiry_str)
+        expiries = await broker.list_option_expiries(req.symbol)
     except Exception as exc:
-        return {"error": "chain_fetch_failed", "reason": str(exc)}
+        last_err = f"list_option_expiries: {exc}"
 
-    right = "C" if "bull" in req.direction else "P"
-    chain_sub = chain_df[chain_df["option_type"] == ("CALL" if right == "C" else "PUT")]
+    candidates: list[str] = []
+    if expiries:
+        # Score each available expiry by abs(days from target anchor); prefer
+        # >= target_anchor when ties (don't go shorter-DTE than asked).
+        scored = []
+        for e in expiries:
+            try:
+                d = _date.fromisoformat(e)
+            except ValueError:
+                continue
+            if d < _date.today():
+                continue  # already-expired
+            delta = (d - target_anchor).days
+            scored.append((abs(delta), -delta, e))  # tie-break: prefer >= target
+        scored.sort()
+        candidates = [e for _, _, e in scored]
+    else:
+        # Fallback: original weekend-walk loop — still works, just doesn't
+        # know about market holidays.
+        for skip in range(0, 8):
+            d = _date.today() + timedelta(days=req.target_dte + skip)
+            if d.weekday() >= 5:
+                continue
+            candidates.append(d.strftime("%Y-%m-%d"))
+
+    for candidate in candidates[:8]:  # cap at 8 chain fetches per call
+        try:
+            df = await broker.get_option_chain(req.symbol, candidate)
+        except Exception as exc:
+            last_err = str(exc)
+            continue
+        if df is not None and hasattr(df, "empty") and not df.empty:
+            chain_df = df
+            expiry_str = candidate
+            break
+
+    if chain_df is None or expiry_str is None:
+        return {"error": "chain_fetch_failed",
+                "reason": last_err or "no chain found near target_dte"}
+
+    is_bear = "bear" in req.direction
+    right = "P" if is_bear else "C"
+    chain_sub = chain_df[chain_df["option_type"] == ("PUT" if is_bear else "CALL")]
     strike_grid = sorted(chain_sub["strike_price"].unique().tolist())
-    call_prices = {
+    leg_prices = {
         float(row["strike_price"]): (float(row["bid_price"]), float(row["ask_price"]))
         for _, row in chain_sub.iterrows()
     }
 
-    # Strike selection
-    spread = pick_bull_call_strikes(
-        strike_grid=strike_grid,
-        underlying=underlying,
-        call_prices=call_prices,
-        target_debit=req.spread_cost_target,
-        otm_offset=req.otm_offset,
-    )
+    # Strike selection — branch by direction. Bull-call lifts K_long ≈ ATM +
+    # offset and shorts a higher strike; bear-put drops K_long ≈ ATM − offset
+    # and shorts a lower strike. Same target_debit / max_width / OTM offset
+    # semantics in both directions.
+    if is_bear:
+        spread = pick_bear_put_strikes(
+            strike_grid=strike_grid,
+            underlying=underlying,
+            put_prices=leg_prices,
+            target_debit=req.spread_cost_target,
+            otm_offset=req.otm_offset,
+        )
+        picker_name = "pick_bear_put_strikes"
+    else:
+        spread = pick_bull_call_strikes(
+            strike_grid=strike_grid,
+            underlying=underlying,
+            call_prices=leg_prices,
+            target_debit=req.spread_cost_target,
+            otm_offset=req.otm_offset,
+        )
+        picker_name = "pick_bull_call_strikes"
     if not spread:
-        return {"error": "no_spread_found", "reason": "pick_bull_call_strikes returned None"}
+        return {"error": "no_spread_found", "reason": f"{picker_name} returned None"}
 
     # Pre-trade chain quality check — reject degenerate quotes BEFORE order
     # submission.  Catches: zero bid/ask, crossed markets, blown-out spreads,
@@ -2737,13 +3432,16 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
         }
         for _, row in chain_sub.iterrows()
     }
+    # Tolerances default to the moomoo-friendly 0.25 (OpenD NBBO is wider than
+    # IBKR's). Volume/OI gates default to 0 because moomoo chains often report
+    # zero for both — relying on them silently rejects every signal.
     quality_ok, quality_reason = validate_spread_quality(
         spread,
-        max_bid_ask_pct=0.10,         # 10% bid/ask spread tolerance
-        min_mid=0.05,                  # debit must be ≥ $0.05 per contract
+        max_bid_ask_pct=float(getattr(req, "chain_max_bid_ask_pct", 0.25) or 0.25),
+        min_mid=0.05,
         quality_lookup=quality_lookup,
-        min_volume=10,                 # at least 10 contracts traded today
-        min_open_interest=50,          # at least 50 contracts of OI
+        min_volume=int(getattr(req, "chain_min_volume", 0) or 0) or None,
+        min_open_interest=int(getattr(req, "chain_min_open_interest", 0) or 0) or None,
     )
     if not quality_ok:
         journal.log_event("chain_quality_rejected", subject=req.symbol, payload={
@@ -2815,8 +3513,9 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
         })
         return {"error": "risk_gate_blocked", "reason": decision.reason, **decision.details}
 
-    # Build spread request
-    expiry_ymd = target_date.strftime("%Y%m%d")
+    # Build spread request — expiry_str ('YYYY-MM-DD') was set by the chain
+    # picker above; the moomoo broker code wants the dash-less form.
+    expiry_ymd = expiry_str.replace("-", "")
     spread_req = SpreadRequest(
         symbol=req.symbol,
         long_leg=LegSpec(expiry=expiry_ymd, strike=spread["K_long"], right=right,
@@ -2842,37 +3541,143 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
     if order_result.get("status") != "ok":
         # Log the broker's rejection (e.g., long_leg_timeout) so the audit
         # trail shows what was attempted even when no position was opened.
-        journal.log_event("order_rejected", subject=req.symbol, payload={
+        evt_kind = "broken_spread" if order_result.get("status") == "broken_spread" else "order_rejected"
+        journal.log_event(evt_kind, subject=req.symbol, payload={
             "broker": "moomoo", "client_order_id": client_id,
             "K_long": spread["K_long"], "K_short": spread["K_short"],
             **order_result,
         })
+        # If leg1 actually filled and the flatten didn't take, we have an
+        # orphan long at the broker. Record it so the monitor can MTM / exit
+        # it instead of letting it bleed. Skip recording when the flatten
+        # succeeded (long is already closed) or when leg1 itself never filled.
+        flatten_ok = (
+            order_result.get("flatten_order_id") is not None
+            and order_result.get("reason") != "broken_spread_unflattened"
+        )
+        if (
+            order_result.get("leg1_order_id")
+            and order_result.get("reason") not in ("long_leg_timeout", None)
+            and not flatten_ok
+        ):
+            from core.journal import Position
+            orphan_legs = [
+                {"expiry": expiry_ymd, "strike": spread["K_long"], "right": right,
+                 "side": "long", "qty": contracts},
+            ]
+            try:
+                now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                orphan_id = journal.open_position(Position(
+                    id=f"{client_id}:orphan",
+                    symbol=req.symbol,
+                    topology="single_leg_orphan",
+                    direction=req.direction,
+                    contracts=contracts,
+                    entry_cost=spread["long_bid"] * 100,  # ~mid; refined later
+                    entry_time=now_iso,
+                    expiry=expiry_ymd,
+                    state="open",
+                    legs=tuple(orphan_legs),
+                    broker="moomoo",
+                    high_water_mark=spread["long_bid"] * 100,
+                    meta={
+                        "broker": "moomoo",
+                        "orphan": True,
+                        "broker_order_id": order_result.get("leg1_order_id", ""),
+                        "stop_loss_pct": req.stop_loss_pct,
+                        "take_profit_pct": req.take_profit_pct,
+                        "trailing_stop_pct": req.trailing_stop_pct,
+                        "idempotency_key": client_id + ":orphan",
+                        **order_result,
+                    },
+                ))
+                journal.log_event("orphan_long_recorded", subject=req.symbol, payload={
+                    "broker": "moomoo", "position_id": orphan_id,
+                    "K_long": spread["K_long"], "leg1_order_id": order_result.get("leg1_order_id"),
+                    "reason": order_result.get("reason"),
+                })
+            except Exception as exc:
+                journal.log_event("orphan_journal_failed", subject=req.symbol, payload={
+                    "broker": "moomoo", "error": str(exc), **order_result,
+                })
         return {"error": "order_rejected", **order_result}
 
     # Journal
-    from core.journal import PositionState
+    from core.journal import Order, Position
+    import uuid as _uuid
+
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     legs = [
         {"expiry": expiry_ymd, "strike": spread["K_long"], "right": right,
          "side": "long", "qty": contracts},
         {"expiry": expiry_ymd, "strike": spread["K_short"], "right": right,
          "side": "short", "qty": contracts},
     ]
-    pos_id = journal.open_position(
+    pos_id = journal.open_position(Position(
+        id=client_id,
         symbol=req.symbol,
         topology="vertical_spread",
         direction=req.direction,
         contracts=contracts,
-        entry_cost=spread["debit_per_contract"] * 100,
+        entry_cost=spread["debit_per_contract"] * 100 * contracts,
+        entry_time=now_iso,
         expiry=expiry_ymd,
-        legs=legs,
+        state="open",
+        legs=tuple(legs),
         broker="moomoo",
-        broker_order_id=order_result.get("leg1_order_id", ""),
-        stop_loss_pct=req.stop_loss_pct,
-        take_profit_pct=req.take_profit_pct,
-        trailing_stop_pct=req.trailing_stop_pct,
+        high_water_mark=spread["debit_per_contract"] * 100,
+        meta={
+            "broker": "moomoo",
+            "legs": legs,
+            "broker_order_id": order_result.get("leg1_order_id", ""),
+            "stop_loss_pct": req.stop_loss_pct,
+            "take_profit_pct": req.take_profit_pct,
+            "trailing_stop_pct": req.trailing_stop_pct,
+            "idempotency_key": client_id,
+            "preset_name": getattr(req, "preset_name", None),
+            **order_result,
+        },
+    ))
+    long_order_id = str(_uuid.uuid4())
+    short_order_id = str(_uuid.uuid4())
+    journal.record_order(Order(
+        id=long_order_id,
+        position_id=pos_id,
+        broker="moomoo",
+        broker_order_id=str(order_result.get("leg1_order_id") or ""),
+        side="BUY",
+        limit_price=round(spread["long_ask"], 2),
+        status="filled",
+        submitted_at=now_iso,
+        filled_at=now_iso,
+        fill_price=round(spread["long_ask"], 2),
+        kind="entry",
         idempotency_key=client_id,
-        meta={"broker": "moomoo", "legs": legs, **order_result},
-    )
+    ))
+    journal.record_order(Order(
+        id=short_order_id,
+        position_id=pos_id,
+        broker="moomoo",
+        broker_order_id=str(order_result.get("leg2_order_id") or ""),
+        side="SELL",
+        limit_price=round(spread["short_bid"], 2),
+        status="filled",
+        submitted_at=now_iso,
+        filled_at=now_iso,
+        fill_price=round(spread["short_bid"], 2),
+        kind="entry",
+        idempotency_key=f"{client_id}:short",
+    ))
+    journal.log_event("entry_submitted", subject=pos_id, payload={
+        "symbol": req.symbol,
+        "broker": "moomoo",
+        "contracts": contracts,
+        "K_long": spread["K_long"],
+        "K_short": spread["K_short"],
+        "leg1_order_id": order_result.get("leg1_order_id"),
+        "leg2_order_id": order_result.get("leg2_order_id"),
+        "entry_order_ids": [long_order_id, short_order_id],
+    })
 
     # Notify
     try:
@@ -2937,6 +3742,260 @@ def journal_reconciliation(date: Optional[str] = None):
     """
     from core.journal import get_journal
     return _safe_json(get_journal().daily_reconciliation_report(date))
+
+
+class PaperValidationRequest(BaseModel):
+    """Compares live (paper) trade stats against backtest expectations.
+
+    Implements skill Step 10: "run preset on moomoo paper for one full
+    trading week ... compare live-paper stats to the backtest". The
+    caller supplies the backtest stats from /api/backtest (or any prior
+    run); this endpoint reads the journal for live positions opened
+    under the preset and computes deltas.
+    """
+    preset_name: str
+    days_back: int = 7
+    expected_win_rate_pct: float = 0.0     # backtest WR%, e.g. 75 for rsi2
+    expected_trades_per_week: float = 0.0  # 3y / 156 weeks for that strategy
+    expected_max_drawdown_pct: float = 0.0  # backtest max DD %, negative number
+
+
+@app.post("/api/paper_validation")
+def paper_validation(req: PaperValidationRequest):
+    """Skill Step 10 paper-validation gate.
+
+    Returns a verdict {pass | warn | fail} plus per-criterion deltas:
+      - trade-count vs expected cadence (warn if < 25% of expected)
+      - win-rate within 10 percentage points of backtest WR
+      - any single losing trade larger than backtest max drawdown ($)
+
+    Read-only — does not mutate the journal or block any flow. Surfaces
+    the comparison the skill asks the human to do by hand.
+    """
+    from datetime import datetime, timedelta, timezone
+    from core.journal import get_journal
+    from core.presets import PresetStore
+
+    store = PresetStore()
+    preset = store.get(req.preset_name)
+    if preset is None:
+        return {"error": "preset_not_found", "preset_name": req.preset_name}
+
+    journal = get_journal()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, req.days_back))).isoformat()
+    positions = [p for p in journal.list_all(limit=1000)
+                 if p.entry_time >= cutoff
+                 and (p.meta or {}).get("preset_name") == req.preset_name
+                 and p.state in ("closed", "open")]
+
+    closed = [p for p in positions if p.state == "closed" and p.realized_pnl is not None]
+    wins = [p for p in closed if (p.realized_pnl or 0) > 0]
+    losses = [p for p in closed if (p.realized_pnl or 0) <= 0]
+    n_closed = len(closed)
+    live_wr = (len(wins) / n_closed * 100.0) if n_closed > 0 else 0.0
+    biggest_loss_dollars = min((p.realized_pnl or 0) for p in closed) if closed else 0.0
+    weeks_observed = max(1.0, req.days_back / 7.0)
+    live_trades_per_week = len(positions) / weeks_observed
+
+    # Equity-based DD threshold: backtest max DD% × preset capital target
+    # (rough — moomoo doesn't expose backtest capital, so use 10k baseline).
+    expected_max_loss_dollars = (req.expected_max_drawdown_pct / 100.0) * 10000.0
+    findings = []
+    verdict = "pass"
+
+    # 1. trade count cadence
+    if req.expected_trades_per_week > 0:
+        ratio = live_trades_per_week / req.expected_trades_per_week
+        if ratio < 0.25:
+            findings.append({
+                "criterion": "trade_count",
+                "severity": "warn",
+                "message": f"live cadence {live_trades_per_week:.2f}/wk is {ratio:.0%} of backtest {req.expected_trades_per_week:.2f}/wk",
+            })
+            verdict = "warn" if verdict == "pass" else verdict
+        elif ratio > 4.0:
+            findings.append({
+                "criterion": "trade_count",
+                "severity": "warn",
+                "message": f"live cadence {live_trades_per_week:.2f}/wk is {ratio:.0%} of backtest — overtrading?",
+            })
+            verdict = "warn" if verdict == "pass" else verdict
+
+    # 2. win-rate band (±10pp per skill)
+    if req.expected_win_rate_pct > 0 and n_closed >= 3:
+        delta = live_wr - req.expected_win_rate_pct
+        if abs(delta) > 10:
+            findings.append({
+                "criterion": "win_rate",
+                "severity": "fail" if abs(delta) > 20 else "warn",
+                "message": f"live WR {live_wr:.1f}% deviates {delta:+.1f}pp from backtest {req.expected_win_rate_pct:.1f}%",
+            })
+            verdict = "fail" if abs(delta) > 20 else ("warn" if verdict == "pass" else verdict)
+
+    # 3. single-trade loss vs backtest max DD$
+    if expected_max_loss_dollars < 0 and biggest_loss_dollars < expected_max_loss_dollars:
+        findings.append({
+            "criterion": "max_single_loss",
+            "severity": "fail",
+            "message": f"a single loss of ${biggest_loss_dollars:.2f} exceeds backtest max DD ${expected_max_loss_dollars:.2f}",
+        })
+        verdict = "fail"
+
+    return _safe_json({
+        "preset_name": req.preset_name,
+        "verdict": verdict,
+        "days_observed": req.days_back,
+        "live": {
+            "positions_total": len(positions),
+            "positions_closed": n_closed,
+            "win_rate_pct": round(live_wr, 2),
+            "trades_per_week": round(live_trades_per_week, 2),
+            "biggest_loss_dollars": round(biggest_loss_dollars, 2),
+            "wins": len(wins),
+            "losses": len(losses),
+        },
+        "expected": {
+            "win_rate_pct": req.expected_win_rate_pct,
+            "trades_per_week": req.expected_trades_per_week,
+            "max_drawdown_pct": req.expected_max_drawdown_pct,
+        },
+        "findings": findings,
+    })
+
+
+class PaperTrialStartRequest(BaseModel):
+    preset_name: str
+    expected_win_rate_pct: float = 0.0
+    expected_trades_per_week: float = 0.0
+    expected_max_drawdown_pct: float = 0.0
+    min_trades: int = 20
+    min_days: int = 7
+    max_open_positions: int = 1
+    allow_overlap: bool = True
+    fast_fail_dd_multiplier: float = 2.0
+    notes: str = ""
+
+
+@app.post("/api/paper_trials/start")
+def paper_trial_start(req: PaperTrialStartRequest):
+    """Begin a paper-trading trial for a preset.
+
+    The preset must exist and its strategy must not be VETTING_RESULT=rejected
+    (the PresetStore guard already enforces this at save time). The trial
+    row drives both the per-fire concurrency gate and the daily evaluator.
+    """
+    from datetime import datetime, timezone
+    from core.paper_gate import (
+        get_paper_gate_store, PaperTrial, STATUS_TRIALING,
+    )
+    from core.presets import PresetStore
+    pstore = PresetStore()
+    preset = pstore.get(req.preset_name)
+    if preset is None:
+        return {"error": "preset_not_found", "preset_name": req.preset_name}
+    store = get_paper_gate_store()
+    trial = PaperTrial(
+        preset_name=req.preset_name,
+        started_at=datetime.now(timezone.utc).isoformat(),
+        status=STATUS_TRIALING,
+        expected_win_rate_pct=req.expected_win_rate_pct,
+        expected_trades_per_week=req.expected_trades_per_week,
+        expected_max_drawdown_pct=req.expected_max_drawdown_pct,
+        min_trades=req.min_trades,
+        min_days=req.min_days,
+        notes=req.notes,
+        max_open_positions=req.max_open_positions,
+        allow_overlap=req.allow_overlap,
+        fast_fail_dd_multiplier=req.fast_fail_dd_multiplier,
+    )
+    store.upsert(trial)
+    # Ensure preset auto_execute is on so the trial actually accumulates fills
+    if not preset.auto_execute:
+        from dataclasses import replace
+        try:
+            pstore.save(replace(preset, auto_execute=True))
+        except Exception:
+            pass
+    return _safe_json({"trial": asdict(trial)})
+
+
+@app.get("/api/paper_trials")
+def paper_trials_list(status: Optional[str] = None):
+    """List trials with live deltas folded in.
+
+    Each entry combines the persisted trial row with a fresh evaluation
+    (live WR / cadence / max-loss vs expected). Use ``?status=trialing``
+    to filter to active rows.
+    """
+    from core.paper_gate import get_paper_gate_store, evaluate_trial
+    store = get_paper_gate_store()
+    trials = store.list(status=status) if status else store.list()
+    out = []
+    for trial in trials:
+        try:
+            ev = evaluate_trial(trial)
+        except Exception as exc:
+            ev = {"error": str(exc)}
+        out.append({"trial": asdict(trial), "evaluation": ev})
+    return _safe_json({"trials": out})
+
+
+@app.post("/api/paper_trials/evaluate_now")
+def paper_trial_evaluate_now():
+    """Manually trigger the daily evaluator (also runs on cron 16:30 ET)."""
+    from core.paper_gate import run_daily_evaluator
+    return _safe_json(run_daily_evaluator())
+
+
+@app.post("/api/paper_trials/{preset_name}/stop")
+def paper_trial_stop(preset_name: str):
+    """Manually demote a trial — disables auto_execute on the preset."""
+    from core.paper_gate import get_paper_gate_store, STATUS_DEMOTED
+    from core.presets import PresetStore
+    store = get_paper_gate_store()
+    ok = store.set_status(preset_name, STATUS_DEMOTED, notes="manual_stop")
+    if not ok:
+        return {"error": "trial_not_found", "preset_name": preset_name}
+    try:
+        pstore = PresetStore()
+        preset = pstore.get(preset_name)
+        if preset and preset.auto_execute:
+            from dataclasses import replace
+            pstore.save(replace(preset, auto_execute=False))
+    except Exception:
+        pass
+    return {"ok": True, "preset_name": preset_name, "status": STATUS_DEMOTED}
+
+
+@app.post("/api/paper_trials/{preset_name}/promote")
+def paper_trial_promote(preset_name: str):
+    """Mark a passed trial as promoted.
+
+    Does NOT move funds or change broker accounts — promotion is an
+    audit-trail flag. The caller is expected to clone the preset to a
+    real-money config separately via the normal preset save flow.
+    """
+    from core.paper_gate import get_paper_gate_store, STATUS_PASSED, STATUS_PROMOTED
+    store = get_paper_gate_store()
+    trial = store.get(preset_name)
+    if trial is None:
+        return {"error": "trial_not_found", "preset_name": preset_name}
+    if trial.status != STATUS_PASSED:
+        return {
+            "error": "trial_not_passed",
+            "current_status": trial.status,
+            "hint": "trial must be in 'passed' state — wait for evaluator or call /evaluate_now",
+        }
+    store.set_status(preset_name, STATUS_PROMOTED, notes="manual_promote")
+    return {"ok": True, "preset_name": preset_name, "status": STATUS_PROMOTED}
+
+
+@app.delete("/api/paper_trials/{preset_name}")
+def paper_trial_delete(preset_name: str):
+    """Remove the trial row entirely (audit-trail erase)."""
+    from core.paper_gate import get_paper_gate_store
+    ok = get_paper_gate_store().delete(preset_name)
+    return {"ok": ok, "preset_name": preset_name}
 
 
 @app.post("/api/orders/cleanup-stale")
@@ -3254,7 +4313,8 @@ def start_monitor(interval: int = 15):
                 if job.id == "telegram_bot":
                     job.remove()
             scheduler.add_job(_run_telegram_poll, "interval", seconds=tg_secs,
-                              id="telegram_bot", replace_existing=True)
+                              id="telegram_bot", replace_existing=True,
+                              max_instances=1, coalesce=True)
             log_event(_startup_log, "telegram_bot_registered",
                       poll_interval_seconds=tg_secs)
     except Exception as e:  # noqa: BLE001
@@ -3263,6 +4323,18 @@ def start_monitor(interval: int = 15):
 
     log_event(_startup_log, "monitor_started", interval_seconds=secs)
     return {"status": "started", "interval_seconds": secs, "leader": True}
+
+
+def _run_paper_gate_evaluator():
+    """APScheduler entry — runs the daily paper-gate evaluator."""
+    try:
+        from core.paper_gate import run_daily_evaluator
+        result = run_daily_evaluator()
+        if result.get("transitions"):
+            log_event(_startup_log, "paper_gate_transitions",
+                      transitions=result["transitions"])
+    except Exception as exc:
+        _startup_log.warning("paper gate evaluator failed: %s", exc)
 
 
 def _run_telegram_poll():

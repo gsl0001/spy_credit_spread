@@ -498,6 +498,12 @@ async def _process_position(
     if broker_name == "moomoo":
         return await _process_position_moomoo(pos, journal, defaults, today=today)
 
+    # IBKR path — needs a live IBKR trader. If the monitor was woken up with
+    # only moomoo work queued, ``trader`` is None for this branch.
+    if trader is None:
+        return {"position_id": pos.id, "skipped": True,
+                "reason": "ibkr_trader_unavailable"}
+
     try:
         legs_list = [dict(leg) for leg in pos.legs]
         mid = await trader.get_combo_midpoint(pos.symbol, legs_list)
@@ -585,10 +591,23 @@ async def tick(
         j.log_event("monitor_no_trader", payload={
             "error": f"{type(e).__name__}: {e}",
         })
-        return []
-    if trader is None:
-        j.log_event("monitor_no_trader", payload={"error": "factory returned None"})
-        return []
+        trader = None  # fall through — moomoo positions still tickable
+    # Note: we used to bail here when trader was None, which silently disabled
+    # the moomoo MTM monitor any time IBKR had no work queued. moomoo
+    # positions don't need the IBKR trader; they route through the broker
+    # registry. So we only skip IBKR positions later when trader is None.
+    has_ibkr_pos = any(
+        ((p.meta or {}).get("broker", p.broker or "ibkr")) == "ibkr"
+        for p in active
+    )
+    if trader is None and has_ibkr_pos:
+        j.log_event("monitor_skip_ibkr", payload={
+            "reason": "no IBKR trader; moomoo positions will still tick",
+            "ibkr_positions_skipped": sum(
+                1 for p in active
+                if ((p.meta or {}).get("broker", p.broker or "ibkr")) == "ibkr"
+            ),
+        })
 
     if defaults is None:
         try:

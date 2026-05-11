@@ -17,6 +17,7 @@ import {
 const EMPTY = {
   total_return_pct: 0, sharpe: 0, max_dd_pct: 0, win_rate: 0,
   trades: 0, equity: [], total_pnl: 0, avg_pnl: 0, profit_factor: 0,
+  recovery_factor: 0, avg_hold_days: 0, max_consec_losses: 0,
   trade_list: [], mc: null, wf: [], price_history: [],
 };
 
@@ -33,38 +34,9 @@ function Field({ label, children, full }) {
 
 function Toggle({ label, on, onChange }) {
   return (
-    <div style={{
-      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-      fontSize: 12, gridColumn: '1 / -1', padding: '4px 0',
-    }}>
+    <div className="toggle-row">
       <span style={{ color: on ? 'var(--text)' : 'var(--text-3)' }}>{label}</span>
       <Switch on={!!on} onChange={onChange} />
-    </div>
-  );
-}
-
-function SectionBox({ title, icon, children, open = false }) {
-  const [isOpen, setIsOpen] = useState(open);
-  return (
-    <div style={{ border: '1px solid var(--border-soft)', borderRadius: 6, overflow: 'hidden' }}>
-      <div
-        onClick={() => setIsOpen(v => !v)}
-        style={{
-          padding: '8px 12px', cursor: 'pointer', userSelect: 'none',
-          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-          background: 'var(--bg-2)',
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.5, color: 'var(--text-2)' }}>
-          <Ico name={icon} size={12} /> {title}
-        </div>
-        <Ico name={isOpen ? 'minus' : 'plus'} size={11} />
-      </div>
-      {isOpen && (
-        <div style={{ padding: '12px 12px 14px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, background: 'var(--bg-1)' }}>
-          {children}
-        </div>
-      )}
     </div>
   );
 }
@@ -99,6 +71,7 @@ export function BacktestView() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [selectedTrade, setSelectedTrade] = useState(null);
+  const [activeConfigSection, setActiveConfigSection] = useState('market');
 
   useEffect(() => { saveConfig(config); }, [config]);
 
@@ -126,7 +99,7 @@ export function BacktestView() {
         const m = res.metrics || {};
         const cap = Number(config.capital_allocation) || 10000;
         setB({
-          total_return_pct: m.total_pnl != null ? (m.total_pnl / cap) * 100 : 0,
+          total_return_pct: m.total_pnl != null && cap > 0 ? (m.total_pnl / cap) * 100 : 0,
           sharpe: m.sharpe_ratio ?? 0,
           max_dd_pct: m.max_drawdown ?? 0,
           win_rate: (m.win_rate ?? 0) / 100,
@@ -134,6 +107,9 @@ export function BacktestView() {
           total_pnl: m.total_pnl ?? 0,
           avg_pnl: m.avg_pnl ?? 0,
           profit_factor: m.profit_factor ?? 0,
+          recovery_factor: m.recovery_factor ?? 0,
+          avg_hold_days: m.avg_hold_days ?? 0,
+          max_consec_losses: m.max_consec_losses ?? 0,
           equity: (res.equity_curve || []).map(d => d.equity),
           trade_list: res.trades || [],
           mc: res.monte_carlo,
@@ -175,220 +151,340 @@ export function BacktestView() {
     if (selectedPreset === name) setSelectedPreset('');
   };
 
-  /* ─────────────────────── RENDER ─────────────────────── */
-  return (
-    <div style={{
-      display: 'grid',
-      gridTemplateColumns: '320px 1fr',
-      height: 'calc(100vh - 52px)',
-      overflow: 'hidden',
-    }}>
+  // Has the user run a sim yet? Determines whether to show empty-state placeholders.
+  const hasRun = (b.trades || 0) > 0 || (b.equity || []).length > 0 || (b.price_history || []).length > 0;
+  const selectedStrategy = strategies.find(s => s.id === config.strategy_id);
+  const strategyLabel = selectedStrategy?.name || config.strategy_id || 'Strategy';
+  const topologyLabel = String(config.topology || 'vertical_spread').replace(/_/g, ' ');
+  const barSize = selectedStrategy?.bar_size || '1 day';
+  const isIntraday = barSize !== '1 day';
+  // yfinance hard caps for intraday history (in days). Anything else → years.
+  const intradayHistoryDays = {
+    '1 min': 7,
+    '5 mins': 60,
+    '15 mins': 60,
+    '30 mins': 60,
+    '1 hour': 730,
+  };
+  const tfLabel = barSize === '1 day' ? 'Daily' : barSize.replace(' mins', 'm').replace(' min', 'm').replace(' hour', 'h').replace(' day', 'd');
+  const tfHistoryHint = isIntraday
+    ? `${intradayHistoryDays[barSize] || 60} days max (yfinance cap)`
+    : `${config.years_history || 0} years`;
 
-      {/* ═══════════ LEFT SIDEBAR — scrollable config ═══════════ */}
-      <div style={{
-        overflowY: 'auto',
-        borderRight: '1px solid var(--border-soft)',
-        padding: '14px 14px 60px 14px',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 10,
-      }}>
-        {/* Run button */}
-        <div style={{ display: 'flex', gap: 6 }}>
-          <button
-            className="btn primary"
-            onClick={run}
-            disabled={loading}
-            style={{ flex: 1, justifyContent: 'center', height: 38, fontSize: 12, fontWeight: 700, gap: 6 }}
-          >
-            <Ico name="zap" size={13} /> {loading ? 'CALCULATING…' : 'RUN SIMULATION'}
-          </button>
-          <Btn size="sm" variant="ghost" onClick={() => setConfig({ ...DEFAULT_CONFIG })} style={{ whiteSpace: 'nowrap' }}>Reset</Btn>
-        </div>
+  // Auto-adjust years_history when switching to intraday — yfinance won't
+  // serve more than the cap above. Convert capped days to fractional years
+  // so the request payload is valid.
+  useEffect(() => {
+    if (!isIntraday) return;
+    const capDays = intradayHistoryDays[barSize] || 60;
+    const capYears = Math.max(1, Math.round((capDays / 365) * 10) / 10);
+    if ((config.years_history || 0) > capYears + 0.05) {
+      setConfig(prev => ({ ...prev, years_history: capYears }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.strategy_id, barSize]);
+  const configSections = [
+    { id: 'market', title: 'Market', icon: 'cog', hint: 'Ticker, history window, capital, and commission.' },
+    { id: 'strategy', title: 'Strategy', icon: 'activity', hint: 'Signal logic and strategy-specific parameters.' },
+    { id: 'sizing', title: 'Sizing', icon: 'target', hint: 'Fixed contracts or percent-risk sizing controls.' },
+    { id: 'structure', title: 'Structure', icon: 'zap', hint: 'Option topology, DTE, strike width, and fill realism.' },
+    { id: 'risk', title: 'Risk', icon: 'shield', hint: 'Exit rules used during simulation.' },
+    { id: 'filters', title: 'Filters', icon: 'sliders', hint: 'Optional market filters before entry.' },
+    { id: 'analysis', title: 'Analysis', icon: 'radar', hint: 'Monte Carlo and walk-forward outputs.' },
+    { id: 'optimizer', title: 'Optimizer', icon: 'dashboard', hint: 'Parameter sweep for the current base setup.' },
+  ];
 
-        {/* Presets — at the top for quick access */}
-        <SectionBox title="Presets" icon="book" open>
-          <div style={{ gridColumn: '1/-1', display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <select className="sel" value={selectedPreset || ''} onChange={e => applyPreset(e.target.value)}>
-              <option value="">— Load preset —</option>
-              {Object.keys(allPresets).map(n => <option key={n} value={n}>{n}</option>)}
-            </select>
-            {selectedPreset && presets[selectedPreset] && (
-              <Btn size="sm" variant="ghost" icon="x" onClick={() => deletePreset(selectedPreset)} style={{ color: 'var(--neg)' }}>
-                Delete "{selectedPreset}"
-              </Btn>
+  const activeSectionMeta = configSections.find(s => s.id === activeConfigSection) || configSections[0];
+  const renderConfigSection = () => {
+    switch (activeConfigSection) {
+      case 'strategy':
+        return (
+          <>
+            <Field label="Logic" full>
+              <select className="sel" value={config.strategy_id || ''} onChange={str('strategy_id')}>
+                {strategies.length === 0 && <option value="">— loading… —</option>}
+                {strategies.map(s => {
+                  const v = s.vetting_result || 'pending';
+                  const verdictTag = v === 'rejected' ? ' ⊘ rejected'
+                    : v === 'shipped' ? ''
+                    : ' · pending';
+                  const tfTag = s.bar_size && s.bar_size !== '1 day' ? ` · ${s.bar_size}` : '';
+                  return (
+                    <option key={s.id} value={s.id}>{s.name}{tfTag}{verdictTag}</option>
+                  );
+                })}
+              </select>
+            </Field>
+            <div style={{ gridColumn: '1/-1' }}>
+              <StrategyParamsForm
+                strategyId={config.strategy_id || 'consecutive_days'}
+                values={config}
+                onChange={v => setConfig(prev => ({ ...prev, ...v }))}
+              />
+            </div>
+          </>
+        );
+      case 'sizing':
+        return (
+          <>
+            <Toggle label="Dynamic Sizing" on={!!config.use_dynamic_sizing} onChange={bool('use_dynamic_sizing')} />
+            {config.use_dynamic_sizing ? (
+              <>
+                <Field label="Risk %">
+                  <input className="inp" type="number" step="0.5" value={config.risk_percent || 0} onChange={num('risk_percent')} />
+                </Field>
+                <Field label="Max Trade Cap $">
+                  <input className="inp" type="number" value={config.max_trade_cap || 0} onChange={num('max_trade_cap')} />
+                </Field>
+              </>
+            ) : (
+              <Field label="Contracts / Trade">
+                <input className="inp" type="number" min="1" value={config.contracts_per_trade || 1} onChange={num('contracts_per_trade')} />
+              </Field>
             )}
-            <div style={{ display: 'flex', gap: 6 }}>
+          </>
+        );
+      case 'structure':
+        return (
+          <>
+            <Field label="Topology">
+              <select className="sel" value={config.topology || ''} onChange={str('topology')}>
+                <option value="vertical_spread">Vertical Spread</option>
+                <option value="long_call">Long Call</option>
+                <option value="long_put">Long Put</option>
+                <option value="iron_condor">Iron Condor</option>
+              </select>
+            </Field>
+            <Field label="Direction">
+              <select className="sel" value={config.strategy_type || ''} onChange={str('strategy_type')}>
+                <option value="bull_call">Bull Call</option>
+                <option value="bear_put">Bear Put</option>
+              </select>
+            </Field>
+            <Field label="Strike Width">
+              <input className="inp" type="number" value={config.strike_width || 0} onChange={num('strike_width')} />
+            </Field>
+            <Field label="Target DTE">
+              <input className="inp" type="number" value={config.target_dte || 0} onChange={num('target_dte')} />
+            </Field>
+            <Field label="Spread Target $">
+              <input className="inp" type="number" value={config.spread_cost_target || 0} onChange={num('spread_cost_target')} />
+            </Field>
+            <Field label="Realism Factor">
+              <input className="inp" type="number" step="0.05" value={config.realism_factor || 0} onChange={num('realism_factor')} />
+            </Field>
+          </>
+        );
+      case 'risk':
+        return (
+          <>
+            <Field label="Stop Loss %">
+              <input className="inp" type="number" value={config.stop_loss_pct || 0} onChange={num('stop_loss_pct')} />
+            </Field>
+            <Field label="Take Profit %">
+              <input className="inp" type="number" value={config.take_profit_pct || 0} onChange={num('take_profit_pct')} />
+            </Field>
+            <Field label="Trailing Stop %">
+              <input className="inp" type="number" value={config.trailing_stop_pct || 0} onChange={num('trailing_stop_pct')} />
+            </Field>
+            <Toggle label="Mark-to-Market Exit" on={!!config.use_mark_to_market} onChange={bool('use_mark_to_market')} />
+          </>
+        );
+      case 'filters':
+        return (
+          <>
+            <Toggle label="RSI Filter" on={!!config.use_rsi_filter} onChange={bool('use_rsi_filter')} />
+            {config.use_rsi_filter && (
+              <Field label="RSI Threshold">
+                <input className="inp" type="number" value={config.rsi_threshold ?? 30} onChange={num('rsi_threshold')} />
+              </Field>
+            )}
+            <Toggle label="EMA Filter" on={!!config.use_ema_filter} onChange={bool('use_ema_filter')} />
+            {config.use_ema_filter && (
+              <Field label="EMA Length">
+                <input className="inp" type="number" value={config.ema_length ?? 10} onChange={num('ema_length')} />
+              </Field>
+            )}
+            <Toggle label="VIX Filter" on={!!config.use_vix_filter} onChange={bool('use_vix_filter')} />
+            {config.use_vix_filter && (
+              <>
+                <Field label="VIX Min">
+                  <input className="inp" type="number" value={config.vix_min ?? 15} onChange={num('vix_min')} />
+                </Field>
+                <Field label="VIX Max">
+                  <input className="inp" type="number" value={config.vix_max ?? 35} onChange={num('vix_max')} />
+                </Field>
+              </>
+            )}
+            <Toggle label="Regime Filter" on={!!config.use_regime_filter} onChange={bool('use_regime_filter')} />
+            {config.use_regime_filter && (
+              <Field label="Regime" full>
+                <select className="sel" value={config.regime_allowed || 'all'} onChange={str('regime_allowed')}>
+                  <option value="all">All Regimes</option>
+                  <option value="bull">Bull Only</option>
+                  <option value="bear">Bear Only</option>
+                  <option value="neutral">Neutral Only</option>
+                </select>
+              </Field>
+            )}
+            <Toggle label="SMA 200 Trend" on={!!config.use_sma200_filter} onChange={bool('use_sma200_filter')} />
+            <Toggle label="Volume Filter" on={!!config.use_volume_filter} onChange={bool('use_volume_filter')} />
+          </>
+        );
+      case 'analysis':
+        return (
+          <>
+            <Toggle label="Monte Carlo" on={!!config.enable_mc_histogram} onChange={bool('enable_mc_histogram')} />
+            <Toggle label="Walk-Forward" on={!!config.enable_walk_forward} onChange={bool('enable_walk_forward')} />
+            {config.enable_walk_forward && (
+              <Field label="WF Windows" full>
+                <input className="inp" type="number" min="2" max="12" value={config.walk_forward_windows ?? 4} onChange={num('walk_forward_windows')} />
+              </Field>
+            )}
+          </>
+        );
+      case 'optimizer':
+        return <OptimiserCard baseConfig={config} />;
+      case 'market':
+      default:
+        return (
+          <>
+            <Field label="Ticker">
+              <input className="inp" value={config.ticker || ''} onChange={str('ticker')} />
+            </Field>
+            <Field label={isIntraday ? `History (yrs · capped by yfinance to ${intradayHistoryDays[barSize] || 60}d)` : 'History (yrs)'}>
               <input
                 className="inp"
-                placeholder="Save current as…"
+                type="number"
+                step={isIntraday ? '0.1' : '1'}
+                max={isIntraday ? (Math.round((intradayHistoryDays[barSize] || 60) / 365 * 10) / 10) : undefined}
+                value={config.years_history || 0}
+                onChange={num('years_history')}
+              />
+            </Field>
+            <Field label="Bar Size">
+              <input className="inp" value={barSize} disabled readOnly title="Set by the strategy class (BAR_SIZE)" />
+            </Field>
+            <Field label="Initial Capital $">
+              <input className="inp" type="number" value={config.capital_allocation || 0} onChange={num('capital_allocation')} />
+            </Field>
+            <Field label="Commission $">
+              <input className="inp" type="number" step="0.01" value={config.commission_per_contract || 0} onChange={num('commission_per_contract')} />
+            </Field>
+          </>
+        );
+    }
+  };
+
+  /* ─────────────────────── RENDER ─────────────────────── */
+  return (
+    <div className="workspace-split">
+
+      {/* ═══════════ LEFT SIDEBAR — scrollable config ═══════════ */}
+      <div className="workspace-sidebar config-panel">
+        <div className="config-panel-header">
+          <div>
+            <div className="config-eyebrow">Backtest Setup</div>
+            <div className="config-title">{config.ticker || 'SPY'} strategy lab</div>
+          </div>
+          <div className="config-chip-grid">
+            <div className="config-chip">
+              <span>Strategy</span>
+              <strong>{strategyLabel}</strong>
+            </div>
+            <div className="config-chip">
+              <span>Capital</span>
+              <strong>{fmtUsd(config.capital_allocation || 0)}</strong>
+            </div>
+            <div className="config-chip">
+              <span>Structure</span>
+              <strong>{topologyLabel}</strong>
+            </div>
+            <div className="config-chip">
+              <span>DTE</span>
+              <strong>{config.target_dte ?? 0}</strong>
+            </div>
+            <div className="config-chip" title={`Bar size: ${barSize}`}>
+              <span>Timeframe</span>
+              <strong>{tfLabel}{isIntraday ? ' · 0DTE-capable' : ''}</strong>
+            </div>
+          </div>
+          <div className="config-actions">
+            <button
+              className="btn primary"
+              onClick={run}
+              disabled={loading}
+            >
+              <Ico name="zap" size={13} /> {loading ? 'Calculating' : 'Run Simulation'}
+            </button>
+            <Btn size="sm" variant="ghost" onClick={() => { setConfig({ ...DEFAULT_CONFIG }); setSelectedPreset(''); setError(null); }}>
+              Reset
+            </Btn>
+          </div>
+          <div className="config-preset-tools">
+            <div className="config-preset-head">
+              <span><Ico name="book" size={12} /> Preset</span>
+              {selectedPreset && presets[selectedPreset] && (
+                <button className="config-link danger" onClick={() => deletePreset(selectedPreset)}>
+                  Delete
+                </button>
+              )}
+            </div>
+            <select className="sel" value={selectedPreset || ''} onChange={e => applyPreset(e.target.value)}>
+              <option value="">Load preset</option>
+              {Object.keys(allPresets).map(n => <option key={n} value={n}>{n}</option>)}
+            </select>
+            <div className="preset-save-row">
+              <input
+                className="inp"
+                placeholder="Save current setup as"
                 value={presetName}
                 onChange={e => setPresetName(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && savePreset()}
-                style={{ flex: 1 }}
               />
               <Btn size="sm" variant="primary" onClick={savePreset} disabled={!presetName.trim()}>Save</Btn>
             </div>
           </div>
-        </SectionBox>
+        </div>
 
-        <SectionBox title="Asset & Timeframe" icon="cog" open>
-          <Field label="Ticker">
-            <input className="inp" value={config.ticker || ''} onChange={str('ticker')} />
-          </Field>
-          <Field label="History (yrs)">
-            <input className="inp" type="number" value={config.years_history || 0} onChange={num('years_history')} />
-          </Field>
-          <Field label="Initial Capital $">
-            <input className="inp" type="number" value={config.capital_allocation || 0} onChange={num('capital_allocation')} />
-          </Field>
-          <Field label="Commission $">
-            <input className="inp" type="number" step="0.01" value={config.commission_per_contract || 0} onChange={num('commission_per_contract')} />
-          </Field>
-        </SectionBox>
-
-        <SectionBox title="Strategy Engine" icon="activity" open>
-          <Field label="Logic" full>
-            <select className="sel" value={config.strategy_id || ''} onChange={str('strategy_id')}>
-              {strategies.length === 0 && <option value="">— loading… —</option>}
-              {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-            </select>
-          </Field>
-          <div style={{ gridColumn: '1/-1' }}>
-            <StrategyParamsForm
-              strategyId={config.strategy_id || 'consecutive_days'}
-              values={config}
-              onChange={v => setConfig(prev => ({ ...prev, ...v }))}
-            />
+        <div className="config-workbench">
+          <div className="config-tabs" aria-label="Backtest configuration sections">
+            {configSections.map(section => (
+              <button
+                key={section.id}
+                type="button"
+                className="config-tab"
+                aria-current={activeConfigSection === section.id ? 'true' : undefined}
+                onClick={() => setActiveConfigSection(section.id)}
+                title={section.hint}
+              >
+                <Ico name={section.icon} size={13} />
+                <span>{section.title}</span>
+              </button>
+            ))}
           </div>
-        </SectionBox>
 
-        <SectionBox title="Position Sizing" icon="target">
-          <Toggle label="Dynamic Sizing" on={!!config.use_dynamic_sizing} onChange={bool('use_dynamic_sizing')} />
-          {config.use_dynamic_sizing ? (
-            <>
-              <Field label="Risk %">
-                <input className="inp" type="number" step="0.5" value={config.risk_percent || 0} onChange={num('risk_percent')} />
-              </Field>
-              <Field label="Max Trade Cap $">
-                <input className="inp" type="number" value={config.max_trade_cap || 0} onChange={num('max_trade_cap')} />
-              </Field>
-            </>
-          ) : (
-            <Field label="Contracts / Trade">
-              <input className="inp" type="number" min="1" value={config.contracts_per_trade || 1} onChange={num('contracts_per_trade')} />
-            </Field>
-          )}
-        </SectionBox>
-
-        <SectionBox title="Execution Details" icon="zap">
-          <Field label="Topology">
-            <select className="sel" value={config.topology || ''} onChange={str('topology')}>
-              <option value="vertical_spread">Vertical Spread</option>
-              <option value="long_call">Long Call</option>
-              <option value="long_put">Long Put</option>
-              <option value="iron_condor">Iron Condor</option>
-            </select>
-          </Field>
-          <Field label="Direction">
-            <select className="sel" value={config.strategy_type || ''} onChange={str('strategy_type')}>
-              <option value="bull_call">Bull Call</option>
-              <option value="bear_put">Bear Put</option>
-            </select>
-          </Field>
-          <Field label="Strike Width">
-            <input className="inp" type="number" value={config.strike_width || 0} onChange={num('strike_width')} />
-          </Field>
-          <Field label="Target DTE">
-            <input className="inp" type="number" value={config.target_dte || 0} onChange={num('target_dte')} />
-          </Field>
-          <Field label="Spread Target $">
-            <input className="inp" type="number" value={config.spread_cost_target || 0} onChange={num('spread_cost_target')} />
-          </Field>
-          <Field label="Realism Factor">
-            <input className="inp" type="number" step="0.05" value={config.realism_factor || 0} onChange={num('realism_factor')} />
-          </Field>
-        </SectionBox>
-
-        <SectionBox title="Risk Management" icon="shield">
-          <Field label="Stop Loss %">
-            <input className="inp" type="number" value={config.stop_loss_pct || 0} onChange={num('stop_loss_pct')} />
-          </Field>
-          <Field label="Take Profit %">
-            <input className="inp" type="number" value={config.take_profit_pct || 0} onChange={num('take_profit_pct')} />
-          </Field>
-          <Field label="Trailing Stop %">
-            <input className="inp" type="number" value={config.trailing_stop_pct || 0} onChange={num('trailing_stop_pct')} />
-          </Field>
-          <Toggle label="Mark-to-Market Exit" on={!!config.use_mark_to_market} onChange={bool('use_mark_to_market')} />
-        </SectionBox>
-
-        <SectionBox title="Entry Filters" icon="sliders">
-          <Toggle label="RSI Filter" on={!!config.use_rsi_filter} onChange={bool('use_rsi_filter')} />
-          {config.use_rsi_filter && (
-            <Field label="RSI Threshold">
-              <input className="inp" type="number" value={config.rsi_threshold ?? 30} onChange={num('rsi_threshold')} />
-            </Field>
-          )}
-          <Toggle label="EMA Filter" on={!!config.use_ema_filter} onChange={bool('use_ema_filter')} />
-          {config.use_ema_filter && (
-            <Field label="EMA Length">
-              <input className="inp" type="number" value={config.ema_length ?? 10} onChange={num('ema_length')} />
-            </Field>
-          )}
-          <Toggle label="VIX Filter" on={!!config.use_vix_filter} onChange={bool('use_vix_filter')} />
-          {config.use_vix_filter && (
-            <>
-              <Field label="VIX Min">
-                <input className="inp" type="number" value={config.vix_min ?? 15} onChange={num('vix_min')} />
-              </Field>
-              <Field label="VIX Max">
-                <input className="inp" type="number" value={config.vix_max ?? 35} onChange={num('vix_max')} />
-              </Field>
-            </>
-          )}
-          <Toggle label="Regime Filter" on={!!config.use_regime_filter} onChange={bool('use_regime_filter')} />
-          {config.use_regime_filter && (
-            <Field label="Regime" full>
-              <select className="sel" value={config.regime_allowed || 'all'} onChange={str('regime_allowed')}>
-                <option value="all">All Regimes</option>
-                <option value="bull">Bull Only</option>
-                <option value="bear">Bear Only</option>
-                <option value="neutral">Neutral Only</option>
-              </select>
-            </Field>
-          )}
-          <Toggle label="SMA 200 Trend" on={!!config.use_sma200_filter} onChange={bool('use_sma200_filter')} />
-          <Toggle label="Volume Filter" on={!!config.use_volume_filter} onChange={bool('use_volume_filter')} />
-        </SectionBox>
-
-        <SectionBox title="Advanced / Analysis" icon="radar">
-          <Toggle label="Monte Carlo" on={!!config.enable_mc_histogram} onChange={bool('enable_mc_histogram')} />
-          <Toggle label="Walk-Forward" on={!!config.enable_walk_forward} onChange={bool('enable_walk_forward')} />
-          {config.enable_walk_forward && (
-            <Field label="WF Windows" full>
-              <input className="inp" type="number" min="2" max="12" value={config.walk_forward_windows ?? 4} onChange={num('walk_forward_windows')} />
-            </Field>
-          )}
-        </SectionBox>
-
-        <OptimiserCard baseConfig={config} />
-
-        {/* bottom padding so last item is reachable */}
-        <div style={{ height: 40, flexShrink: 0 }} />
+          <div className="config-editor">
+            <div className="config-editor__head">
+              <div>
+                <div className="config-editor__title">
+                  <Ico name={activeSectionMeta.icon} size={14} /> {activeSectionMeta.title}
+                </div>
+                <div className="config-editor__hint">{activeSectionMeta.hint}</div>
+              </div>
+            </div>
+            <div className={activeConfigSection === 'optimizer' ? 'config-editor__body config-editor__body--single' : 'config-editor__body'}>
+              {renderConfigSection()}
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* ═══════════ RIGHT MAIN — scrollable results ═══════════ */}
-      <div style={{
-        overflowY: 'auto',
-        padding: '14px 16px 40px 16px',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 14,
-      }}>
+      <div className="workspace-main">
 
         {/* KPI strip */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6,1fr)', gap: 8 }}>
+        <div className="kpi-strip">
           {[
             { label: 'Total Return', value: fmtPct(b.total_return_pct), color: b.total_return_pct >= 0 ? 'var(--pos)' : 'var(--neg)' },
             { label: 'Max Drawdown', value: fmtPct(b.max_dd_pct), color: 'var(--neg)' },
@@ -404,7 +500,7 @@ export function BacktestView() {
         </div>
 
         {/* Chart + Execution Stats side by side */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 260px', gap: 12, alignItems: 'stretch' }}>
+        <div className="bt-chart-grid">
           {/* Chart */}
           <div className="card" style={{ display: 'flex', flexDirection: 'column' }}>
             <CardHead
@@ -422,14 +518,31 @@ export function BacktestView() {
                 {error}
               </div>
             )}
-            <div style={{ height: 520 }}>
-              <CandlestickChart
-                series={b.price_history}
-                trades={b.trade_list}
-                height={520}
-                selectedTrade={selectedTrade}
-                onTradeSelect={setSelectedTrade}
-              />
+            <div className="chart-frame">
+              {hasRun ? (
+                <CandlestickChart
+                  series={b.price_history}
+                  trades={b.trade_list}
+                  height={520}
+                  selectedTrade={selectedTrade}
+                  onTradeSelect={setSelectedTrade}
+                />
+              ) : (
+                <div className="empty-state">
+                  <Ico name="trending" size={28} />
+                  <div>No simulation yet. Configure inputs on the left, then run the model.</div>
+                </div>
+              )}
+              {loading && (
+                <div style={{
+                  position: 'absolute', inset: 0,
+                  background: 'rgba(0,0,0,.45)', backdropFilter: 'blur(2px)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 12, color: 'var(--text)', fontWeight: 600, gap: 10,
+                }}>
+                  <Ico name="zap" size={16} /> Running backtest…
+                </div>
+              )}
             </div>
           </div>
 
@@ -449,14 +562,20 @@ export function BacktestView() {
               />
               <StatRow
                 label="Recovery Factor"
-                value={((b.total_pnl || 0) / (Math.abs((b.max_dd_pct || 0) * 100) || 1)).toFixed(2)}
+                value={(b.recovery_factor || 0).toFixed(2)}
+              />
+              <StatRow label="Avg Hold (days)" value={(b.avg_hold_days || 0).toFixed(1)} />
+              <StatRow
+                label="Max Consec Losses"
+                value={b.max_consec_losses || 0}
+                color={b.max_consec_losses > 5 ? 'var(--neg)' : undefined}
               />
             </div>
           </div>
         </div>
 
         {/* Bottom row: Trade Log + Equity/MC/WF */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: 12, alignItems: 'start' }}>
+        <div className="bt-bottom-grid">
 
           {/* Trade Log */}
           <div className="card" style={{ display: 'flex', flexDirection: 'column' }}>
@@ -468,24 +587,29 @@ export function BacktestView() {
                 </div>
               ) : (
                 <table className="tbl">
-                  <thead>
+                  <thead style={{ position: 'sticky', top: 0, zIndex: 5, background: 'var(--bg-1)' }}>
                     <tr>
-                      <th>Date</th>
+                      <th>Entry</th>
+                      <th>Exit</th>
                       <th>Side</th>
+                      <th className="num">Days</th>
                       <th className="num">P&amp;L</th>
-                      <th>Exit Reason</th>
+                      <th>Reason</th>
                     </tr>
                   </thead>
                   <tbody>
                     {b.trade_list.map((t, i) => {
                       const sel = selectedTrade === i;
+                      const reason = t.reason || t.exit_reason || '—';
                       return (
                         <tr key={i} onClick={() => setSelectedTrade(sel ? null : i)}
                           style={{ cursor: 'pointer', background: sel ? 'var(--accent-bg)' : undefined }}>
                           <td className="mono" style={{ fontSize: 10 }}>{t.entry_date}</td>
+                          <td className="mono" style={{ fontSize: 10, color: 'var(--text-3)' }}>{t.exit_date || '—'}</td>
                           <td><Badge variant={t.side === 'BUY' ? 'pos' : 'neg'}>{t.side}</Badge></td>
+                          <td className="num mono" style={{ fontSize: 10 }}>{t.days_held ?? '—'}</td>
                           <td className="num mono" style={{ color: (t.pnl || 0) >= 0 ? 'var(--pos)' : 'var(--neg)', fontWeight: 600 }}>{fmtUsd(t.pnl, true)}</td>
-                          <td style={{ fontSize: 10, color: 'var(--text-3)' }}>{t.exit_reason || '—'}</td>
+                          <td style={{ fontSize: 10, color: 'var(--text-3)' }}>{reason}</td>
                         </tr>
                       );
                     })}
@@ -500,7 +624,13 @@ export function BacktestView() {
             <div className="card">
               <CardHead icon="activity" title="Equity Curve" />
               <div style={{ height: 220, padding: '8px 12px 0' }}>
-                <EquityChart data={b.equity} height={210} />
+                {(b.equity || []).length > 0 ? (
+                  <EquityChart data={b.equity} height={210} />
+                ) : (
+                  <div style={{ height: 210, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-3)', fontSize: 11 }}>
+                    No equity curve yet
+                  </div>
+                )}
               </div>
             </div>
 

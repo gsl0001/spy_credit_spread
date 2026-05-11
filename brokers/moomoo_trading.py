@@ -42,6 +42,50 @@ _LEG_TIMEOUT_S = 30.0
 _RETRY_DELAYS = [5, 10, 20, 40, 60]  # seconds
 
 
+def _close_session_kwargs(ft_module) -> dict:
+    """Return a kwargs dict to pass ``session=...`` to ``place_order`` for
+    close / flatten paths so afterhours fills are eligible.
+
+    moomoo OpenAPI exposes a ``Session`` enum with values like
+    ``ALL / ETH / OVERNIGHT / RTH / NONE`` depending on SDK version. We pick
+    the most permissive value that exists at runtime so a moomoo SDK upgrade
+    doesn't break the build. Returns ``{}`` (skip the param) if the SDK has
+    no ``Session`` enum or none of the expected values.
+
+    Why on close paths only: entry orders should stay RTH-default to avoid
+    accidentally legging into a spread on illiquid afterhours quotes; only
+    flattens / stops / orphan cleanups benefit from extended sessions.
+    """
+    session_enum = getattr(ft_module, "Session", None)
+    if session_enum is None:
+        return {}
+    for name in ("ALL", "ETH", "OVERNIGHT", "RTH"):
+        val = getattr(session_enum, name, None)
+        if val is not None:
+            return {"session": val}
+    return {}
+
+
+def _get_loop_safe() -> asyncio.AbstractEventLoop:
+    """Return a usable event loop from any context (coroutine, sync handler,
+    APScheduler worker thread). Prefers the currently-running loop; falls back
+    to the policy's loop or a fresh one if neither exists.
+
+    Used only by ``schedule_reconnect`` which can be called from a thread
+    that has no running loop.
+    """
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    try:
+        return asyncio.get_event_loop_policy().get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 def _accounts_to_dicts(acc_data) -> list[dict[str, Any]]:
     """Normalise acc_list DataFrame rows to plain dicts (lists JSON-friendly)."""
     rows: list[dict[str, Any]] = []
@@ -127,7 +171,7 @@ class MoomooTrader:
         except ImportError as exc:
             return {"ok": False, "error": "moomoo-api not installed", "detail": str(exc)}
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _do_probe():
             trd_ctx = None
@@ -168,7 +212,7 @@ class MoomooTrader:
         trd_env_obj = ft.TrdEnv.REAL if self._trd_env_int == 1 else ft.TrdEnv.SIMULATE
         self._ft_trd_env = trd_env_obj
         env_label = "REAL" if self._trd_env_int == 1 else "SIMULATE"
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _do_connect():
             quote_ctx = None
@@ -351,6 +395,13 @@ class MoomooTrader:
         logger.warning("Auto-reconnect: OpenD connection lost, starting backoff loop")
 
         while not self._intentional_disconnect:
+            try:
+                from core.connection_flags import is_auto_enabled
+                if not is_auto_enabled("moomoo"):
+                    logger.info("Auto-reconnect: aborted (header toggle off)")
+                    break
+            except Exception:
+                pass
             self._reconnect_attempt += 1
             delay = min(2 ** self._reconnect_attempt, self._max_reconnect_backoff)
             logger.info("Auto-reconnect: attempt #%d in %ds", self._reconnect_attempt, delay)
@@ -402,8 +453,14 @@ class MoomooTrader:
             return  # already trying
         if self.is_alive():
             return  # still connected
+        try:
+            from core.connection_flags import is_auto_enabled
+            if not is_auto_enabled("moomoo"):
+                return  # header toggle off
+        except Exception:
+            pass
 
-        target_loop = loop or asyncio.get_event_loop()
+        target_loop = loop or _get_loop_safe()
         self._reconnect_task = target_loop.create_task(self._reconnect_loop())
 
     # ── ensure_connected (IBKR-parity) ────────────────────────────────────────
@@ -419,6 +476,13 @@ class MoomooTrader:
 
         if self._intentional_disconnect:
             return {"success": False, "msg": "Intentionally disconnected"}
+
+        try:
+            from core.connection_flags import is_auto_enabled
+            if not is_auto_enabled("moomoo"):
+                return {"success": False, "msg": "moomoo auto-reconnect disabled"}
+        except Exception:
+            pass
 
         # Exponential backoff
         idx = min(self._reconnect_attempt, len(_RETRY_DELAYS) - 1)
@@ -474,7 +538,7 @@ class MoomooTrader:
     async def get_account_summary(self) -> dict[str, Any]:
         await self.ensure_connected()
         import moomoo as ft
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _fetch():
             ret, data = self._trd_ctx.accinfo_query(
@@ -493,7 +557,7 @@ class MoomooTrader:
     async def get_positions(self) -> list[dict[str, Any]]:
         await self.ensure_connected()
         import moomoo as ft
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _fetch():
             ret, data = self._trd_ctx.position_list_query(
@@ -511,7 +575,7 @@ class MoomooTrader:
 
     async def get_live_price(self, symbol: str) -> dict[str, Any]:
         await self.ensure_connected()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         code = f"US.{symbol}"
 
         def _fetch():
@@ -532,6 +596,64 @@ class MoomooTrader:
 
     # ── Option chain ──────────────────────────────────────────────────────────
 
+    async def list_option_expiries(self, symbol: str) -> list[str]:
+        """Return a sorted list of valid SPY option expiry dates ('YYYY-MM-DD')
+        according to moomoo's authoritative calendar.
+
+        Replaces the previous "today + N + walk over weekends" hack that
+        didn't know about market holidays. Cached for 1 hour per symbol so
+        the per-tick scanner doesn't burn the SDK's chain-API quota.
+
+        Returns ``[]`` if the SDK call fails — caller should fall back to
+        calendar math.
+        """
+        cache = getattr(self, "_expiry_cache", None)
+        if cache is None:
+            cache = {}
+            self._expiry_cache = cache
+        now = _time_module.monotonic()
+        cached = cache.get(symbol)
+        if cached and (now - cached[0]) < 3600:
+            return list(cached[1])
+
+        self._require_connected()
+        loop = asyncio.get_running_loop()
+        code = f"US.{symbol}"
+
+        def _fetch():
+            import moomoo as ft
+            ret, data = self._quote_ctx.get_option_expiration_date(code=code)
+            if ret != ft.RET_OK:
+                return None, str(data)
+            # DataFrame columns vary across SDK versions: prefer 'strike_time'
+            # (current), fall back to 'date' (older), then any column whose
+            # values look ISO-formatted.
+            col = None
+            for cand in ("strike_time", "date"):
+                if cand in data.columns:
+                    col = cand
+                    break
+            if col is None:
+                # last resort: first object-typed column
+                obj_cols = [c for c in data.columns if data[c].dtype == "O"]
+                if obj_cols:
+                    col = obj_cols[0]
+            if col is None:
+                return [], "no expiry column"
+            return [str(v)[:10] for v in data[col].tolist()], None
+
+        try:
+            expiries, err = await loop.run_in_executor(None, _fetch)
+        except Exception as exc:
+            logger.warning("list_option_expiries(%s) failed: %s", symbol, exc)
+            return []
+        if expiries is None:
+            logger.warning("list_option_expiries(%s) ret error: %s", symbol, err)
+            return []
+        expiries = sorted({e for e in expiries if e and len(e) == 10})
+        cache[symbol] = (now, expiries)
+        return expiries
+
     async def get_option_chain(self, symbol: str, expiry_date: str):
         """Return chain DataFrame enriched with bid/ask from market snapshots.
 
@@ -544,7 +666,7 @@ class MoomooTrader:
         expiry_date: 'YYYY-MM-DD'
         """
         self._require_connected()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         code = f"US.{symbol}"
 
         def _fetch_chain():
@@ -603,11 +725,38 @@ class MoomooTrader:
     async def place_spread(self, req: SpreadRequest) -> dict[str, Any]:
         """Execute a debit spread as two sequential legged orders.
 
-        Leg 1 (long): BUY limit at req.long_leg.price
-        Leg 2 (short): SELL limit at req.short_leg.price — only placed after leg 1 fills
-        Safety net: any timeout triggers cancel + market flatten where needed.
+        Hardened against the leg2-timeout class of failure that produced
+        Thursday's $8K orphan-leg incident:
+
+          1. Pre-flight: fetch a live mid for both legs and reject if either
+             leg has a degenerate quote (zero / crossed / very wide). This
+             prevents the most common cause of leg2 not filling.
+          2. Leg 1 (long): BUY limit at req.long_leg.price.
+          3. Leg 2 (short): SELL limit at req.short_leg.price — only placed
+             after leg 1 fills.
+          4. If leg 2 times out: flatten leg 1 with a marketable-limit at
+             ``bid - safety_buffer`` (rather than a raw market order that
+             can fill at any price during a wide / illiquid quote). Returns
+             ``status: "broken_spread"`` so the caller can journal this as
+             an open orphan position the monitor will manage.
         """
         self._require_connected()
+
+        # ── 1. Pre-flight quote sanity ────────────────────────────────────
+        try:
+            preflight = await self._preflight_spread_quotes(req.long_leg, req.short_leg)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("place_spread preflight quote failed: %s", exc)
+            preflight = None
+        if preflight and preflight.get("error"):
+            logger.warning(
+                "place_spread aborted preflight: %s",
+                preflight.get("reason"),
+            )
+            return {"status": "error", "reason": "preflight_" + preflight["error"],
+                    **preflight}
+
+        # ── 2. Leg 1 ──────────────────────────────────────────────────────
         long_order_id = await self._place_single_leg(
             leg=req.long_leg,
             side="buy",
@@ -616,14 +765,44 @@ class MoomooTrader:
         )
         logger.info("Moomoo leg1 placed: order_id=%s", long_order_id)
 
-        filled = await self._wait_for_fill(long_order_id, timeout=_LEG_TIMEOUT_S)
-        if not filled:
-            await self._cancel_order_sync(long_order_id)
-            logger.warning("Moomoo leg1 timed out, cancelled. req=%s", req.client_order_id)
-            return {"status": "error", "reason": "long_leg_timeout", "leg1_order_id": long_order_id}
+        leg1 = await self._wait_for_fill_detail(long_order_id, timeout=_LEG_TIMEOUT_S)
+        if leg1["outcome"] != "filled":
+            cancel_res = await self._cancel_order_sync(long_order_id)
+            if leg1["outcome"] == "partial":
+                # Some long contracts filled — flatten the partial so we don't
+                # carry naked length. The caller will journal the broken state.
+                logger.warning(
+                    "Moomoo leg1 partial fill (%d/%d) — flattening filled portion",
+                    leg1["filled_qty"], leg1["total_qty"],
+                )
+                flatten_id = None
+                try:
+                    flatten_id = await self._marketable_limit_close(
+                        req.long_leg, qty=leg1["filled_qty"], side="sell",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("partial-leg1 flatten failed: %s", exc)
+                return {
+                    "status": "broken_spread",
+                    "reason": "long_leg_partial",
+                    "leg1_order_id": long_order_id,
+                    "leg1_filled_qty": leg1["filled_qty"],
+                    "leg1_total_qty": leg1["total_qty"],
+                    "flatten_order_id": flatten_id,
+                    "cancel_ok": cancel_res.get("ok", False),
+                }
+            logger.warning(
+                "Moomoo leg1 %s; cancelled (cancel_ok=%s). req=%s",
+                leg1["outcome"], cancel_res.get("ok"), req.client_order_id,
+            )
+            return {"status": "error", "reason": f"long_leg_{leg1['outcome']}",
+                    "leg1_order_id": long_order_id,
+                    "cancel_ok": cancel_res.get("ok", False)}
 
-        logger.info("Moomoo leg1 filled: order_id=%s", long_order_id)
+        logger.info("Moomoo leg1 filled: order_id=%s qty=%d",
+                    long_order_id, leg1["filled_qty"])
 
+        # ── 3. Leg 2 ──────────────────────────────────────────────────────
         short_order_id = await self._place_single_leg(
             leg=req.short_leg,
             side="sell",
@@ -632,25 +811,142 @@ class MoomooTrader:
         )
         logger.info("Moomoo leg2 placed: order_id=%s", short_order_id)
 
-        filled = await self._wait_for_fill(short_order_id, timeout=_LEG_TIMEOUT_S)
-        if not filled:
-            await self._cancel_order_sync(short_order_id)
-            logger.warning("Moomoo leg2 timed out; flattening leg1 at market.")
-            flatten_id = await self._place_market_close(req.long_leg, qty=req.qty, side="sell")
+        leg2 = await self._wait_for_fill_detail(short_order_id, timeout=_LEG_TIMEOUT_S)
+        if leg2["outcome"] != "filled":
+            cancel_res = await self._cancel_order_sync(short_order_id)
+            logger.warning(
+                "Moomoo leg2 %s (filled %d/%d, cancel_ok=%s); flattening leg1 long. req=%s",
+                leg2["outcome"], leg2["filled_qty"], leg2["total_qty"],
+                cancel_res.get("ok"), req.client_order_id,
+            )
+            # Marketable-limit close: bid - $0.05 buffer, never raw market.
+            # If we can't get a quote to compute the limit, fall through to
+            # market and journal the spread as broken — better to keep the
+            # orphan on the books than abandon it silently.
+            flatten_id = None
+            flatten_reason = "broken_spread"
+            try:
+                flatten_id = await self._marketable_limit_close(
+                    req.long_leg, qty=req.qty, side="sell",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("marketable-limit flatten failed: %s — falling back to market", exc)
+                try:
+                    flatten_id = await self._place_market_close(
+                        req.long_leg, qty=req.qty, side="sell",
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    logger.error("market flatten ALSO failed: %s — leg1 remains open", exc2)
+                    flatten_reason = "broken_spread_unflattened"
             return {
-                "status": "error",
-                "reason": "short_leg_timeout_flattened",
+                "status": "broken_spread",
+                "reason": flatten_reason,
                 "leg1_order_id": long_order_id,
                 "leg2_order_id": short_order_id,
+                "leg1_filled_qty": leg1["filled_qty"],
+                "leg2_filled_qty": leg2["filled_qty"],
+                "leg2_outcome": leg2["outcome"],
                 "flatten_order_id": flatten_id,
+                "cancel_ok": cancel_res.get("ok", False),
             }
 
-        logger.info("Moomoo leg2 filled: order_id=%s", short_order_id)
+        logger.info("Moomoo leg2 filled: order_id=%s qty=%d",
+                    short_order_id, leg2["filled_qty"])
         return {
             "status": "ok",
             "leg1_order_id": long_order_id,
             "leg2_order_id": short_order_id,
+            "leg1_filled_qty": leg1["filled_qty"],
+            "leg2_filled_qty": leg2["filled_qty"],
         }
+
+    async def _preflight_spread_quotes(
+        self, long_leg: LegSpec, short_leg: LegSpec,
+    ) -> dict[str, Any]:
+        """Snapshot live NBBO for both legs; refuse if either is unusable.
+
+        Refuses on:
+          - zero / negative bid or ask on either leg
+          - crossed quote (ask < bid)
+          - bid-ask spread wider than 50% of mid on either leg
+            (legs should already pass the higher-level chain-quality gate;
+            this is a last-second safety check)
+        Returns ``{}`` (success) or ``{"error": "...", "reason": "..."}``.
+        """
+        import moomoo as ft  # local import: keep moomoo optional
+        loop = asyncio.get_running_loop()
+
+        codes = [
+            self._option_code("SPY", long_leg.expiry, long_leg.right, long_leg.strike),
+            self._option_code("SPY", short_leg.expiry, short_leg.right, short_leg.strike),
+        ]
+
+        def _snap():
+            ret, data = self._quote_ctx.get_market_snapshot(codes)
+            if ret != ft.RET_OK:
+                return None, str(data)
+            return data.to_dict(orient="records"), None
+
+        rows, err = await loop.run_in_executor(None, _snap)
+        if err is not None or not rows:
+            return {"error": "quote_unavailable", "reason": err or "empty snapshot"}
+
+        for row, leg_label in zip(rows, ("long", "short")):
+            bid = float(row.get("bid_price") or 0)
+            ask = float(row.get("ask_price") or 0)
+            if bid <= 0 or ask <= 0:
+                return {"error": "no_quote",
+                        "reason": f"{leg_label}_leg_zero_bid_or_ask",
+                        "bid": bid, "ask": ask}
+            if ask < bid:
+                return {"error": "crossed_quote",
+                        "reason": f"{leg_label}_leg_ask<bid",
+                        "bid": bid, "ask": ask}
+            mid = (bid + ask) / 2.0
+            if mid > 0 and (ask - bid) / mid > 0.50:
+                return {"error": "spread_too_wide",
+                        "reason": f"{leg_label}_leg_{(ask-bid)/mid*100:.0f}pct",
+                        "bid": bid, "ask": ask}
+        return {}
+
+    async def _marketable_limit_close(
+        self, leg: LegSpec, qty: int, side: str, buffer: float = 0.05,
+    ) -> str:
+        """Close ``leg`` with a marketable-limit (NBBO ± buffer) instead of a
+        raw market order. Protects against fills at absurd prices when the
+        quote is wide or stale (the original 22-spread incident class).
+        """
+        import moomoo as ft
+        loop = asyncio.get_running_loop()
+        code = self._option_code("SPY", leg.expiry, leg.right, leg.strike)
+
+        def _snap_then_place():
+            ret, data = self._quote_ctx.get_market_snapshot([code])
+            if ret != ft.RET_OK:
+                raise RuntimeError(f"snapshot failed: {data}")
+            row = data.to_dict(orient="records")[0]
+            bid = float(row.get("bid_price") or 0)
+            ask = float(row.get("ask_price") or 0)
+            # SELL to close → take the bid minus buffer to cross the spread.
+            # BUY to close  → take the ask plus  buffer.
+            if side == "sell":
+                limit = max(0.01, round(bid - buffer, 2)) if bid > 0 else 0.01
+                trd_side = ft.TrdSide.SELL
+            else:
+                limit = round(ask + buffer, 2) if ask > 0 else 9999.0
+                trd_side = ft.TrdSide.BUY
+            ret, data = self._trd_ctx.place_order(
+                price=limit, qty=qty, code=code, trd_side=trd_side,
+                order_type=ft.OrderType.NORMAL,
+                trd_env=self._ft_trd_env, acc_id=self._acc_id,
+                remark="marketable_limit_close",
+                **_close_session_kwargs(ft),
+            )
+            if ret != ft.RET_OK:
+                raise RuntimeError(f"place_order marketable-limit failed: {data}")
+            return str(data["order_id"].iloc[0])
+
+        return await loop.run_in_executor(None, _snap_then_place)
 
     async def close_position(self, position_id: str, legs: list[dict]) -> dict[str, Any]:
         """Close all legs with market orders (guarantees fill, used for exits)."""
@@ -675,8 +971,12 @@ class MoomooTrader:
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         self._require_connected()
-        await self._cancel_order_sync(order_id)
-        return {"status": "ok", "order_id": order_id}
+        res = await self._cancel_order_sync(order_id)
+        return {
+            "status": "ok" if res.get("ok") else "error",
+            "order_id": order_id,
+            **({"reason": res["reason"]} if not res.get("ok") and res.get("reason") else {}),
+        }
 
     async def get_order_status(self, order_id: str) -> dict[str, Any] | None:
         """Return order status in the standard fill_watcher format.
@@ -686,7 +986,7 @@ class MoomooTrader:
         if not self.is_alive():
             return None
         import moomoo as ft
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _fetch():
             ret, data = self._trd_ctx.order_list_query(
@@ -726,7 +1026,7 @@ class MoomooTrader:
         Returns None if any leg quote is unavailable.
         """
         self._require_connected()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         codes = [
             self._option_code("SPY", leg["expiry"], leg["right"], float(leg["strike"]))
             for leg in legs
@@ -790,7 +1090,7 @@ class MoomooTrader:
         self, leg: LegSpec, side: str, qty: int, client_ref: str
     ) -> str:
         import moomoo as ft
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         code = self._option_code("SPY", leg.expiry, leg.right, leg.strike)
         trd_side = ft.TrdSide.BUY if side == "buy" else ft.TrdSide.SELL
 
@@ -812,9 +1112,43 @@ class MoomooTrader:
         return await loop.run_in_executor(None, _place)
 
     async def _wait_for_fill(self, order_id: str, timeout: float) -> bool:
+        """Bool wrapper kept for backward compatibility. Returns True only on
+        a *complete* fill (``FILLED_ALL``); a partial fill returns False so
+        existing callers behave as before. New code should prefer
+        :meth:`_wait_for_fill_detail` which surfaces the partial state.
+        """
+        result = await self._wait_for_fill_detail(order_id, timeout)
+        return result.get("outcome") == "filled"
+
+    async def _wait_for_fill_detail(
+        self, order_id: str, timeout: float,
+    ) -> dict[str, Any]:
+        """Poll moomoo's order_list_query until the order reaches a terminal
+        state or the timeout expires. Returns a dict::
+
+            {
+              "outcome":    "filled" | "partial" | "cancelled" | "failed" | "timeout",
+              "status":     <last raw moomoo status string seen, or None>,
+              "filled_qty": <int — total dealt qty, may be 0>,
+              "total_qty":  <int — original order qty>,
+            }
+
+        ``partial`` means the deadline expired with non-zero ``filled_qty`` but
+        the order was still working — the caller should cancel the remainder
+        and decide whether to flatten the partial.
+        """
         import moomoo as ft
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = _time_module.monotonic() + timeout
+        last_status: str | None = None
+        last_filled_qty: int = 0
+        last_total_qty: int = 0
+
+        terminal_filled = {"FILLED_ALL"}
+        terminal_cancelled = {"CANCELLED_ALL", "CANCELLED_PART", "DELETED",
+                              "CANCELLING_PART", "CANCELLING_ALL"}
+        terminal_failed = {"FAILED", "DISABLED"}
+
         while _time_module.monotonic() < deadline:
             await asyncio.sleep(_POLL_INTERVAL_S)
 
@@ -824,21 +1158,53 @@ class MoomooTrader:
                     trd_env=self._ft_trd_env,
                     acc_id=self._acc_id,
                 )
-                if ret != ft.RET_OK:
-                    return None
-                return str(data["order_status"].iloc[0])
+                if ret != ft.RET_OK or data.empty:
+                    return None, 0, 0
+                row = data.iloc[0]
+                status = str(row.get("order_status", ""))
+                filled = int(float(row.get("dealt_qty", 0) or 0))
+                total = int(float(row.get("qty", 0) or 0))
+                return status, filled, total
 
-            status = await loop.run_in_executor(None, _check)
-            if status == "FILLED_ALL":
-                return True
-        return False
+            status, filled_qty, total_qty = await loop.run_in_executor(None, _check)
+            if status is not None:
+                last_status = status
+                last_filled_qty = filled_qty
+                last_total_qty = total_qty
 
-    async def _cancel_order_sync(self, order_id: str) -> None:
+            if status in terminal_filled:
+                return {"outcome": "filled", "status": status,
+                        "filled_qty": filled_qty, "total_qty": total_qty}
+            if status in terminal_cancelled:
+                return {"outcome": "cancelled", "status": status,
+                        "filled_qty": filled_qty, "total_qty": total_qty}
+            if status in terminal_failed:
+                return {"outcome": "failed", "status": status,
+                        "filled_qty": filled_qty, "total_qty": total_qty}
+            # FILLED_PART is non-terminal: keep waiting for FILLED_ALL.
+
+        # Deadline expired. If anything filled, surface it as 'partial'.
+        outcome = "partial" if last_filled_qty > 0 else "timeout"
+        return {"outcome": outcome, "status": last_status,
+                "filled_qty": last_filled_qty, "total_qty": last_total_qty}
+
+    async def _cancel_order_sync(self, order_id: str) -> dict[str, Any]:
+        """Cancel an order, returning a structured outcome.
+
+        Old behaviour was to ignore ``modify_order``'s ``(ret, data)`` return
+        — a failed cancel (e.g. order already filled, network error) silently
+        left orphan legs open. Now we unpack, log, and surface the result so
+        callers can decide whether to escalate (e.g. force a market flatten).
+
+        Returns one of:
+          ``{"ok": True,  "order_id": ...}`` on RET_OK
+          ``{"ok": False, "order_id": ..., "reason": <str>}`` otherwise
+        """
         import moomoo as ft
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _cancel():
-            self._trd_ctx.modify_order(
+            ret, data = self._trd_ctx.modify_order(
                 modify_order_op=ft.ModifyOrderOp.CANCEL,
                 order_id=order_id,
                 qty=0,
@@ -846,15 +1212,26 @@ class MoomooTrader:
                 trd_env=self._ft_trd_env,
                 acc_id=self._acc_id,
             )
+            return ret, data
 
         try:
-            await loop.run_in_executor(None, _cancel)
+            ret, data = await loop.run_in_executor(None, _cancel)
         except Exception as exc:
-            logger.warning("cancel_order %s failed: %s", order_id, exc)
+            logger.warning("cancel_order %s exception: %s", order_id, exc)
+            return {"ok": False, "order_id": order_id, "reason": str(exc)}
+
+        if ret != ft.RET_OK:
+            reason = str(data)
+            logger.warning(
+                "cancel_order %s failed: ret=%s reason=%s",
+                order_id, ret, reason,
+            )
+            return {"ok": False, "order_id": order_id, "reason": reason}
+        return {"ok": True, "order_id": order_id}
 
     async def _place_market_close(self, leg: LegSpec, qty: int, side: str) -> str:
         import moomoo as ft
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         code = self._option_code("SPY", leg.expiry, leg.right, leg.strike)
         trd_side = ft.TrdSide.BUY if side == "buy" else ft.TrdSide.SELL
 
@@ -868,6 +1245,7 @@ class MoomooTrader:
                 trd_env=self._ft_trd_env,
                 acc_id=self._acc_id,
                 remark="flatten",
+                **_close_session_kwargs(ft),
             )
             if ret != ft.RET_OK:
                 raise RuntimeError(f"place_order MARKET failed ({side} {code}): {data}")
@@ -888,7 +1266,7 @@ class MoomooTrader:
         await self.ensure_connected()
         import moomoo as ft
         from datetime import datetime, timedelta
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         bar_map = {
             "1D": ft.KLType.K_DAY, "K_DAY": ft.KLType.K_DAY,
@@ -932,7 +1310,7 @@ class MoomooTrader:
         """Return all pending/submitted orders. Mirrors IBKRTrader.get_active_orders()."""
         await self.ensure_connected()
         import moomoo as ft
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _fetch():
             ret, data = self._trd_ctx.order_list_query(

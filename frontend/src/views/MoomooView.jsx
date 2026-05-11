@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
-import { fmtUsd, Card, Kpi, Badge, Btn } from '../primitives.jsx';
-import { api } from '../api.js';
+import { fmtUsd, fmtTimeAgo, Badge } from '../primitives.jsx';
+import { api, safe } from '../api.js';
+import { useData } from '../useBackendData.jsx';
 
 // ── Orange design tokens (inline — no Tailwind config change needed) ──────────
 const C = {
@@ -14,30 +15,31 @@ const C = {
   btn:        { background: '#f97316', color: '#000', border: 'none' },
 };
 
-const OCard = ({ title, subtitle, children, flush, right }) => (
+const OCard = ({ title, subtitle, children, flush, right, compact, style }) => (
   <div style={{
     background: C.cardBg, border: `1px solid ${C.cardBorder}`,
-    borderRadius: 10, overflow: 'hidden',
+    borderRadius: 8, overflow: 'hidden',
     marginBottom: flush ? 0 : undefined,
+    ...style,
   }}>
     {title && (
       <div style={{
-        padding: '12px 16px', borderBottom: `1px solid ${C.cardBorder}`,
+        padding: compact ? '8px 12px' : '12px 16px', borderBottom: `1px solid ${C.cardBorder}`,
         display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
       }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
           <span style={{ fontWeight: 600, fontSize: 13 }}>{title}</span>
           {subtitle && <span style={{ fontSize: 11, color: 'var(--text-3)' }}>{subtitle}</span>}
         </div>
-        {right && <div>{right}</div>}
+        {right && <div style={{ flexShrink: 0 }}>{right}</div>}
       </div>
     )}
-    <div style={flush ? undefined : { padding: '14px 16px' }}>{children}</div>
+    <div style={flush ? undefined : { padding: compact ? '10px 12px' : '14px 16px' }}>{children}</div>
   </div>
 );
 
 const OKpi = ({ label, value, sub, color }) => (
-  <div style={{ background: C.cardBg, border: `1px solid ${C.cardBorder}`, borderRadius: 10, padding: '16px 20px' }}>
+  <div style={{ background: C.cardBg, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: '16px 20px' }}>
     <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '.04em' }}>{label}</div>
     <div style={{ fontSize: 26, fontWeight: 700, color: color || C.accent }}>{value}</div>
     {sub && <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>{sub}</div>}
@@ -77,6 +79,47 @@ const StatusPill = ({ connected, accId }) => (
 // ── Main view ─────────────────────────────────────────────────────────────────
 
 export function MoomooView() {
+  // Shared backend feed (heartbeat / monitor / alerts / scanner logs)
+  const m = useData();
+
+  // Telegram bot state
+  const [tgStatus, setTgStatus] = useState(null);
+  const [tgBusy, setTgBusy] = useState(false);
+  const [tgMsg, setTgMsg] = useState('');
+  const [tgCustom, setTgCustom] = useState('');
+
+  // Alert ack state — alerts older than this timestamp are visually "read"
+  const [alertsAckedAt, setAlertsAckedAt] = useState(null);
+  const [logClearedAt, setLogClearedAt] = useState(null);
+
+  // moomoo-specific heartbeat (poll directly to get moomoo_* fields the
+  // shared useData provider doesn't expose).
+  const [moomooHb, setMoomooHb] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      const hb = await safe(api.heartbeat, null);
+      if (!cancelled) setMoomooHb(hb);
+    };
+    tick();
+    const id = setInterval(tick, 5000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  // Monitor heartbeat is moomoo-specific: prefer moomoo_last_healthy_iso when
+  // OpenD is connected; fall back to "off" when disconnected.
+  const moomooHealthyAt = moomooHb?.moomoo_last_healthy_iso || null;
+  const moomooConnected = !!moomooHb?.moomoo_connected;
+  const monitorAge = moomooHealthyAt
+    ? Math.floor((new Date() - new Date(moomooHealthyAt)) / 1000)
+    : null;
+  const tickState = !moomooConnected
+    ? 'fail'
+    : monitorAge === null ? 'fail'
+    : monitorAge < 30 ? 'ok'
+    : monitorAge < 60 ? 'stale'
+    : 'fail';
+
   // Connection state
   const [host, setHost] = useState(() => localStorage.getItem('moomoo_host') || '127.0.0.1');
   const [port, setPort] = useState(() => localStorage.getItem('moomoo_port') || '11111');
@@ -127,6 +170,39 @@ export function MoomooView() {
   const [zeroDteBusy, setZeroDteBusy] = useState(false);
   const [zeroDteInfo, setZeroDteInfo] = useState(null);
 
+  // Telegram status — refresh on mount + every 30s.
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      const r = await safe(api.telegramStatus, null);
+      if (!cancelled) setTgStatus(r);
+    };
+    refresh();
+    const id = setInterval(refresh, 30000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  const sendTgTest = useCallback(async () => {
+    setTgBusy(true); setTgMsg('Sending…');
+    try {
+      const r = await api.telegramTest();
+      setTgMsg(r?.ok ? '✓ test message sent' : `✗ ${r?.error || 'send failed'}`);
+    } catch (e) { setTgMsg(`✗ ${e.message}`); }
+    finally { setTgBusy(false); }
+  }, []);
+
+  const sendTgCustom = useCallback(async () => {
+    const text = tgCustom.trim();
+    if (!text) return;
+    setTgBusy(true); setTgMsg('Sending…');
+    try {
+      const r = await api.telegramTest(text);
+      setTgMsg(r?.ok ? '✓ message sent' : `✗ ${r?.error || 'send failed'}`);
+      if (r?.ok) setTgCustom('');
+    } catch (e) { setTgMsg(`✗ ${e.message}`); }
+    finally { setTgBusy(false); }
+  }, [tgCustom]);
+
 const persistConn = useCallback(() => {
     localStorage.setItem('moomoo_host', host);
     localStorage.setItem('moomoo_port', port);
@@ -140,14 +216,13 @@ const persistConn = useCallback(() => {
   // as initialized, so referencing them earlier throws ReferenceError
   // and the whole view renders blank.
   const refreshAccount = useCallback(async () => {
-    if (!connected) return;
     try {
       const res = await api.moomoo.account();
       if (!res?.error) setAccount(res);
     } catch {
       // Ignored
     }
-  }, [connected]);
+  }, []);
 
   const refreshPositions = useCallback(async () => {
     // Pull from journal so we have position_id + legs for Close.
@@ -385,11 +460,23 @@ const persistConn = useCallback(() => {
     // Always poll journal positions (so user sees what was opened even if
     // they reload before reconnecting).  Account refresh requires connect.
     refreshPositions();
-    if (!connected) return;
-    refreshAccount();
+    if (moomooConnected) refreshAccount();
     const id = setInterval(() => { refreshAccount(); refreshPositions(); }, 15000);
     return () => clearInterval(id);
-  }, [connected, refreshAccount, refreshPositions]);
+  }, [moomooConnected, refreshAccount, refreshPositions]);
+
+  // Keep UI connection state in sync with backend connection state so
+  // Telegram-triggered connects are reflected immediately on screen.
+  useEffect(() => {
+    setConnected(moomooConnected);
+    if (moomooConnected) {
+      if (moomooHb?.moomoo_acc_id != null) setAccId(String(moomooHb.moomoo_acc_id));
+      if (!account) refreshAccount();
+    } else {
+      setAccId('');
+      setAccount(null);
+    }
+  }, [moomooConnected, moomooHb, account, refreshAccount]);
 
   // Load presets list + scanner status on mount; refresh status every 10s
   useEffect(() => {
@@ -494,16 +581,35 @@ const persistConn = useCallback(() => {
     type, value: val, onChange: e => set(e.target.value),
     style: {
       background: 'var(--bg-2)', border: '1px solid var(--border)',
-      borderRadius: 6, padding: '6px 10px', color: 'var(--text-1)',
+      borderRadius: 6, padding: '6px 10px', color: 'var(--text)',
       fontSize: 13, width: '100%', boxSizing: 'border-box',
     }
   });
 
+  // Set of moomoo preset names — used to filter the shared scanner log to
+  // moomoo-only ticks. The IBKR view filters the same log to non-moomoo.
+  const moomooPresetNames = new Set(moomooPresets.map(p => p.name));
+
+  // moomoo-only alerts: any heartbeat alert whose code/message mentions moomoo.
+  const moomooAlerts = (m.alerts || []).filter(a => {
+    const hay = `${a.code || ''} ${a.title || ''} ${a.msg || ''}`.toLowerCase();
+    return hay.includes('moomoo') || hay.includes('opend');
+  });
+
+  // moomoo-only scanner logs: only ticks whose preset is a moomoo preset, and
+  // only when a moomoo preset is currently the active scan.
+  const activePresetIsMoomoo = scannerActive && (scannerPreset?.broker === 'moomoo' || moomooPresetNames.has(scannerPreset?.name));
+  const moomooLogs = (m.scanner?.logs || []).filter(l => {
+    if (l.preset_name) return moomooPresetNames.has(l.preset_name);
+    // legacy logs without preset_name: only show if a moomoo preset is active
+    return activePresetIsMoomoo;
+  });
+
   return (
-    <div className="page">
+    <div className="page moomoo-page">
 
       {/* ── KPI row ── */}
-      <div className="grid g-4" style={{ marginBottom: 14 }}>
+      <div className="moomoo-kpis">
         <OKpi label="Total Assets" value={fmtUsd(account?.equity ?? 0)} sub="moomoo account" />
         <OKpi label="Buying Power" value={fmtUsd(account?.buying_power ?? 0)} sub="available" />
         <OKpi label="Unrealized P&L" value={fmtUsd(account?.unrealized_pnl ?? 0, true)}
@@ -512,25 +618,139 @@ const persistConn = useCallback(() => {
           color={(account?.realized_pnl ?? 0) >= 0 ? C.pos : C.neg} />
       </div>
 
-      <div className="grid g-23" style={{ gap: 14 }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <div className="moomoo-dashboard">
+        <div className="moomoo-stack">
+
+          {/* ── Monitor Heartbeat | Alerts ── */}
+          <div className="moomoo-status-grid">
+            <OCard
+              title="moomoo Heartbeat"
+              subtitle={
+                !moomooConnected ? 'OpenD disconnected'
+                : tickState === 'ok' ? 'healthy'
+                : tickState === 'stale' ? 'stale'
+                : 'stalled'
+              }
+              right={
+                <span style={{
+                  fontSize: 10, fontWeight: 700, padding: '3px 8px', borderRadius: 10,
+                  letterSpacing: 0.5, textTransform: 'uppercase',
+                  color: tickState === 'ok' ? '#22c55e' : tickState === 'stale' ? C.warn : C.neg,
+                  background: tickState === 'ok' ? 'rgba(34,197,94,.12)' : tickState === 'stale' ? 'rgba(245,158,11,.12)' : 'rgba(248,113,113,.12)',
+                  border: `1px solid ${tickState === 'ok' ? 'rgba(34,197,94,.35)' : tickState === 'stale' ? 'rgba(245,158,11,.35)' : 'rgba(248,113,113,.35)'}`,
+                }}>
+                  {tickState === 'ok' ? 'HEALTHY' : tickState === 'stale' ? 'STALE' : 'STALLED'}
+                </span>
+              }
+            >
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: 200, alignItems: 'center', justifyContent: 'center', padding: '6px 0' }}>
+                <div style={{ fontSize: 26, fontWeight: 700, fontFamily: 'monospace' }}>
+                  {monitorAge !== null ? `${monitorAge}s` : '—'}
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  {moomooHealthyAt
+                    ? `last call ${new Date(moomooHealthyAt).toTimeString().slice(0, 8)}`
+                    : moomooConnected ? 'connected · waiting' : 'disconnected'}
+                </div>
+                {moomooHb?.moomoo_reconnecting && (
+                  <div style={{ fontSize: 11, color: C.warn }}>
+                    reconnecting · attempt #{moomooHb.moomoo_reconnect_attempt || 0}
+                  </div>
+                )}
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'center' }}>
+                  {[
+                    { label: 'OpenD', ok: moomooConnected },
+                    { label: 'Fresh', ok: !moomooHb?.moomoo_stalled && moomooConnected },
+                    { label: 'Stable', ok: !moomooHb?.moomoo_reconnecting },
+                  ].map(({ label, ok }) => (
+                    <span key={label} style={{
+                      fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 10,
+                      letterSpacing: 0.4,
+                      color: ok ? '#22c55e' : 'var(--text-3)',
+                      background: ok ? 'rgba(34,197,94,.10)' : 'rgba(100,100,100,.10)',
+                      border: `1px solid ${ok ? 'rgba(34,197,94,.30)' : 'rgba(100,100,100,.25)'}`,
+                    }}>{label}</span>
+                  ))}
+                </div>
+              </div>
+            </OCard>
+
+            <OCard
+              title="moomoo Alerts"
+              subtitle={(() => {
+                const unread = moomooAlerts.filter(a => {
+                  if (alertsAckedAt == null) return true;
+                  const t = a.time ? new Date(a.time).getTime() : 0;
+                  return t > alertsAckedAt;
+                }).length;
+                return unread > 0 ? `${unread} unread` : (moomooAlerts.length ? 'all read' : 'no moomoo alerts');
+              })()}
+              right={
+                <button
+                  onClick={() => setAlertsAckedAt(Date.now())}
+                  disabled={!moomooAlerts.length}
+                  style={{
+                    background: 'transparent', border: `1px solid ${C.cardBorder}`,
+                    color: 'var(--text-2)', fontSize: 11, padding: '4px 10px',
+                    borderRadius: 6, cursor: moomooAlerts.length ? 'pointer' : 'not-allowed',
+                    opacity: moomooAlerts.length ? 1 : 0.5,
+                  }}
+                >Mark all read</button>
+              }
+              flush
+            >
+              <div style={{ maxHeight: 180, overflowY: 'auto' }}>
+                {moomooAlerts.length === 0 && (
+                  <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)', fontSize: 12 }}>No active moomoo alerts</div>
+                )}
+                {moomooAlerts.map((a, i) => {
+                  const t = a.time ? new Date(a.time).getTime() : 0;
+                  const acked = alertsAckedAt != null && t <= alertsAckedAt;
+                  const lvlColor = a.level === 'crit' ? C.neg : a.level === 'warn' ? C.warn : C.accent;
+                  return (
+                    <div key={i} style={{
+                      display: 'flex', gap: 10, padding: '10px 14px',
+                      borderBottom: '1px solid rgba(255,255,255,.04)',
+                      opacity: acked ? 0.55 : 1,
+                    }}>
+                      <span style={{
+                        width: 6, height: 6, borderRadius: '50%', background: lvlColor,
+                        marginTop: 6, flexShrink: 0,
+                      }} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{a.title}</div>
+                        <div style={{ fontSize: 11, color: 'var(--text-3)' }}>{a.msg}</div>
+                      </div>
+                      <div style={{ fontSize: 10, color: 'var(--text-3)', whiteSpace: 'nowrap' }}>{fmtTimeAgo(a.time)}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </OCard>
+          </div>
 
           {/* ── Connection panel ── */}
-          <OCard title="moomoo OpenD Connection" subtitle="Requires OpenD v8.3+ running locally">
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end', marginBottom: 12 }}>
-              <div style={{ flex: '1 1 120px' }}>
+          <OCard
+            title="moomoo OpenD Connection"
+            subtitle="Requires OpenD v8.3+ running locally"
+            compact
+            style={{ order: -1 }}
+            right={<StatusPill connected={connected} accId={accId} />}
+          >
+            <div className="moomoo-connect-grid">
+              <div>
                 <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Host</div>
                 <input {...inp(host, setHost)} />
               </div>
-              <div style={{ flex: '0 0 80px' }}>
+              <div>
                 <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Port</div>
                 <input {...inp(port, setPort, 'number')} />
               </div>
-              <div style={{ flex: '1 1 140px' }}>
+              <div>
                 <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Trade Password</div>
                 <input {...inp(tradePwd, setTradePwd, 'password')} placeholder="PIN (real only)" />
               </div>
-              <div style={{ flexShrink: 0 }}>
+              <div>
                 <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Mode</div>
                 <div style={{ display: 'flex', gap: 4 }}>
                   {[{ label: 'Simulate', val: 0 }, { label: 'Real', val: 1 }].map(({ label, val }) => (
@@ -543,11 +763,11 @@ const persistConn = useCallback(() => {
                   ))}
                 </div>
               </div>
-              <div style={{ flexShrink: 0 }}>
+              <div>
                 <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Firm</div>
                 <select disabled={connected} value={secFirm} onChange={e => setSecFirm(e.target.value)} style={{
                   padding: '5px 8px', fontSize: 12, borderRadius: 6, border: '1px solid rgba(100,100,100,.3)',
-                  background: 'var(--bg-card)', color: 'var(--text-1)', cursor: connected ? 'default' : 'pointer',
+                  background: 'var(--bg-2)', color: 'var(--text)', cursor: connected ? 'default' : 'pointer',
                 }}>
                   <option value="NONE">Auto (NONE)</option>
                   <option value="FUTUINC">Futu Inc (US)</option>
@@ -557,15 +777,16 @@ const persistConn = useCallback(() => {
                   <option value="FUTUAU">Futu AU</option>
                 </select>
               </div>
-              <OBtn onClick={connected ? doDisconnect : doConnect} disabled={connBusy} danger={connected}>
-                {connBusy ? '…' : connected ? 'Disconnect' : 'Connect'}
-              </OBtn>
-              <OBtn onClick={doProbe} disabled={probeBusy || connected}>
-                {probeBusy ? '…' : 'Probe'}
-              </OBtn>
+              <div className="moomoo-connect-actions">
+                <OBtn small onClick={connected ? doDisconnect : doConnect} disabled={connBusy} danger={connected}>
+                  {connBusy ? '…' : connected ? 'Disconnect' : 'Connect'}
+                </OBtn>
+                <OBtn small onClick={doProbe} disabled={probeBusy || connected}>
+                  {probeBusy ? '…' : 'Probe'}
+                </OBtn>
+              </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-              <StatusPill connected={connected} accId={accId} />
               {connMsg && (
                 <span style={{ fontSize: 12, color: connMsg.startsWith('✓') ? C.pos : connMsg.startsWith('✗') ? C.neg : 'var(--text-3)' }}>
                   {connMsg}
@@ -644,7 +865,7 @@ const persistConn = useCallback(() => {
                   style={{
                     width: '100%', padding: '6px 8px', fontSize: 13, borderRadius: 6,
                     border: '1px solid rgba(100,100,100,.3)',
-                    background: 'var(--bg-card)', color: 'var(--text-1)',
+                    background: 'var(--bg-2)', color: 'var(--text)',
                   }}
                 >
                   {moomooPresets.length === 0 && <option value="">(no moomoo presets)</option>}
@@ -691,135 +912,78 @@ const persistConn = useCallback(() => {
             <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-3)', lineHeight: 1.5 }}>
               ORB strategy trades only on Mon/Wed/Fri when VIX is 15-25, the OR range
               ≥ 0.05% of price, and the day is not a scheduled high-impact news day
-              (FOMC, NFP, CPI). Today (2026-04-29) is FOMC and will be skipped.
+              (FOMC, NFP, CPI).
             </div>
           </OCard>
 
-          {/* ── 0DTE Order Flow Bot ── */}
-          <OCard title="0DTE Order Flow Bot" subtitle="Native tick-level SPY absorption & delta signals">
-            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
-              {!zeroDteActive ? (
-                <OBtn onClick={doZeroDteStart} disabled={!connected || zeroDteBusy}>
-                  {zeroDteBusy ? '…' : 'Start Engine'}
-                </OBtn>
-              ) : (
-                <OBtn onClick={doZeroDteStop} disabled={zeroDteBusy} danger>
-                  {zeroDteBusy ? '…' : 'Stop Engine'}
-                </OBtn>
-              )}
-              
-              <span style={{
-                display: 'inline-flex', alignItems: 'center', gap: 6,
-                background: zeroDteActive ? 'rgba(56,189,248,.15)' : 'rgba(100,100,100,.15)',
-                border: `1px solid ${zeroDteActive ? 'rgba(56,189,248,.4)' : 'rgba(100,100,100,.3)'}`,
-                borderRadius: 20, padding: '3px 10px', fontWeight: 600, fontSize: 12,
-                color: zeroDteActive ? '#38bdf8' : 'var(--text-3)',
+          {/* ── Signals Log (live scanner ticks, moomoo presets only) ── */}
+          <OCard
+            title="moomoo Signals Log"
+            subtitle={
+              activePresetIsMoomoo
+                ? `live · ${scannerPreset?.name || ''}`
+                : scannerActive ? `idle · active preset is IBKR (${scannerPreset?.name})` : 'idle'
+            }
+            right={
+              <button
+                onClick={() => setLogClearedAt(Date.now())}
+                style={{
+                  background: 'transparent', border: `1px solid ${C.cardBorder}`,
+                  color: 'var(--text-2)', fontSize: 11, padding: '4px 10px',
+                  borderRadius: 6, cursor: 'pointer',
+                }}
+              >Clear</button>
+            }
+            flush
+          >
+            <div style={{ maxHeight: 240, overflowY: 'auto' }}>
+              <div style={{
+                display: 'grid', gridTemplateColumns: '70px 14px 70px 50px 1fr',
+                gap: 8, padding: '8px 14px',
+                background: 'rgba(0,0,0,.18)',
+                fontSize: 10, fontWeight: 600, textTransform: 'uppercase',
+                letterSpacing: 0.6, color: 'var(--text-3)',
+                position: 'sticky', top: 0, zIndex: 5,
               }}>
-                <span style={{ width: 7, height: 7, borderRadius: '50%', background: zeroDteActive ? '#38bdf8' : '#6b7280' }} />
-                {zeroDteActive ? 'Engine running' : 'Engine idle'}
-              </span>
-
-              {zeroDteMsg && (
-                <span style={{ fontSize: 12, color: zeroDteMsg.startsWith('✓') ? C.pos : zeroDteMsg.startsWith('✗') ? C.neg : 'var(--text-3)' }}>
-                  {zeroDteMsg}
-                </span>
-              )}
-              {!connected && (
-                <span style={{ fontSize: 12, color: C.neg }}>Connect to moomoo first.</span>
-              )}
-            </div>
-
-            {zeroDteInfo?.state && zeroDteActive && (
-              <div style={{ marginTop: 12, display: 'flex', gap: 16, fontSize: 12, color: 'var(--text-1)' }}>
-                <span>Cum. Delta: <strong style={{ color: zeroDteInfo.state.cumulative_delta > 0 ? C.pos : C.neg }}>{zeroDteInfo.state.cumulative_delta}</strong></span>
-                <span>Bars Built: <strong>{zeroDteInfo.state.bars_count}</strong></span>
-                {zeroDteInfo.state.latest_bar && (
-                  <span>Last Absorption: <strong>{Number(zeroDteInfo.state.latest_bar.absorption).toFixed(1)}</strong></span>
-                )}
-                {zeroDteInfo.last_signal && (
-                  <span style={{ color: C.warn }}>Last Signal: <strong>{zeroDteInfo.last_signal}</strong></span>
-                )}
+                <span>Time</span><span></span><span>Price</span><span>RSI</span><span>Message</span>
               </div>
-            )}
-            <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-3)', lineHeight: 1.5 }}>
-              Executes ATM 0DTE options upon Absorption Bull/Bear or Delta Divergence.
-              Monitors ticks natively. Trades use OCO (-50% stop, +100% target).
+              {(() => {
+                const visible = logClearedAt
+                  ? moomooLogs.filter(l => {
+                      const [h, mn, s] = (l.t || '00:00:00').split(':').map(Number);
+                      return new Date().setHours(h, mn, s, 0) > logClearedAt;
+                    })
+                  : moomooLogs;
+                if (visible.length === 0) {
+                  return (
+                    <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-3)', fontSize: 12 }}>
+                      {activePresetIsMoomoo
+                        ? 'Waiting for first scan…'
+                        : scannerActive
+                          ? 'No moomoo ticks — active preset is on IBKR'
+                          : 'No scans yet — start a moomoo preset above'}
+                    </div>
+                  );
+                }
+                return visible.map((l, i) => (
+                  <div key={i} style={{
+                    display: 'grid', gridTemplateColumns: '70px 14px 70px 50px 1fr',
+                    gap: 8, padding: '6px 14px', fontSize: 11.5,
+                    borderBottom: '1px solid rgba(255,255,255,.03)',
+                  }}>
+                    <span style={{ color: 'var(--text-3)', fontFamily: 'monospace' }}>{l.t}</span>
+                    <span style={{
+                      width: 8, height: 8, borderRadius: '50%', marginTop: 4,
+                      background: l.signal ? C.pos : 'rgba(120,120,120,.4)',
+                    }} />
+                    <span style={{ fontFamily: 'monospace' }}>${(l.price ?? 0).toFixed(2)}</span>
+                    <span style={{ fontFamily: 'monospace', color: l.rsi_ok ? C.pos : 'var(--text-3)' }}>{(l.rsi ?? 0).toFixed(1)}</span>
+                    <span style={{ color: l.signal ? C.pos : 'var(--text-2)', fontWeight: l.signal ? 600 : 400 }}>{l.msg}</span>
+                  </div>
+                ));
+              })()}
             </div>
           </OCard>
-
-          {/* ── Legged execution warning ── */}
-          <div style={{
-            background: 'rgba(249,115,22,.1)', border: `1px solid ${C.cardBorder}`,
-            borderRadius: 8, padding: '10px 14px', fontSize: 12,
-            color: C.accentHov, display: 'flex', gap: 8, alignItems: 'flex-start',
-          }}>
-            <span style={{ fontSize: 16, marginTop: -1 }}>⚠</span>
-            <span>
-              <strong>Legged execution:</strong> Spreads place 2 sequential single-leg orders.
-              If leg 2 fails or times out, leg 1 is automatically flattened at market price.
-              Monitor order log below for status.
-            </span>
-          </div>
-
-          {/* ── Order ticket ── */}
-          <OCard title="Order Ticket" subtitle="SPY 0DTE · legged spread">
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
-              {/* Direction toggle */}
-              <div>
-                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Direction</div>
-                <div style={{ display: 'flex', gap: 0, border: `1px solid ${C.cardBorder}`, borderRadius: 6, overflow: 'hidden' }}>
-                  {['bull_call', 'bear_put'].map(d => (
-                    <button key={d} onClick={() => setTicketDir(d)} style={{
-                      background: ticketDir === d ? C.accent : 'transparent',
-                      color: ticketDir === d ? '#000' : 'var(--text-2)',
-                      border: 'none', padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
-                    }}>
-                      {d === 'bull_call' ? 'Bull Call' : 'Bear Put'}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div style={{ flex: '0 0 80px' }}>
-                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Offset (pts)</div>
-                <input {...inp(ticketOffset, setTicketOffset, 'number')} />
-              </div>
-              <div style={{ flex: '0 0 60px' }}>
-                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Width ($)</div>
-                <input {...inp(ticketWidth, setTicketWidth, 'number')} />
-              </div>
-              <div style={{ flex: '0 0 60px' }}>
-                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Qty</div>
-                <input {...inp(ticketQty, setTicketQty, 'number')} />
-              </div>
-              <div style={{ flex: '0 0 90px' }}>
-                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Net Debit ($)</div>
-                <input {...inp(ticketDebit, setTicketDebit, 'number')} />
-              </div>
-              <div style={{ display: 'flex', alignItems: 'flex-end' }}>
-                <OBtn onClick={doExecute} disabled={execBusy || !connected}>
-                  {execBusy ? 'Placing…' : 'Execute'}
-                </OBtn>
-              </div>
-            </div>
-            {execMsg && (
-              <div style={{ fontSize: 12, color: execMsg.startsWith('✓') ? C.pos : execMsg.startsWith('✗') ? C.neg : 'var(--text-3)', marginBottom: 8 }}>
-                {execMsg}
-              </div>
-            )}
-            {execResult && (
-              <div style={{ display: 'flex', gap: 16, fontSize: 12, color: 'var(--text-2)' }}>
-                <span>K_long <strong style={{ color: C.accent }}>{execResult.K_long}</strong></span>
-                <span>K_short <strong style={{ color: C.accent }}>{execResult.K_short}</strong></span>
-                <span>Debit <strong>{fmtUsd(execResult.debit_per_contract * 100)}</strong></span>
-                <span>Leg1 <code style={{ fontSize: 11 }}>{execResult.leg1_order_id}</code></span>
-                <span>Leg2 <code style={{ fontSize: 11 }}>{execResult.leg2_order_id}</code></span>
-              </div>
-            )}
-          </OCard>
-
-        </div>
-
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
 
           {/* ── Positions table (journal-backed) ── */}
           <OCard
@@ -893,6 +1057,128 @@ const persistConn = useCallback(() => {
             )}
           </OCard>
 
+          {/* ── 0DTE Order Flow Bot ── */}
+          <OCard title="0DTE Order Flow Bot" subtitle="Native tick-level SPY absorption & delta signals">
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
+              {!zeroDteActive ? (
+                <OBtn onClick={doZeroDteStart} disabled={!connected || zeroDteBusy}>
+                  {zeroDteBusy ? '…' : 'Start Engine'}
+                </OBtn>
+              ) : (
+                <OBtn onClick={doZeroDteStop} disabled={zeroDteBusy} danger>
+                  {zeroDteBusy ? '…' : 'Stop Engine'}
+                </OBtn>
+              )}
+              
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                background: zeroDteActive ? 'rgba(56,189,248,.15)' : 'rgba(100,100,100,.15)',
+                border: `1px solid ${zeroDteActive ? 'rgba(56,189,248,.4)' : 'rgba(100,100,100,.3)'}`,
+                borderRadius: 20, padding: '3px 10px', fontWeight: 600, fontSize: 12,
+                color: zeroDteActive ? '#38bdf8' : 'var(--text-3)',
+              }}>
+                <span style={{ width: 7, height: 7, borderRadius: '50%', background: zeroDteActive ? '#38bdf8' : '#6b7280' }} />
+                {zeroDteActive ? 'Engine running' : 'Engine idle'}
+              </span>
+
+              {zeroDteMsg && (
+                <span style={{ fontSize: 12, color: zeroDteMsg.startsWith('✓') ? C.pos : zeroDteMsg.startsWith('✗') ? C.neg : 'var(--text-3)' }}>
+                  {zeroDteMsg}
+                </span>
+              )}
+              {!connected && (
+                <span style={{ fontSize: 12, color: C.neg }}>Connect to moomoo first.</span>
+              )}
+            </div>
+
+            {zeroDteInfo?.state && zeroDteActive && (
+              <div style={{ marginTop: 12, display: 'flex', gap: 16, fontSize: 12, color: 'var(--text)' }}>
+                <span>Cum. Delta: <strong style={{ color: zeroDteInfo.state.cumulative_delta > 0 ? C.pos : C.neg }}>{zeroDteInfo.state.cumulative_delta}</strong></span>
+                <span>Bars Built: <strong>{zeroDteInfo.state.bars_count}</strong></span>
+                {zeroDteInfo.state.latest_bar && (
+                  <span>Last Absorption: <strong>{Number(zeroDteInfo.state.latest_bar.absorption).toFixed(1)}</strong></span>
+                )}
+                {zeroDteInfo.last_signal && (
+                  <span style={{ color: C.warn }}>Last Signal: <strong>{zeroDteInfo.last_signal}</strong></span>
+                )}
+              </div>
+            )}
+            <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-3)', lineHeight: 1.5 }}>
+              Executes ATM 0DTE options upon Absorption Bull/Bear or Delta Divergence.
+              Monitors ticks natively. Trades use OCO (-50% stop, +100% target).
+            </div>
+          </OCard>
+
+          {/* ── Legged execution warning ── */}
+          <div className="notice warn">
+            <span style={{ fontSize: 16, marginTop: -1 }}>!</span>
+            <span>
+              <strong>Legged execution:</strong> Spreads place 2 sequential single-leg orders.
+              If leg 2 fails or times out, leg 1 is automatically flattened at market price.
+              Monitor order log below for status.
+            </span>
+          </div>
+
+          {/* ── Order ticket ── */}
+          <OCard title="Order Ticket" subtitle="SPY 0DTE · legged spread">
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+              {/* Direction toggle */}
+              <div>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Direction</div>
+                <div style={{ display: 'flex', gap: 0, border: `1px solid ${C.cardBorder}`, borderRadius: 6, overflow: 'hidden' }}>
+                  {['bull_call', 'bear_put'].map(d => (
+                    <button key={d} onClick={() => setTicketDir(d)} style={{
+                      background: ticketDir === d ? C.accent : 'transparent',
+                      color: ticketDir === d ? '#000' : 'var(--text-2)',
+                      border: 'none', padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                    }}>
+                      {d === 'bull_call' ? 'Bull Call' : 'Bear Put'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ flex: '0 0 80px' }}>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Offset (pts)</div>
+                <input {...inp(ticketOffset, setTicketOffset, 'number')} />
+              </div>
+              <div style={{ flex: '0 0 60px' }}>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Width ($)</div>
+                <input {...inp(ticketWidth, setTicketWidth, 'number')} />
+              </div>
+              <div style={{ flex: '0 0 60px' }}>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Qty</div>
+                <input {...inp(ticketQty, setTicketQty, 'number')} />
+              </div>
+              <div style={{ flex: '0 0 90px' }}>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Net Debit ($)</div>
+                <input {...inp(ticketDebit, setTicketDebit, 'number')} />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+                <OBtn onClick={doExecute} disabled={execBusy || !connected}>
+                  {execBusy ? 'Placing…' : 'Execute'}
+                </OBtn>
+              </div>
+            </div>
+            {execMsg && (
+              <div style={{ fontSize: 12, color: execMsg.startsWith('✓') ? C.pos : execMsg.startsWith('✗') ? C.neg : 'var(--text-3)', marginBottom: 8 }}>
+                {execMsg}
+              </div>
+            )}
+            {execResult && (
+              <div style={{ display: 'flex', gap: 16, fontSize: 12, color: 'var(--text-2)' }}>
+                <span>K_long <strong style={{ color: C.accent }}>{execResult.K_long}</strong></span>
+                <span>K_short <strong style={{ color: C.accent }}>{execResult.K_short}</strong></span>
+                <span>Debit <strong>{fmtUsd(execResult.debit_per_contract * 100)}</strong></span>
+                <span>Leg1 <code style={{ fontSize: 11 }}>{execResult.leg1_order_id}</code></span>
+                <span>Leg2 <code style={{ fontSize: 11 }}>{execResult.leg2_order_id}</code></span>
+              </div>
+            )}
+          </OCard>
+
+        </div>
+
+        <div className="moomoo-stack">
+
           {/* ── Order log ── */}
           <OCard title="Order Log" subtitle="legged execution results">
             {orderLog.length === 0 ? (
@@ -917,6 +1203,98 @@ const persistConn = useCallback(() => {
                 </tbody>
               </table>
             )}
+          </OCard>
+
+          {/* ── Telegram bot control + status ── */}
+          <OCard
+            title="Telegram Bot"
+            subtitle={
+              tgStatus == null
+                ? 'loading…'
+                : tgStatus.configured
+                  ? `chat ${tgStatus.chat_id_masked} · polling every ${tgStatus.poll_interval_seconds}s`
+                  : 'set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID env vars and restart'
+            }
+            right={
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                fontSize: 10, fontWeight: 700, padding: '3px 8px', borderRadius: 10,
+                letterSpacing: 0.5, textTransform: 'uppercase',
+                color: tgStatus?.configured ? (tgStatus?.polling_active ? '#22c55e' : C.warn) : 'var(--text-3)',
+                background: tgStatus?.configured ? (tgStatus?.polling_active ? 'rgba(34,197,94,.12)' : 'rgba(245,158,11,.12)') : 'rgba(100,100,100,.12)',
+                border: `1px solid ${tgStatus?.configured ? (tgStatus?.polling_active ? 'rgba(34,197,94,.35)' : 'rgba(245,158,11,.35)') : 'rgba(100,100,100,.3)'}`,
+              }}>
+                {tgStatus?.configured ? (tgStatus?.polling_active ? 'ACTIVE' : 'IDLE') : 'NOT CONFIGURED'}
+              </span>
+            }
+          >
+            <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 14 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                  <input
+                    placeholder={tgStatus?.configured ? 'Custom message to push to Telegram…' : 'Bot not configured'}
+                    value={tgCustom}
+                    onChange={e => setTgCustom(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && !e.shiftKey && tgCustom.trim() && tgStatus?.configured && !tgBusy) {
+                        e.preventDefault(); sendTgCustom();
+                      }
+                    }}
+                    disabled={!tgStatus?.configured || tgBusy}
+                    style={{
+                      flex: 1, padding: '7px 10px', fontSize: 13, borderRadius: 6,
+                      border: '1px solid rgba(100,100,100,.3)',
+                      background: 'var(--bg-2)', color: 'var(--text)',
+                    }}
+                  />
+                  <OBtn onClick={sendTgCustom} disabled={!tgStatus?.configured || tgBusy || !tgCustom.trim()}>
+                    Send
+                  </OBtn>
+                </div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <OBtn small onClick={sendTgTest} disabled={!tgStatus?.configured || tgBusy}>
+                    Send test message
+                  </OBtn>
+                  {tgMsg && (
+                    <span style={{ fontSize: 11, color: tgMsg.startsWith('✓') ? C.pos : tgMsg.startsWith('✗') ? C.neg : 'var(--text-3)' }}>
+                      {tgMsg}
+                    </span>
+                  )}
+                </div>
+                {!tgStatus?.configured && (
+                  <div style={{ fontSize: 11, color: 'var(--text-3)', lineHeight: 1.5 }}>
+                    <strong>Setup:</strong> talk to <span style={{ fontFamily: 'monospace' }}>@BotFather</span> on Telegram → <span style={{ fontFamily: 'monospace' }}>/newbot</span> → copy the token.
+                    Then DM your bot once and ask <span style={{ fontFamily: 'monospace' }}>@userinfobot</span> for your chat id.
+                    Add both to <span style={{ fontFamily: 'monospace' }}>config/.env</span> and restart the server.
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <div style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600, color: 'var(--text-3)', marginBottom: 6 }}>
+                  Available slash commands
+                </div>
+                {Array.isArray(tgStatus?.commands) && tgStatus.commands.length > 0 ? (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                    {tgStatus.commands.map(c => (
+                      <span key={c} style={{
+                        fontFamily: 'monospace', fontSize: 10.5,
+                        padding: '2px 8px', borderRadius: 10,
+                        background: 'rgba(249,115,22,.12)', color: C.accent,
+                        border: `1px solid ${C.cardBorder}`,
+                      }}>/{c}</span>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                    Configure the bot to see registered commands.
+                  </div>
+                )}
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 10, lineHeight: 1.5 }}>
+                  Notifies on: <strong>entry submit/fill</strong>, <strong>risk reject</strong>, <strong>exit fill (+ realized P&L)</strong>, <strong>FLATTEN ALL</strong>.
+                </div>
+              </div>
+            </div>
           </OCard>
 
         </div>

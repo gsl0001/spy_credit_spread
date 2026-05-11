@@ -40,6 +40,29 @@ def list_strategy_classes() -> dict:
         from strategies.combo_spread import ComboSpreadStrategy
         from strategies.dryrun import DryRunStrategy
         from strategies.orb import OrbStrategy
+        from strategies.rsi2 import Rsi2Strategy
+        from strategies.ibs import IbsStrategy
+        from strategies.eod_drift import EodDriftStrategy
+        from strategies.donchian import DonchianStrategy
+        from strategies.turn_of_month import TurnOfMonthStrategy
+        from strategies.vix_spike import VixSpikeStrategy
+        from strategies.bollinger_b import BollingerBStrategy
+        from strategies.dabd import DabdStrategy
+        from strategies.panic_dip import PanicDipStrategy
+        from strategies.nr7 import Nr7Strategy
+        from strategies.turnaround_tuesday import TurnaroundTuesdayStrategy
+        from strategies.rsi_ibs_confluence import RsiIbsConfluenceStrategy
+        from strategies.gap_down_reversal import GapDownReversalStrategy
+        from strategies.streak_ibs import StreakIbsStrategy
+        from strategies.cci_extreme import CciExtremeStrategy
+        from strategies.ldm_0dte import Ldm0dteStrategy
+        from strategies.ldm_fade_0dte import LdmFade0dteStrategy
+        from strategies.connors_3day import Connors3DayStrategy
+        from strategies.double7 import Double7Strategy
+        from strategies.rsi_25_75 import Rsi2575Strategy
+        from strategies.cumulative_rsi import CumulativeRsiStrategy
+        from strategies.r3 import R3Strategy
+        from strategies.williams_r import WilliamsRStrategy
     except Exception:  # noqa: BLE001
         return {}
     return {
@@ -47,6 +70,29 @@ def list_strategy_classes() -> dict:
         "combo_spread": ComboSpreadStrategy,
         "dryrun": DryRunStrategy,
         "orb": OrbStrategy,
+        "rsi2": Rsi2Strategy,
+        "ibs": IbsStrategy,
+        "eod_drift": EodDriftStrategy,
+        "donchian": DonchianStrategy,
+        "turn_of_month": TurnOfMonthStrategy,
+        "vix_spike": VixSpikeStrategy,
+        "bollinger_b": BollingerBStrategy,
+        "dabd": DabdStrategy,
+        "panic_dip": PanicDipStrategy,
+        "nr7": Nr7Strategy,
+        "turnaround_tuesday": TurnaroundTuesdayStrategy,
+        "rsi_ibs_confluence": RsiIbsConfluenceStrategy,
+        "gap_down_reversal": GapDownReversalStrategy,
+        "streak_ibs": StreakIbsStrategy,
+        "cci_extreme": CciExtremeStrategy,
+        "ldm_0dte": Ldm0dteStrategy,
+        "ldm_fade_0dte": LdmFade0dteStrategy,
+        "connors_3day": Connors3DayStrategy,
+        "double7": Double7Strategy,
+        "rsi_25_75": Rsi2575Strategy,
+        "cumulative_rsi": CumulativeRsiStrategy,
+        "r3": R3Strategy,
+        "williams_r": WilliamsRStrategy,
     }
 
 

@@ -3,7 +3,7 @@ import { Ico } from './icons.jsx';
 export function Sidebar({ view, setView, alertCount }) {
   const items = [
     { id: 'live',     icon: 'dashboard', label: 'Live Trading' },
-    { id: 'paper',    icon: 'radar',     label: 'Paper (Alpaca)' },
+    { id: 'paper',    icon: 'radar',     label: 'Paper Trials' },
     { id: 'moomoo',   icon: 'zap',       label: 'Moomoo',        orange: true },
     { id: 'backtest', icon: 'activity',  label: 'Backtest' },
     { id: 'journal',  icon: 'book',      label: 'Journal' },

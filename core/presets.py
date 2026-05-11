@@ -53,6 +53,15 @@ class ScannerPreset:
     commission_per_contract: float = 0.65
     realism_factor: float = 1.15
 
+    # Smoke-test escape hatch: skip the event-blackout gate. Production presets
+    # MUST leave this False — CPI/FOMC/NFP filters exist to avoid event risk.
+    bypass_event_blackout: bool = False
+
+    # Stored for self-description / drift detection only. The scanner's
+    # bar fetcher reads BAR_SIZE from the strategy class — this field
+    # is a redundancy check enforced at save time (see PresetStore.save).
+    bar_size: str = "1 day"
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ScannerPreset":
         if "name" not in data or not data["name"]:
@@ -83,6 +92,8 @@ class ScannerPreset:
             use_mark_to_market=bool(data.get("use_mark_to_market", True)),
             commission_per_contract=float(data.get("commission_per_contract", 0.65)),
             realism_factor=float(data.get("realism_factor", 1.15)),
+            bypass_event_blackout=bool(data.get("bypass_event_blackout", False)),
+            bar_size=str(data.get("bar_size", "1 day")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -140,7 +151,47 @@ class PresetStore:
         return None
 
     def save(self, preset: ScannerPreset) -> ScannerPreset:
-        """Insert or replace by name."""
+        """Insert or replace by name.
+
+        Enforces two soft invariants at save time:
+          - bar_size drift: preset.bar_size must match the strategy
+            class's BAR_SIZE. Mismatch raises ValueError because the
+            scanner reads BAR_SIZE from the class — a stale preset
+            would silently route to the wrong harness.
+          - vetting gate: refuse to save a preset whose strategy is
+            marked VETTING_RESULT='rejected' on the class. Skill bar
+            says: "may not become a moomoo preset until its backtest
+            stats clear an explicit bar" — this enforces it.
+        """
+        import logging
+        log = logging.getLogger(__name__)
+        try:
+            from core.scanner import resolve_strategy_class
+            cls = resolve_strategy_class(preset.strategy_name)
+        except Exception:
+            cls = None
+        if cls is not None:
+            actual_bar = getattr(cls, "BAR_SIZE", "1 day")
+            if preset.bar_size and preset.bar_size != actual_bar:
+                raise ValueError(
+                    f"preset {preset.name!r} bar_size={preset.bar_size!r} "
+                    f"drifted from strategy {preset.strategy_name!r} "
+                    f"class BAR_SIZE={actual_bar!r}. Update the preset or "
+                    f"the strategy class so they agree."
+                )
+            verdict = getattr(cls, "VETTING_RESULT", "pending")
+            if verdict == "rejected":
+                raise ValueError(
+                    f"strategy {preset.strategy_name!r} is marked "
+                    f"VETTING_RESULT='rejected'. Cannot create a preset "
+                    f"for a rejected strategy — re-vet first."
+                )
+            if verdict == "pending":
+                log.warning(
+                    "preset %s saved for VETTING_RESULT='pending' strategy %s "
+                    "— ensure backtest cleared the skill bar before live use.",
+                    preset.name, preset.strategy_name,
+                )
         presets = [p for p in self._read_all() if p.name != preset.name]
         presets.append(preset)
         self._write_all(presets)

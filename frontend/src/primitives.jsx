@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 export const cls = (...xs) => xs.filter(Boolean).join(' ');
 
 export const fmtUsd = (n, sign = false) => {

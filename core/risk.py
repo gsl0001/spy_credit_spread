@@ -193,8 +193,13 @@ def size_position(
         contracts = max(0, int(fixed_contracts))
     elif canonical == "dynamic":
         budget = equity * (risk_percent / 100.0)
+        # Both caps clamp the budget. max_trade_cap is the legacy IBKR knob;
+        # max_allocation_cap is the moomoo/preset knob. Apply whichever
+        # is positive so a preset can't escape its dollar ceiling.
         if max_trade_cap > 0:
             budget = min(budget, max_trade_cap)
+        if max_allocation_cap > 0:
+            budget = min(budget, max_allocation_cap)
         contracts = max(1, int(math.floor(budget / risk_per_contract)))
     elif canonical == "targeted_spread":
         # use_request §2③: try targeted % first; if it exceeds the cap,

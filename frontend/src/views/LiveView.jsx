@@ -46,6 +46,17 @@ export function LiveView() {
     : null;
   const tickState = monitorAge === null ? 'fail' : monitorAge < 30 ? 'ok' : monitorAge < 60 ? 'stale' : 'fail';
 
+  // IBKR view filters: exclude moomoo-broker presets / OpenD alerts so the
+  // moomoo cards in the moomoo view don't bleed into here.
+  const moomooPresetNameSet = new Set(
+    presetList.filter(p => p.broker === 'moomoo').map(p => p.name)
+  );
+  const ibkrAlerts = m.alerts.filter(a => {
+    const hay = `${a.code || ''} ${a.title || ''} ${a.msg || ''}`.toLowerCase();
+    return !(hay.includes('moomoo') || hay.includes('opend'));
+  });
+  const ibkrLogs = m.scanner.logs.filter(l => !l.preset_name || !moomooPresetNameSet.has(l.preset_name));
+
   const connect = useCallback(async () => {
     setBusy(true); setConnectMsg('Connecting…');
     setIbkrCreds({ host, port, client_id: clientId });
@@ -365,18 +376,18 @@ export function LiveView() {
           title="Alerts"
           icon="bell"
           subtitle={(() => {
-            const unread = m.alerts.filter(a => {
+            const unread = ibkrAlerts.filter(a => {
               if (alertsAckedAt == null) return true;
               const t = a.time ? new Date(a.time).getTime() : 0;
               return t > alertsAckedAt;
             }).length;
-            return unread > 0 ? `${unread} unread` : (m.alerts.length ? 'all read' : 'no alerts');
+            return unread > 0 ? `${unread} unread` : (ibkrAlerts.length ? 'all read' : 'no alerts');
           })()}
           actions={
             <Btn
               variant="ghost"
               size="sm"
-              disabled={!m.alerts.length}
+              disabled={!ibkrAlerts.length}
               onClick={() => setAlertsAckedAt(Date.now())}
             >
               Mark all read
@@ -384,10 +395,10 @@ export function LiveView() {
           }
         >
           <div style={{ maxHeight: 150, overflowY: 'auto', margin: '-16px -20px' }}>
-            {m.alerts.length === 0 && (
+            {ibkrAlerts.length === 0 && (
               <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)', fontSize: 12 }}>No active alerts</div>
             )}
-            {m.alerts.map((a, i) => {
+            {ibkrAlerts.map((a, i) => {
               const t = a.time ? new Date(a.time).getTime() : 0;
               const acked = alertsAckedAt != null && t <= alertsAckedAt;
               return (
@@ -465,7 +476,7 @@ export function LiveView() {
             <div>
               <div className="muted" style={{ fontSize: 10, textTransform: 'uppercase' }}>Signals Today</div>
               <div className="mono" style={{ fontWeight: 700, color: 'var(--pos)', fontSize: 16 }}>
-                {m.scanner.logs.filter(l=>l.signal).length}
+                {ibkrLogs.filter(l=>l.signal).length}
               </div>
             </div>
           </div>
@@ -484,12 +495,12 @@ export function LiveView() {
             </div>
             {(() => {
               const visibleLogs = logClearedAt
-                ? m.scanner.logs.filter(l => {
+                ? ibkrLogs.filter(l => {
                     const [h, mn, s] = (l.t || '00:00:00').split(':').map(Number);
                     const logMs = new Date().setHours(h, mn, s, 0);
                     return logMs > logClearedAt;
                   })
-                : m.scanner.logs;
+                : ibkrLogs;
               if (visibleLogs.length === 0) {
                 return <div style={{ padding:40, textAlign:'center', color:'var(--text-3)', fontSize:12 }}>
                   {scannerRunning ? 'Waiting for first scan…' : 'No scans yet — start a preset scan'}

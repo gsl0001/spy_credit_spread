@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 import { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { api, safe, IBKR_CREDS } from './api.js';
 import { MOCK } from './data.js';
@@ -55,11 +56,19 @@ function mergeAccount(src, hb) {
 
 function mergeRisk(src, hb) {
   if (!hb) return src;
+  const marketReason = hb.market_reason ? String(hb.market_reason).replace(/_/g, ' ') : null;
+  const nextClose = hb.next_close || (
+    hb.market_open && Number.isFinite(hb.minutes_to_close)
+      ? `${hb.minutes_to_close}m to close`
+      : marketReason
+  );
   return {
     ...src,
     daily_loss_limit_pct: hb.daily_loss_limit_pct ?? src.daily_loss_limit_pct,
     daily_loss_used_pct: hb.daily_loss_pct_used ?? 0,
     current_concurrent: hb.open_positions ?? 0,
+    market_open: hb.market_open ?? src.market_open,
+    next_close: nextClose || src.next_close,
   };
 }
 
@@ -154,14 +163,18 @@ function mergeScanner(src, res) {
       : res.timing_mode || 'idle',
     logs: (res.logs || []).slice(0, 40).map(l => ({
       t: l.time?.slice(11, 19) ?? '—',
-      signal: !!l.signal,
+      // backend uses `fired` for preset scanner; `signal` for legacy scanner
+      signal: !!(l.signal ?? l.fired),
       price: l.price ?? 0,
       rsi: l.rsi ?? 0,
       rsi_ok: l.details?.rsi_ok ?? false,
       ema_ok: l.details?.ema_ok ?? true,
       sma200_ok: l.details?.sma200_ok ?? true,
       vol_ok: l.details?.vol_ok ?? true,
-      msg: l.msg || '',
+      // include preset_name + reason so views can filter by broker
+      preset_name: l.preset_name || null,
+      reason: l.reason || null,
+      msg: l.msg || l.reason || '',
     })),
     last_signal: res.logs?.[0]
       ? {

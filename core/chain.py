@@ -173,6 +173,64 @@ def pick_bull_call_strikes(
     return best
 
 
+def pick_bear_put_strikes(
+    strike_grid: list[float],
+    underlying: float,
+    put_prices: dict[float, tuple[float, float]],
+    target_debit: float,
+    max_width: int = 40,
+    otm_offset: float = 0.0,
+) -> Optional[dict]:
+    """Mirror of pick_bull_call_strikes for bear-put debit spreads.
+
+    K_long  ≈ ATM − otm_offset (nearest whole-dollar strike to underlying − offset)
+    K_short < K_long, chosen so (mid_long − mid_short) ≈ target_debit/100.
+    """
+    if not strike_grid:
+        return None
+    target_k_long = underlying - otm_offset
+    k_long = min(strike_grid, key=lambda k: abs(k - target_k_long))
+    long_quote = put_prices.get(k_long)
+    if not long_quote or long_quote[0] <= 0 or long_quote[1] <= 0:
+        return None
+    long_bid, long_ask = long_quote
+    long_mid = (long_bid + long_ask) / 2.0
+    target_per_contract = target_debit / 100.0 if target_debit > 0 else 2.50
+    below = [k for k in strike_grid if k < k_long and (k_long - k) <= max_width]
+    below.sort(reverse=True)  # search nearest-first
+    if not below:
+        return None
+    best = None
+    for k_short in below:
+        q = put_prices.get(k_short)
+        if not q or q[0] <= 0 or q[1] <= 0:
+            continue
+        s_bid, s_ask = q
+        s_mid = (s_bid + s_ask) / 2.0
+        debit = long_mid - s_mid
+        if debit <= 0:
+            break
+        diff = abs(debit - target_per_contract)
+        cand = {
+            "K_long": k_long,
+            "K_short": k_short,
+            "debit_per_contract": debit,
+            "long_bid": long_bid,
+            "long_ask": long_ask,
+            "short_bid": s_bid,
+            "short_ask": s_ask,
+            "long_mid": long_mid,
+            "short_mid": s_mid,
+        }
+        if best is None or diff < best["_diff"]:
+            cand["_diff"] = diff
+            best = cand
+    if best is None:
+        return None
+    best.pop("_diff", None)
+    return best
+
+
 def validate_spread_quality(
     spread: dict,
     *,
@@ -658,6 +716,7 @@ __all__ = [
     "SpreadSpec",
     "pick_nearest_expiry",
     "pick_bull_call_strikes",
+    "pick_bear_put_strikes",
     "resolve_bull_call_spread",
     "resolve_bull_call_spread_with_diagnostics",
     "build_synthetic_spread",

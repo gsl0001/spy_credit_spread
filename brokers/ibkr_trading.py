@@ -204,6 +204,12 @@ class IBKRTrader:
         """Reconnect if the socket dropped, with exponential backoff."""
         import time as _time
         if not self.is_alive():
+            try:
+                from core.connection_flags import is_auto_enabled
+                if not is_auto_enabled("ibkr"):
+                    return {"success": False, "msg": "IBKR auto-reconnect disabled"}
+            except Exception:
+                pass
             if self.connected: # It was connected but dropped
                 logging.warning("IBKR connection dropped. Attempting reconnect...")
             
@@ -475,6 +481,17 @@ class IBKRTrader:
 _ib_instances = {}
 
 async def get_ib_connection(creds: dict):
+    # Header toggle gate: when IBKR auto-reconnect is OFF, refuse new
+    # connection attempts. Existing endpoints that explicitly want to bypass
+    # the toggle (e.g. /api/ibkr/connect) can pass force=True via creds.
+    if not creds.get("force"):
+        try:
+            from core.connection_flags import is_auto_enabled
+            if not is_auto_enabled("ibkr"):
+                return None, "IBKR auto-reconnect disabled (header toggle off)"
+        except Exception:
+            pass
+
     if not _try_load_ibsync():
         return None, f"IBKR disabled: ib_insync unavailable ({_IBSYNC_IMPORT_ERROR})"
 

@@ -1,134 +1,310 @@
-import { useState, useCallback } from 'react';
-import { useData } from '../useBackendData.jsx';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { fmtUsd, Card, Kpi, Badge, Btn } from '../primitives.jsx';
 import { api } from '../api.js';
 
-export function PaperView() {
-  const m = useData();
-  const paper = m.paper || { equity: 0, day_pnl: 0, positions: [], auto_execute: false, api_key_set: false };
-  const pos = paper.positions || [];
+// Paper-trading gate — automated multi-preset trialing on moomoo paper.
+//
+// Each row = one preset under trial. The backend's daily evaluator job
+// transitions trialing → passed/failed when the sample-size minimums
+// (min_trades + min_days) are met. Promotion is manual via the button.
 
-  // Alpaca credentials persist in localStorage so the user doesn't retype
-  // them every session. Stored unencrypted (single-user local app); for
-  // production you'd want OS-keychain integration.
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('alpaca_key') || '');
-  const [apiSecret, setApiSecret] = useState(() => localStorage.getItem('alpaca_secret') || '');
-  const [connectBusy, setConnectBusy] = useState(false);
-  const [connectMsg, setConnectMsg] = useState('');
+function VerdictPill({ verdict }) {
+  const variant =
+    verdict === 'pass' ? 'success' :
+    verdict === 'fail' ? 'danger' :
+    verdict === 'warn' ? 'warning' : 'neutral';
+  return <Badge variant={variant}>{verdict || 'pending'}</Badge>;
+}
 
-  const reconnect = useCallback(async () => {
-    if (connectBusy) return;
-    const key = apiKey.trim();
-    const secret = apiSecret.trim();
-    if (!key || !secret) {
-      setConnectMsg('Enter API key + secret first.');
-      return;
-    }
-    localStorage.setItem('alpaca_key', key);
-    localStorage.setItem('alpaca_secret', secret);
-    setConnectBusy(true);
-    setConnectMsg('Connecting…');
+function StatusPill({ status }) {
+  const variant =
+    status === 'trialing' ? 'info' :
+    status === 'passed' ? 'success' :
+    status === 'failed' ? 'danger' :
+    status === 'promoted' ? 'success' :
+    'neutral';
+  return <Badge variant={variant}>{status}</Badge>;
+}
+
+function StartTrialForm({ presets, onStarted }) {
+  const [presetName, setPresetName] = useState('');
+  const [wr, setWr] = useState('');
+  const [cadence, setCadence] = useState('');
+  const [maxDd, setMaxDd] = useState('');
+  const [minTrades, setMinTrades] = useState(20);
+  const [minDays, setMinDays] = useState(7);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const submit = useCallback(async () => {
+    if (!presetName) { setMsg('Pick a preset.'); return; }
+    setBusy(true); setMsg('');
     try {
-      const res = await api.paperConnect({ api_key: key, api_secret: secret });
-      if (res?.connected || res?.success) {
-        setConnectMsg(`✓ Connected · ${res?.account_id || res?.summary?.account_id || ''}`);
+      const res = await api.paperTrialStart({
+        preset_name: presetName,
+        expected_win_rate_pct: Number(wr) || 0,
+        expected_trades_per_week: Number(cadence) || 0,
+        expected_max_drawdown_pct: Number(maxDd) || 0,
+        min_trades: Number(minTrades) || 20,
+        min_days: Number(minDays) || 7,
+      });
+      if (res.error) {
+        setMsg(`Failed: ${res.error}`);
       } else {
-        setConnectMsg(`✗ ${res?.error || 'connect failed'}`);
+        setMsg(`Trial started for ${presetName}.`);
+        setPresetName(''); setWr(''); setCadence(''); setMaxDd('');
+        onStarted && onStarted();
       }
     } catch (e) {
-      setConnectMsg(`✗ ${e.message}`);
+      setMsg(String(e.message || e));
     } finally {
-      setConnectBusy(false);
+      setBusy(false);
     }
-  }, [apiKey, apiSecret, connectBusy]);
+  }, [presetName, wr, cadence, maxDd, minTrades, minDays, onStarted]);
 
   return (
-    <div className="page">
-      <div className="grid g-4" style={{ marginBottom: 14 }}>
-        <Card><Kpi label="Paper Equity" value={fmtUsd(paper.equity)} delta={{ text: 'Alpaca paper', color: 'var(--text-3)' }} big /></Card>
-        <Card><Kpi label="Day P&L" value={fmtUsd(paper.day_pnl, true)} color={paper.day_pnl >= 0 ? 'var(--pos)' : 'var(--neg)'} big /></Card>
-        <Card><Kpi label="Open" value={pos.length} delta={{ text: pos.length ? 'SPY surrogate' : '—' }} big /></Card>
-        <Card><Kpi label="Auto-execute" value={paper.auto_execute ? 'ON' : 'OFF'} delta={{ text: 'manual signal confirm', color: 'var(--warn)' }} big /></Card>
+    <Card title="Start Trial" icon="zap">
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10 }}>
+        <div className="field">
+          <label>Preset</label>
+          <select className="sel" value={presetName} onChange={e => setPresetName(e.target.value)}>
+            <option value="">— pick —</option>
+            {(presets || []).map(p => (
+              <option key={p.name} value={p.name}>
+                {p.name} · {p.strategy_name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label>Expected WR %</label>
+          <input className="inp" type="number" step="0.1" value={wr}
+            onChange={e => setWr(e.target.value)} placeholder="e.g. 75" />
+        </div>
+        <div className="field">
+          <label>Trades / week</label>
+          <input className="inp" type="number" step="0.1" value={cadence}
+            onChange={e => setCadence(e.target.value)} placeholder="e.g. 0.5" />
+        </div>
+        <div className="field">
+          <label>Max DD % (negative)</label>
+          <input className="inp" type="number" step="0.1" value={maxDd}
+            onChange={e => setMaxDd(e.target.value)} placeholder="e.g. -4" />
+        </div>
+        <div className="field">
+          <label>Min trades</label>
+          <input className="inp" type="number" value={minTrades}
+            onChange={e => setMinTrades(e.target.value)} />
+        </div>
+        <div className="field">
+          <label>Min days</label>
+          <input className="inp" type="number" value={minDays}
+            onChange={e => setMinDays(e.target.value)} />
+        </div>
       </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 10 }}>
+        <Btn variant="primary" onClick={submit} disabled={busy}>
+          {busy ? 'Starting…' : 'Start Trial'}
+        </Btn>
+        {msg && <span style={{ fontSize: 12, color: 'var(--text-3)' }}>{msg}</span>}
+      </div>
+    </Card>
+  );
+}
 
-      <div className="grid g-23">
-        <Card title="Paper positions (equity surrogate)" icon="dashboard" subtitle="Alpaca doesn't support spreads — we trade 100-sh SPY as a proxy" flush>
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th>Symbol</th><th className="num">Qty</th><th>Side</th>
-                <th className="num">Avg</th><th className="num">Mark</th>
-                <th className="num">Mkt Val</th><th className="num">Unrealized</th>
-              </tr>
-            </thead>
-            <tbody>
-              {pos.length === 0 && (
-                <tr><td colSpan="7" style={{ textAlign: 'center', padding: 24, color: 'var(--text-3)' }}>No paper positions</td></tr>
-              )}
-              {pos.map((p, i) => (
-                <tr key={i}>
-                  <td style={{ fontWeight: 600 }}>{p.symbol}</td>
-                  <td className="num">{p.qty ?? 0}</td>
-                  <td><Badge variant={p.side === 'LONG' ? 'pos' : 'neg'} dot>{p.side}</Badge></td>
-                  <td className="num">${(p.avg ?? 0).toFixed(2)}</td>
-                  <td className="num">${(p.mark ?? 0).toFixed(2)}</td>
-                  <td className="num">${(p.mkt_val ?? 0).toFixed(2)}</td>
-                  <td className="num" style={{ color: (p.unrealized ?? 0) >= 0 ? 'var(--pos)' : 'var(--neg)' }}>
-                    {fmtUsd(p.unrealized, true)} ({(p.unrealized_pct ?? 0) >= 0 ? '+' : ''}{(p.unrealized_pct ?? 0).toFixed(2)}%)
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </Card>
-
-        <Card title="Connection" icon="wifi"
-              subtitle={apiKey ? `key ${apiKey.slice(0,4)}…${apiKey.slice(-2)}` : 'not configured'}>
-          <div className="field" style={{ marginBottom: 10 }}>
-            <label>API Key</label>
-            <input
-              className="inp"
-              type="password"
-              placeholder="PK…"
-              value={apiKey}
-              onChange={e => setApiKey(e.target.value)}
-              autoComplete="off"
-            />
-          </div>
-          <div className="field" style={{ marginBottom: 12 }}>
-            <label>Secret</label>
-            <input
-              className="inp"
-              type="password"
-              placeholder="secret"
-              value={apiSecret}
-              onChange={e => setApiSecret(e.target.value)}
-              autoComplete="off"
-            />
-          </div>
-          <Btn
-            variant="primary"
-            icon="wifi"
-            disabled={connectBusy || !apiKey.trim() || !apiSecret.trim()}
-            onClick={reconnect}
-            style={{ width: '100%', justifyContent: 'center' }}
-          >
-            {connectBusy ? 'Connecting…' : 'Reconnect'}
-          </Btn>
-          {connectMsg && (
-            <div style={{
-              fontSize: 11, marginTop: 8, textAlign: 'center',
-              color: connectMsg.startsWith('✓') ? 'var(--pos)' : connectMsg.startsWith('✗') ? 'var(--neg)' : 'var(--text-3)',
-            }}>
-              {connectMsg}
-            </div>
+function TrialRow({ entry, onAction }) {
+  const { trial, evaluation } = entry;
+  const live = evaluation?.live || {};
+  const expected = evaluation?.expected || {};
+  const findings = evaluation?.findings || [];
+  const tradeRatio = expected.trades_per_week > 0
+    ? `${live.trades_per_week ?? 0} / ${expected.trades_per_week}/wk`
+    : `${live.trades_per_week ?? 0}/wk`;
+  const wrCell = `${live.win_rate_pct ?? 0}% ${expected.win_rate_pct ? `(target ${expected.win_rate_pct}%)` : ''}`;
+  return (
+    <tr>
+      <td className="mono" style={{ fontWeight: 700 }}>{trial.preset_name}</td>
+      <td><StatusPill status={trial.status} /></td>
+      <td><VerdictPill verdict={evaluation?.verdict} /></td>
+      <td className="mono">{evaluation?.days_open ?? 0}d / {trial.min_days}d</td>
+      <td className="mono">{live.positions_closed ?? 0} / {trial.min_trades}</td>
+      <td className="mono">{wrCell}</td>
+      <td className="mono">{tradeRatio}</td>
+      <td className="mono">{fmtUsd(live.biggest_loss_dollars ?? 0)}</td>
+      <td>
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+          {trial.status === 'trialing' && (
+            <Btn size="sm" variant="ghost" onClick={() => onAction('stop', trial.preset_name)}>Stop</Btn>
           )}
-          <hr className="sep" />
-          <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>
-            Scanner routes paper signals to equity orders; spread construction only in Live.
+          {trial.status === 'passed' && (
+            <Btn size="sm" variant="primary" onClick={() => onAction('promote', trial.preset_name)}>Promote</Btn>
+          )}
+          <Btn size="sm" variant="ghost" onClick={() => onAction('delete', trial.preset_name)}>×</Btn>
+        </div>
+        {findings.length > 0 && (
+          <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-4)' }}>
+            {findings.map((f, i) => (
+              <div key={i}>· {f.message}</div>
+            ))}
           </div>
-        </Card>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+export function PaperView() {
+  const [entries, setEntries] = useState([]);
+  const [presets, setPresets] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [filterStatus, setFilterStatus] = useState('');
+  const [lastEvalMsg, setLastEvalMsg] = useState('');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [trialRes, presetRes] = await Promise.all([
+        api.paperTrialsList(filterStatus || undefined),
+        api.presetsList(),
+      ]);
+      setEntries(trialRes?.trials || []);
+      setPresets(Array.isArray(presetRes) ? presetRes : (presetRes?.presets || []));
+    } catch (e) {
+      console.error('paper trials refresh', e);
+    } finally {
+      setLoading(false);
+    }
+  }, [filterStatus]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => {
+    const id = setInterval(refresh, 30000);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  const evaluateNow = useCallback(async () => {
+    setLastEvalMsg('Evaluating…');
+    try {
+      const res = await api.paperTrialEvaluate();
+      const n = res?.count ?? 0;
+      const trans = res?.transitions || [];
+      setLastEvalMsg(`Evaluated ${n} trial${n === 1 ? '' : 's'}` +
+        (trans.length ? ` · ${trans.length} transition${trans.length === 1 ? '' : 's'}` : ''));
+      refresh();
+    } catch (e) {
+      setLastEvalMsg(`Failed: ${e.message || e}`);
+    }
+  }, [refresh]);
+
+  const handleAction = useCallback(async (action, presetName) => {
+    if (action === 'stop') {
+      if (!confirm(`Stop trial for ${presetName}? This disables auto_execute.`)) return;
+      await api.paperTrialStop(presetName);
+    } else if (action === 'promote') {
+      await api.paperTrialPromote(presetName);
+    } else if (action === 'delete') {
+      if (!confirm(`Delete trial row for ${presetName}? (does not delete the preset)`)) return;
+      await api.paperTrialDelete(presetName);
+    }
+    refresh();
+  }, [refresh]);
+
+  const counts = useMemo(() => {
+    const c = { trialing: 0, passed: 0, failed: 0, promoted: 0, demoted: 0 };
+    entries.forEach(e => { c[e.trial.status] = (c[e.trial.status] || 0) + 1; });
+    return c;
+  }, [entries]);
+
+  return (
+    <div className="workspace-main">
+      <div className="responsive-grid responsive-grid-kpi">
+        <Kpi label="Trialing" value={counts.trialing || 0} />
+        <Kpi label="Passed" value={counts.passed || 0} />
+        <Kpi label="Failed" value={counts.failed || 0} />
+        <Kpi label="Promoted" value={counts.promoted || 0} />
       </div>
+
+      <StartTrialForm presets={presets} onStarted={refresh} />
+
+      <Card
+        title="Active Trials"
+        icon="radar"
+        actions={
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <select className="sel" value={filterStatus}
+              onChange={e => setFilterStatus(e.target.value)}>
+              <option value="">all</option>
+              <option value="trialing">trialing</option>
+              <option value="passed">passed</option>
+              <option value="failed">failed</option>
+              <option value="promoted">promoted</option>
+              <option value="demoted">demoted</option>
+            </select>
+            <Btn size="sm" variant="ghost" onClick={evaluateNow}>Evaluate Now</Btn>
+            <Btn size="sm" variant="ghost" onClick={refresh} disabled={loading}>
+              {loading ? '…' : 'Refresh'}
+            </Btn>
+          </div>
+        }
+      >
+        {lastEvalMsg && (
+          <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 8 }}>{lastEvalMsg}</div>
+        )}
+        {entries.length === 0 ? (
+          <div style={{ padding: 20, textAlign: 'center', color: 'var(--text-4)', fontSize: 12 }}>
+            No trials yet. Start one above — pick a preset and paste its backtest WR / cadence / max DD.
+          </div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+              <thead>
+                <tr>
+                  <th>Preset</th>
+                  <th>Status</th>
+                  <th>Verdict</th>
+                  <th>Days</th>
+                  <th>Trades</th>
+                  <th>Win Rate</th>
+                  <th>Cadence</th>
+                  <th>Worst Loss</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {entries.map(e => (
+                  <TrialRow key={e.trial.preset_name} entry={e} onAction={handleAction} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+
+      <Card title="How this works" icon="book">
+        <div style={{ fontSize: 12, lineHeight: 1.6, color: 'var(--text-2)' }}>
+          <p>
+            Start a trial for a preset and supply its <strong>backtest</strong> stats
+            (win rate, trades/week, max drawdown%). The auto-execute path fires
+            normally but enforces <strong>fixed contracts = 1</strong> and the per-trial
+            position cap so live samples stay apples-to-apples with the backtest.
+          </p>
+          <p>
+            A daily job at <strong>16:30 ET</strong> evaluates each trial and transitions:
+          </p>
+          <ul style={{ marginLeft: 16 }}>
+            <li><code>passed</code> — verdict <code>pass</code> after ≥ min_trades AND ≥ min_days</li>
+            <li><code>failed</code> — verdict <code>fail</code> at sample-size readiness, OR a single
+              loss exceeds 2× backtest max DD (catastrophic short-circuit)</li>
+            <li><code>demoted</code> — manual stop, disables auto_execute on the preset</li>
+            <li><code>promoted</code> — human review only; click <em>Promote</em> on a passed trial</li>
+          </ul>
+          <p>
+            Promotion is an audit flag — it does not move funds or switch broker
+            accounts. To send the validated preset to a live account, clone it
+            via the Moomoo view with <code>trd_env=REAL</code>.
+          </p>
+        </div>
+      </Card>
     </div>
   );
 }

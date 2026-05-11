@@ -21,6 +21,15 @@ class BaseStrategy(ABC):
     BAR_SIZE: str = "1 day"
     HISTORY_PERIOD: str = "1mo"
 
+    # Lifecycle state per strategy-vetting skill. Three values:
+    #   "pending"  — written but not yet vetted (default for new strategies)
+    #   "shipped"  — backtest cleared the skill's topology-aware bar
+    #   "rejected" — failed the bar; PresetStore.save will refuse to ship it
+    # Subclasses override at class scope. The /api/strategies endpoint
+    # surfaces this so the UI can hide rejected from execution dropdowns
+    # while keeping them in the backtester for re-attempts.
+    VETTING_RESULT: str = "pending"
+
     @property
     @abstractmethod
     def name(self) -> str:

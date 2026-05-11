@@ -277,6 +277,7 @@ def _cmd_help(_args):
         "/scanner — current scanner state",
         "",
         "_Control:_",
+        "/connect-moomoo — connect moomoo broker with default settings",
         "/flatten confirm — close every open position (all brokers)",
         "/flatten ibkr confirm — close only IBKR positions",
         "/flatten moomoo confirm — close only moomoo positions",
@@ -536,6 +537,33 @@ def _cmd_moomoo(_args):
         )
     except Exception as e:  # noqa: BLE001
         return f"⚠️ moomoo query failed: `{e}`"
+
+
+@register_command("connect-moomoo")
+def _cmd_connect_moomoo(_args):
+    """Connect moomoo broker via the existing FastAPI connect path."""
+    try:
+        import asyncio
+        import main
+
+        loop = main._MAIN_LOOP
+        if loop is None or not loop.is_running():
+            return "⚠️ Server not ready — cannot connect moomoo right now."
+
+        req = main.MoomooConnectRequest()
+        fut = asyncio.run_coroutine_threadsafe(main.moomoo_connect(req), loop)
+        result = fut.result(timeout=45)
+    except Exception as e:  # noqa: BLE001
+        return f"⚠️ moomoo connect failed: `{e}`"
+
+    if not isinstance(result, dict):
+        return "⚠️ moomoo connect failed: `unexpected response`"
+    if not result.get("connected"):
+        return f"⚠️ moomoo connect failed: `{result.get('error') or 'unknown error'}`"
+
+    env = str(result.get("trd_env") or ("REAL" if getattr(req, "trd_env", 0) == 1 else "SIMULATE"))
+    acc_id = result.get("acc_id", "—")
+    return f"✅ *Moomoo connected*\nEnv: `{env}`\nAcct: `{acc_id}`"
 
 
 @register_command("preset_start")

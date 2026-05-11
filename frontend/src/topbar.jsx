@@ -1,6 +1,7 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { Ico } from './icons.jsx';
 import { Pill, Sparkline } from './primitives.jsx';
+import { api } from './api.js';
 
 const LS_IBKR_AUTO = 'spy_ibkr_auto_reconnect';
 const LS_MOOMOO_AUTO = 'spy_moomoo_auto_reconnect';
@@ -57,10 +58,37 @@ export function Topbar({ view, mkt, spy, conn, onPanic, leader, onBell, alertCou
   const [ibkrAuto, setIbkrAuto] = useState(() => localStorage.getItem(LS_IBKR_AUTO) !== 'false');
   const [moomooAuto, setMoomooAuto] = useState(() => localStorage.getItem(LS_MOOMOO_AUTO) !== 'false');
 
+  // On mount: push the user's saved preference to the backend so the
+  // server-side gates match the UI immediately (no stale auto-reconnect storms
+  // until the user clicks the toggle).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const remote = await api.connectionAutoGet();
+        if (cancelled || !remote) return;
+        const localIbkr = localStorage.getItem(LS_IBKR_AUTO);
+        const localMoo  = localStorage.getItem(LS_MOOMOO_AUTO);
+        if (localIbkr !== null && Boolean(remote.ibkr) !== (localIbkr !== 'false')) {
+          api.connectionAutoSet('ibkr', localIbkr !== 'false').catch(() => {});
+        } else if (localIbkr === null) {
+          setIbkrAuto(Boolean(remote.ibkr));
+        }
+        if (localMoo !== null && Boolean(remote.moomoo) !== (localMoo !== 'false')) {
+          api.connectionAutoSet('moomoo', localMoo !== 'false').catch(() => {});
+        } else if (localMoo === null) {
+          setMoomooAuto(Boolean(remote.moomoo));
+        }
+      } catch { /* backend unreachable — UI keeps localStorage state */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   const toggleIbkrAuto = useCallback(() => {
     setIbkrAuto(prev => {
       const next = !prev;
       localStorage.setItem(LS_IBKR_AUTO, String(next));
+      api.connectionAutoSet('ibkr', next).catch(() => {});
       return next;
     });
   }, []);
@@ -69,6 +97,7 @@ export function Topbar({ view, mkt, spy, conn, onPanic, leader, onBell, alertCou
     setMoomooAuto(prev => {
       const next = !prev;
       localStorage.setItem(LS_MOOMOO_AUTO, String(next));
+      api.connectionAutoSet('moomoo', next).catch(() => {});
       return next;
     });
   }, []);

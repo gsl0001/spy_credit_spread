@@ -19,12 +19,14 @@ export function StrategyParamsForm({ strategyId, values = {}, onChange }) {
 
   useEffect(() => {
     let cancelled = false;
-    setErr('');
     api.strategySchema(strategyId)
       .then(res => {
         if (cancelled) return;
         if (res.error) setErr(res.error);
-        else setSchema(res.schema || {});
+        else {
+          setErr('');
+          setSchema(res.schema || {});
+        }
       })
       .catch(e => !cancelled && setErr(String(e.message || e)));
     return () => { cancelled = true; };
@@ -37,27 +39,38 @@ export function StrategyParamsForm({ strategyId, values = {}, onChange }) {
   if (!fields.length) return <div className="muted" style={{ fontSize: 12 }}>no parameters</div>;
 
   return (
-    <div className="form-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 8 }}>
+    <div className="strategy-param-grid">
       {fields.map(([key, def]) => {
         const val = values[key] ?? def.default ?? '';
         const label = def.label || key;
         return (
           <label key={key} style={{ display: 'flex', flexDirection: 'column', fontSize: 11 }}>
             <span className="muted">{label}</span>
-            <input
-              type={def.type === 'number' ? 'number' : 'text'}
-              value={val}
-              min={def.min}
-              max={def.max}
-              step={def.step || (def.type === 'number' ? 1 : undefined)}
-              onChange={e => set(key,
-                def.type === 'number' ? Number(e.target.value) : e.target.value)}
-              style={{
-                background: 'var(--bg-2)', color: 'var(--text)',
-                border: '1px solid var(--border)', padding: '4px 6px',
-                borderRadius: 4, fontSize: 12,
-              }}
-            />
+            {def.type === 'boolean' ? (
+              <div className="strategy-param-check">
+                <input
+                  type="checkbox"
+                  checked={!!val}
+                  onChange={e => set(key, e.target.checked)}
+                />
+                <span>{val ? 'Enabled' : 'Disabled'}</span>
+              </div>
+            ) : (
+              <input
+                type={def.type === 'number' ? 'number' : 'text'}
+                value={val}
+                min={def.min}
+                max={def.max}
+                step={def.step || (def.type === 'number' ? 1 : undefined)}
+                onChange={e => set(key,
+                  def.type === 'number' ? Number(e.target.value) : e.target.value)}
+                style={{
+                  background: 'var(--bg-2)', color: 'var(--text)',
+                  border: '1px solid var(--border)', padding: '4px 6px',
+                  borderRadius: 4, fontSize: 12,
+                }}
+              />
+            )}
           </label>
         );
       })}

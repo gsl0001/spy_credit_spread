@@ -210,7 +210,7 @@ class ZeroDTEOrderFlowBot:
         self._pnl_today = 0.0
 
         # Start the main loop as a background task
-        self._task = asyncio.get_event_loop().create_task(self._main_loop())
+        self._task = asyncio.get_running_loop().create_task(self._main_loop())
         logger.info("0DTE OrderFlow bot started (config: %s)", self.config.as_dict())
         return {"ok": True, "msg": "0DTE bot started"}
 
@@ -253,7 +253,7 @@ class ZeroDTEOrderFlowBot:
 
         while self._running:
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
 
                 def _get_ticks():
                     ret, data = self._trader._quote_ctx.get_rt_ticker(
@@ -372,7 +372,7 @@ class ZeroDTEOrderFlowBot:
 
             # Place market order via moomoo
             import moomoo as ft
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def _place():
                 ret, data = self._trader._trd_ctx.place_order(
@@ -421,34 +421,53 @@ class ZeroDTEOrderFlowBot:
                         or status.get("dealt_avg_price")
                         or 0
                     )
-                    self._active_position.entry_price = fill_price
-                    self._active_position.status = "filled"
-
-                    # Calculate stop/target levels
-                    self._active_position.stop_price = fill_price * (
+                    stop_price = fill_price * (
                         1 - self.config.stop_loss_pct / 100
                     )
-                    self._active_position.target_price = fill_price * (
+                    target_price = fill_price * (
                         1 + self.config.profit_target_pct / 100
+                    )
+
+                    # Atomic swap: build the fully-populated filled record
+                    # and replace the pending one in a single assignment so
+                    # _monitor_position never observes stop_price=0/target=0
+                    # alongside status="filled" (the prior partial-mutation
+                    # window caused instant false profit-target exits).
+                    self._active_position = ActivePosition(
+                        signal=signal,
+                        option_code=opt["code"],
+                        strike=opt["strike"],
+                        right=opt["right"],
+                        side=signal.side,
+                        order_id=order_id,
+                        contracts=self.config.contracts,
+                        status="filled",
+                        entry_time=_time.time(),
+                        entry_price=fill_price,
+                        stop_price=stop_price,
+                        target_price=target_price,
                     )
 
                     logger.info(
                         "0DTE FILLED: %s @ $%.2f | Stop: $%.2f | Target: $%.2f",
-                        opt["code"], fill_price,
-                        self._active_position.stop_price,
-                        self._active_position.target_price,
+                        opt["code"], fill_price, stop_price, target_price,
                     )
 
                     # Send telegram notification
                     self._notify(
                         f"🎯 0DTE ENTRY: {signal.side.upper()} {opt['code']}\n"
-                        f"Fill: ${fill_price:.2f} | Stop: ${self._active_position.stop_price:.2f} "
-                        f"| Target: ${self._active_position.target_price:.2f}\n"
+                        f"Fill: ${fill_price:.2f} | Stop: ${stop_price:.2f} "
+                        f"| Target: ${target_price:.2f}\n"
                         f"Signal: {signal.reason}"
                     )
             else:
                 logger.warning("0DTE fill timeout for order %s — cancelling", order_id)
-                await self._trader._cancel_order_sync(order_id)
+                cancel_res = await self._trader._cancel_order_sync(order_id)
+                if not cancel_res.get("ok"):
+                    logger.error(
+                        "0DTE cancel FAILED for %s: %s — leg may still be working",
+                        order_id, cancel_res.get("reason"),
+                    )
                 self._active_position = None
 
         except Exception as exc:
@@ -466,7 +485,7 @@ class ZeroDTEOrderFlowBot:
         try:
             # Get current option price via snapshot
             import moomoo as ft
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def _get_price():
                 ret, data = self._trader._quote_ctx.get_market_snapshot([pos.option_code])
@@ -502,7 +521,7 @@ class ZeroDTEOrderFlowBot:
         """Close the active 0DTE position."""
         try:
             import moomoo as ft
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def _close():
                 ret, data = self._trader._trd_ctx.place_order(

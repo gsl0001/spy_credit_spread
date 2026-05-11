@@ -64,7 +64,7 @@ function TelegramPill() {
   );
 }
 
-export function Statusbar({ online, ibkr, moomoo, mkt, positions, dailyPnl, openPositions }) {
+export function Statusbar({ online, ibkr, moomoo, mkt, dailyPnl, openPositions }) {
   const ibkrLabel = ibkr === 'live' ? 'LIVE' : ibkr === 'warn' ? 'RECON' : 'OFF';
   const mooStatus = moomoo?.status || 'off';
   const mooLabel = moomoo?.reconnecting

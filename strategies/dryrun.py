@@ -8,14 +8,13 @@ class DryRunStrategy(BaseStrategy):
     Test strategy for 'dry run' verification.
 
     Logic:
-    - Opens a trade exactly at specific times after market open.
+    - Opens a trade every 10 minutes during regular trading hours (ET).
     - Closes each trade exactly 5 minutes later.
-    - Executes 3 times per day.
 
-    Times (ET):
-    1. Open 09:35, Close 09:40
-    2. Open 12:00, Close 12:05
-    3. Open 14:30, Close 14:35
+    Entry minutes (ET, 09:30 → 15:50):
+        :00, :10, :20, :30, :40, :50
+    Exit minutes (5 min after each entry):
+        :05, :15, :25, :35, :45, :55
     """
 
     # Intraday strategy — needs 5-minute ET-localised bars so that
@@ -23,6 +22,7 @@ class DryRunStrategy(BaseStrategy):
     # 5d of yfinance 5-minute history is plenty of warm-up.
     BAR_SIZE: str = "5 mins"
     HISTORY_PERIOD: str = "5d"
+    VETTING_RESULT: str = "shipped"
 
     @property
     def name(self) -> str:
@@ -50,15 +50,14 @@ class DryRunStrategy(BaseStrategy):
             return False
             
         t = ts.time()
-        
-        # Entry windows (ET)
-        entries = [
-            time(9, 35),
-            time(12, 0),
-            time(14, 30)
-        ]
-        
-        return t in entries
+
+        # Trade every 10 minutes during RTH (09:30 ET first valid bar is 09:30,
+        # last entry 15:50 so the 15:55 exit lands before the close).
+        if t.minute % 10 != 0 or t.second != 0:
+            return False
+        if t < time(9, 30) or t > time(15, 50):
+            return False
+        return True
 
     def check_exit(self, df: pd.DataFrame, i: int, trade_state: dict, req) -> tuple[bool, str]:
         row = df.iloc[i]
@@ -67,15 +66,9 @@ class DryRunStrategy(BaseStrategy):
             return False, ""
             
         t = ts.time()
-        
-        # Exit windows (5 mins after entries)
-        exits = [
-            time(9, 40),
-            time(12, 5),
-            time(14, 35)
-        ]
-        
-        if t in exits:
+
+        # Exit 5 minutes after each :00/:10/:20/:30/:40/:50 entry, i.e. on
+        # the :05/:15/:25/:35/:45/:55 bar.
+        if t.second == 0 and t.minute % 10 == 5 and time(9, 35) <= t <= time(15, 55):
             return True, "test_complete"
-            
         return False, ""

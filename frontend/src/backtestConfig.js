@@ -78,22 +78,30 @@ export function loadConfig() {
   try {
     const s = localStorage.getItem(STORAGE_KEY);
     if (s) return { ...DEFAULT_CONFIG, ...JSON.parse(s) };
-  } catch (_) {}
+  } catch {
+    return { ...DEFAULT_CONFIG };
+  }
   return { ...DEFAULT_CONFIG };
 }
 
 export function saveConfig(cfg) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); } catch (_) {}
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); } catch {
+    return undefined;
+  }
 }
 
 export function loadPresets() {
   try {
     const s = localStorage.getItem(PRESETS_KEY);
     if (s) return JSON.parse(s);
-  } catch (_) {}
+  } catch {
+    return {};
+  }
   return {};
 }
 
 export function savePresets(presets) {
-  try { localStorage.setItem(PRESETS_KEY, JSON.stringify(presets)); } catch (_) {}
+  try { localStorage.setItem(PRESETS_KEY, JSON.stringify(presets)); } catch {
+    return undefined;
+  }
 }

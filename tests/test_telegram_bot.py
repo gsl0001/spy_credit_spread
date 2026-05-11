@@ -336,7 +336,7 @@ def test_offset_advances_so_same_update_isnt_processed_twice(reset_bot):
 def test_help_command_lists_built_in_commands():
     from core.telegram_bot import _COMMANDS
     reply = _COMMANDS["help"]([])
-    for must_appear in ("/status", "/positions", "/pnl", "/flatten"):
+    for must_appear in ("/status", "/positions", "/pnl", "/flatten", "/connect-moomoo"):
         assert must_appear in reply
 
 
@@ -405,6 +405,29 @@ def test_flatten_command_no_open_positions():
         reply = _COMMANDS["flatten"]([])
     assert "No open positions" in reply
 
+
+def test_connect_moomoo_command_success():
+    from core.telegram_bot import _COMMANDS
+    from unittest.mock import MagicMock
+
+    fake_loop = MagicMock()
+    fake_loop.is_running.return_value = True
+    fake_main = MagicMock()
+    fake_main._MAIN_LOOP = fake_loop
+    fake_main.MoomooConnectRequest.return_value = MagicMock(trd_env=0)
+    fake_main.moomoo_connect = MagicMock()
+
+    fake_future = MagicMock()
+    fake_future.result.return_value = {"connected": True, "trd_env": "SIMULATE", "acc_id": 12345}
+
+    with patch.dict(sys.modules, {"main": fake_main}), patch(
+        "asyncio.run_coroutine_threadsafe", return_value=fake_future
+    ):
+        reply = _COMMANDS["connect-moomoo"]([])
+
+    assert "Moomoo connected" in reply
+    assert "SIMULATE" in reply
+    assert "12345" in reply
 
 # ── Notification formatters ────────────────────────────────────────────
 

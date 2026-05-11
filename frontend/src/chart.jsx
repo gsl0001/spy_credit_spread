@@ -106,10 +106,12 @@ export function CandlestickChart({ series, trades = [], height = '100%', selecte
     return () => {
       resizeObserver.disconnect();
       if (chartRef.current) {
-        try { chartRef.current.remove(); } catch (e) {}
+        try { chartRef.current.remove(); } catch {
+          chartRef.current = null;
+        }
       }
     };
-  }, []);
+  }, [onTradeSelect]);
 
   useEffect(() => {
     if (!seriesRef.current || !chartRef.current || !series || series.length === 0) return;
