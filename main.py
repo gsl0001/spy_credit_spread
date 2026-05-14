@@ -52,6 +52,23 @@ configure_root_logging()
 _startup_log = _logging.getLogger("main")
 log_event(_startup_log, "server_startup", message="FastAPI app initialising")
 
+# Loud warning if uvicorn --reload is active. A file save during an in-flight
+# spread kills leg2 journaling and leaves the broker holding both legs with
+# no journal record — exactly the failure mode that produced the 2026-05-11
+# orphan incident. Detect by inspecting sys.argv (works whether launched via
+# `python -m uvicorn ... --reload` or `uvicorn ... --reload`).
+import sys as _sys
+if "--reload" in _sys.argv or any("--reload" in a for a in _sys.argv):
+    log_event(
+        _startup_log, "reload_mode_warning",
+        level=_logging.WARNING,
+        message=(
+            "uvicorn --reload is active; file saves will kill in-flight "
+            "broker calls and can orphan spreads at the broker. Run without "
+            "--reload for live trading."
+        ),
+    )
+
 _MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 
@@ -122,6 +139,50 @@ async def _lifespan(application):
         except Exception as exc:  # pragma: no cover - best effort
             _startup_log.warning("boot reconcile failed: %s", exc)
     asyncio.create_task(_boot_reconcile_after_delay())
+
+    # Auto-start the canary preset scanner on boot. Without this, every
+    # server restart silently leaves auto_execute presets idle until someone
+    # manually POSTs /api/scanner/preset/start. Discovered 2026-05-12 when
+    # the bot ran all day without firing because the scanner was never
+    # started after run-live.sh booted the server.
+    #
+    # Picks the first moomoo preset with auto_execute=True. For the test week
+    # that's canary-moomoo (and only canary-moomoo by design). After live, set
+    # AUTOSTART_PRESET env var to override.
+    async def _autostart_preset_after_delay():
+        try:
+            await asyncio.sleep(12)  # after reconcile
+            import os
+            override = os.environ.get("AUTOSTART_PRESET", "").strip()
+            target_name = None
+            if override:
+                target_name = override
+            else:
+                from core.presets import PresetStore
+                store = PresetStore()
+                for p in store.list():
+                    if (getattr(p, "broker", "") == "moomoo"
+                            and getattr(p, "auto_execute", False)):
+                        target_name = p.name
+                        break
+            if not target_name:
+                _startup_log.info("autostart_preset: none configured (no moomoo auto_execute)")
+                return
+            # Idempotent — replaces any existing scanner job.
+            preset = _preset_scanner.load_preset(target_name)
+            scanner_state["active"] = True
+            scanner_state["config"] = preset.to_dict()
+            scanner_state["timing_mode"] = preset.timing_mode
+            scanner_state["timing_value"] = preset.timing_value
+            _remove_market_scan_jobs()
+            secs = max(int(preset.timing_value), 10)
+            scheduler.add_job(_run_preset_tick, "interval", seconds=secs,
+                              id="market_scan", replace_existing=True)
+            _startup_log.info("autostart_preset: scanner armed for %s (every %ds)",
+                              target_name, secs)
+        except Exception as exc:  # noqa: BLE001
+            _startup_log.warning("autostart_preset failed: %s", exc)
+    asyncio.create_task(_autostart_preset_after_delay())
 
     yield
     _MAIN_LOOP = None
@@ -960,6 +1021,29 @@ def _run_orb_endpoint_backtest(req: BacktestRequest, raw_df: pd.DataFrame) -> di
     return _adapt_orb_report(report, raw_df, req)
 
 
+def _run_generic_intraday_backtest(req: BacktestRequest, raw_df: pd.DataFrame) -> dict:
+    """Generic 1m/5m intraday harness for non-ORB strategies.
+
+    Used when ``cls.INTRADAY_ENGINE == "generic"``. Drives entries/exits
+    through ``strategy.check_entry`` / ``strategy.check_exit`` on intraday
+    bars; force-flats at session close. Reuses the ORB report shape so
+    the same adapter renders both.
+    """
+    from core.backtest_intraday import run_intraday_backtest, IntradayBacktestConfig
+    bars = _raw_bars_to_orb_frame(raw_df)
+    strategy = StrategyFactory.get_strategy(req.strategy_id)
+    report = run_intraday_backtest(
+        bars,
+        req=req,
+        strategy=strategy,
+        config=IntradayBacktestConfig(
+            entry_cutoff=_parse_hhmm(_param(req, "entry_cutoff_hhmm", "15:30")),
+            session_close=_parse_hhmm(_param(req, "time_exit_hhmm", "15:55")),
+        ),
+    )
+    return _adapt_orb_report(report, raw_df, req)
+
+
 @app.get("/api/strategies")
 def get_strategies():
     all_strats = StrategyFactory.get_all_strategies()
@@ -985,6 +1069,9 @@ def backtest(req: BacktestRequest):
         _cls = _resolve_cls(req.strategy_id)
         _bar_size = getattr(_cls, "BAR_SIZE", "1 day") if _cls else "1 day"
         if _bar_size != "1 day":
+            _engine = getattr(_cls, "INTRADAY_ENGINE", "orb") if _cls else "orb"
+            if _engine == "generic":
+                return _run_generic_intraday_backtest(req, raw_df)
             return _run_orb_endpoint_backtest(req, raw_df)
 
         # Merge VIX data if filter enabled
@@ -3499,6 +3586,7 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
         account=snapshot,
         open_positions=len(journal.list_open()),
         today_realized_pnl=journal.today_realized_pnl(),
+        today_trade_count=journal.today_entry_count(broker="moomoo"),
         debit_per_contract=debit_per_contract_dollars,
         margin_per_contract=margin_per_contract_dollars,
         contracts=contracts,
@@ -3526,7 +3614,55 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
         net_debit_limit=round(spread["debit_per_contract"] * 100 * contracts, 2),
         position_id=client_id,
         client_order_id=client_id,
+        max_bid_ask_pct=float(getattr(req, "chain_max_bid_ask_pct", 0.25) or 0.25),
     )
+
+    # Pre-journal an in-flight ('pending') position so a process crash between
+    # leg1 fill and the post-success journal write doesn't strand the spread
+    # as an unjournaled orphan at the broker. The reconciler treats 'pending'
+    # rows as covering the legs, so it won't manufacture single_leg_orphan
+    # entries. On success we update to state='open' below; on failure we mark
+    # it closed/cancelled.
+    from core.journal import Position as _Position
+    _now_pre_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _pending_legs = [
+        {"expiry": expiry_ymd, "strike": spread["K_long"], "right": right,
+         "side": "long", "qty": contracts},
+        {"expiry": expiry_ymd, "strike": spread["K_short"], "right": right,
+         "side": "short", "qty": contracts},
+    ]
+    _pre_journaled = False
+    try:
+        journal.open_position(_Position(
+            id=client_id,
+            symbol=req.symbol,
+            topology="vertical_spread",
+            direction=req.direction,
+            contracts=contracts,
+            entry_cost=spread["debit_per_contract"] * 100 * contracts,
+            entry_time=_now_pre_iso,
+            expiry=expiry_ymd,
+            state="pending",
+            legs=tuple(_pending_legs),
+            broker="moomoo",
+            high_water_mark=spread["debit_per_contract"] * 100,
+            meta={
+                "broker": "moomoo",
+                "legs": _pending_legs,
+                "stop_loss_pct": req.stop_loss_pct,
+                "take_profit_pct": req.take_profit_pct,
+                "trailing_stop_pct": req.trailing_stop_pct,
+                "idempotency_key": client_id,
+                "preset_name": getattr(req, "preset_name", None),
+                "in_flight": True,
+            },
+        ))
+        _pre_journaled = True
+    except Exception as exc:  # noqa: BLE001
+        # Most likely cause: duplicate id from a retry. That's fine; the
+        # existing row already covers the legs. Continue without raising.
+        logger.warning("pre-journal pending position failed (id=%s): %s",
+                       client_id, exc)
 
     # Execute
     try:
@@ -3536,6 +3672,14 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
             "broker": "moomoo", "client_order_id": client_id, "error": str(exc),
             "K_long": spread["K_long"], "K_short": spread["K_short"],
         })
+        if _pre_journaled:
+            try:
+                journal.close_position(
+                    client_id, exit_cost=0.0,
+                    reason="order_failed", realized_pnl=0.0,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         return {"error": "order_failed", "reason": str(exc)}
 
     if order_result.get("status") != "ok":
@@ -3547,6 +3691,17 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
             "K_long": spread["K_long"], "K_short": spread["K_short"],
             **order_result,
         })
+        # Tear down the pre-journaled pending row. The leg1-orphan handler
+        # below will record its own orphan position if needed.
+        if _pre_journaled:
+            try:
+                journal.close_position(
+                    client_id, exit_cost=0.0,
+                    reason=f"order_{order_result.get('status', 'rejected')}",
+                    realized_pnl=0.0,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         # If leg1 actually filled and the flatten didn't take, we have an
         # orphan long at the broker. Record it so the monitor can MTM / exit
         # it instead of letting it bleed. Skip recording when the flatten
@@ -3613,31 +3768,51 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
         {"expiry": expiry_ymd, "strike": spread["K_short"], "right": right,
          "side": "short", "qty": contracts},
     ]
-    pos_id = journal.open_position(Position(
-        id=client_id,
-        symbol=req.symbol,
-        topology="vertical_spread",
-        direction=req.direction,
-        contracts=contracts,
-        entry_cost=spread["debit_per_contract"] * 100 * contracts,
-        entry_time=now_iso,
-        expiry=expiry_ymd,
-        state="open",
-        legs=tuple(legs),
-        broker="moomoo",
-        high_water_mark=spread["debit_per_contract"] * 100,
-        meta={
-            "broker": "moomoo",
-            "legs": legs,
-            "broker_order_id": order_result.get("leg1_order_id", ""),
-            "stop_loss_pct": req.stop_loss_pct,
-            "take_profit_pct": req.take_profit_pct,
-            "trailing_stop_pct": req.trailing_stop_pct,
-            "idempotency_key": client_id,
-            "preset_name": getattr(req, "preset_name", None),
-            **order_result,
-        },
-    ))
+    # Use real fill prices from the broker when available (live trading
+    # slippage is real and the quoted long_ask/short_bid is what we ASKED,
+    # not what we got). Falls back to quoted prices when the broker didn't
+    # return avg_fill_price (paper/dryrun or older code paths).
+    _leg1_fp = float(order_result.get("leg1_avg_fill_price") or 0.0) or float(spread["long_ask"])
+    _leg2_fp = float(order_result.get("leg2_avg_fill_price") or 0.0) or float(spread["short_bid"])
+    _real_debit_per_contract = max(_leg1_fp - _leg2_fp, 0.0)
+    _real_entry_cost = _real_debit_per_contract * 100 * contracts
+
+    # Promote the pre-journaled pending row to 'open'. If pre-journal failed
+    # (rare — typically a retry collision), fall back to a fresh insert.
+    if _pre_journaled:
+        journal.update_position(
+            client_id,
+            state="open",
+            entry_cost=_real_entry_cost,
+            high_water_mark=_real_debit_per_contract * 100,
+        )
+        pos_id = client_id
+    else:
+        pos_id = journal.open_position(Position(
+            id=client_id,
+            symbol=req.symbol,
+            topology="vertical_spread",
+            direction=req.direction,
+            contracts=contracts,
+            entry_cost=spread["debit_per_contract"] * 100 * contracts,
+            entry_time=now_iso,
+            expiry=expiry_ymd,
+            state="open",
+            legs=tuple(legs),
+            broker="moomoo",
+            high_water_mark=spread["debit_per_contract"] * 100,
+            meta={
+                "broker": "moomoo",
+                "legs": legs,
+                "broker_order_id": order_result.get("leg1_order_id", ""),
+                "stop_loss_pct": req.stop_loss_pct,
+                "take_profit_pct": req.take_profit_pct,
+                "trailing_stop_pct": req.trailing_stop_pct,
+                "idempotency_key": client_id,
+                "preset_name": getattr(req, "preset_name", None),
+                **order_result,
+            },
+        ))
     long_order_id = str(_uuid.uuid4())
     short_order_id = str(_uuid.uuid4())
     journal.record_order(Order(
@@ -3650,7 +3825,7 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
         status="filled",
         submitted_at=now_iso,
         filled_at=now_iso,
-        fill_price=round(spread["long_ask"], 2),
+        fill_price=round(_leg1_fp, 2),
         kind="entry",
         idempotency_key=client_id,
     ))
@@ -3664,10 +3839,30 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
         status="filled",
         submitted_at=now_iso,
         filled_at=now_iso,
-        fill_price=round(spread["short_bid"], 2),
+        fill_price=round(_leg2_fp, 2),
         kind="entry",
         idempotency_key=f"{client_id}:short",
     ))
+
+    # Persist a Fill row per leg so the fills table is no longer empty for
+    # moomoo trades. Before this, the success path wrote Order rows with
+    # status='filled' directly, bypassing fill_watcher's record_fill call,
+    # so any report/PnL that joins on fills was silently empty for moomoo.
+    from core.journal import Fill as _Fill
+    for _oid, _qty, _price in (
+        (long_order_id, int(order_result.get("leg1_filled_qty") or contracts),
+         round(_leg1_fp, 2)),
+        (short_order_id, int(order_result.get("leg2_filled_qty") or contracts),
+         round(_leg2_fp, 2)),
+    ):
+        try:
+            journal.record_fill(_Fill(
+                id=None, order_id=_oid, qty=_qty, price=_price,
+                time=now_iso, exec_id=None, commission=0.0,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("record_fill failed for order %s: %s", _oid, exc)
+
     journal.log_event("entry_submitted", subject=pos_id, payload={
         "symbol": req.symbol,
         "broker": "moomoo",
@@ -3715,6 +3910,99 @@ def journal_positions(state: str = "open"):
     if state == "all":
         return {"positions": [_pos_to_dict(p) for p in journal.list_all()]}
     return {"positions": [_pos_to_dict(p) for p in journal.list_open()]}
+
+
+@app.get("/api/journal/orders")
+def journal_orders(broker: Optional[str] = None, limit: int = 50):
+    """Recent orders from the broker journal.
+
+    Used by the per-broker view's Order Log so scanner-initiated orders
+    (auto_execute presets) and historical orders show up even when the
+    in-memory session log is empty. Optionally filter by ``broker``
+    (``moomoo`` / ``ibkr`` / ``paper``); ``limit`` caps the result.
+
+    Also includes recent ``order_rejected`` events for the same broker so
+    chain-quality / preflight rejections are visible to the operator.
+    """
+    from core.journal import get_journal
+    journal = get_journal()
+    orders = journal.list_recent_orders(broker=broker, limit=int(limit))
+
+    # Hydrate parent-position strikes onto each order row so the UI can
+    # display K_long/K_short for journal-backed orders (Order entities only
+    # carry the leg, not the spread). Single SELECT per unique position_id.
+    pos_strikes: dict[str, dict] = {}
+    for o in orders:
+        if o.position_id and o.position_id not in pos_strikes:
+            try:
+                pos = journal.get_position(o.position_id)
+            except Exception:  # noqa: BLE001
+                pos = None
+            if pos and pos.legs:
+                longs = [l for l in pos.legs if l.get("side") == "long"]
+                shorts = [l for l in pos.legs if l.get("side") == "short"]
+                pos_strikes[o.position_id] = {
+                    "symbol": pos.symbol,
+                    "K_long": longs[0].get("strike") if longs else None,
+                    "K_short": shorts[0].get("strike") if shorts else None,
+                }
+
+    def _order_to_dict(o) -> dict:
+        ps = pos_strikes.get(o.position_id or "", {})
+        return {
+            "id": o.id,
+            "position_id": o.position_id,
+            "broker": o.broker,
+            "broker_order_id": o.broker_order_id,
+            "side": o.side,
+            "limit_price": o.limit_price,
+            "status": o.status,
+            "submitted_at": o.submitted_at,
+            "filled_at": o.filled_at,
+            "fill_price": o.fill_price,
+            "commission": o.commission,
+            "symbol": ps.get("symbol"),
+            "K_long": ps.get("K_long"),
+            "K_short": ps.get("K_short"),
+            "kind": o.kind,
+            "idempotency_key": o.idempotency_key,
+        }
+
+    rejections: list[dict] = []
+    try:
+        # Surface every flavor of "your signal didn't make it to the broker"
+        # so the Order Log explains silent gaps. Before this, ``risk_rejected``
+        # (e.g. max_concurrent_positions) didn't appear in the UI even though
+        # it accounted for ~99% of today's blocked signals.
+        rejection_kinds = {
+            "order_rejected", "chain_quality_rejected", "risk_rejected",
+            "broken_spread", "order_failed",
+        }
+        for ev in journal.recent_events(limit=int(limit) * 5):
+            if ev.get("kind") not in rejection_kinds:
+                continue
+            payload = ev.get("payload") or {}
+            if broker and payload.get("broker") != broker:
+                continue
+            rejections.append({
+                "time": ev.get("time"),
+                "kind": ev.get("kind"),
+                "subject": ev.get("subject"),
+                "reason": payload.get("reason"),
+                "error": payload.get("error"),
+                "client_order_id": payload.get("client_order_id"),
+                "K_long": payload.get("K_long"),
+                "K_short": payload.get("K_short"),
+            })
+            if len(rejections) >= int(limit):
+                break
+    except Exception:
+        rejections = []
+
+    return {
+        "orders": [_order_to_dict(o) for o in orders],
+        "rejections": rejections,
+    }
 
 
 @app.get("/api/journal/daily_pnl")

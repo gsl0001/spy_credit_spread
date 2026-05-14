@@ -46,3 +46,7 @@ frontend/build/
 
 # Graphify
 graphify-out/
+
+# Live env (Telegram token, API keys) — never commit. Template IS committed.
+.env.live
+!.env.live.template

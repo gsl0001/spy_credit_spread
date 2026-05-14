@@ -103,6 +103,38 @@ def test_blocks_daily_loss_abs():
 
 
 @pytest.mark.unit
+def test_blocks_max_orders_per_day():
+    """Bot can't fire forever — once today_trade_count >= cap, gate blocks."""
+    ctx = _ctx(today_trade_count=5,
+               limits=RiskLimits(max_orders_per_day=5,
+                                 require_market_open=False))
+    d = evaluate_pre_trade(ctx)
+    assert d.allowed is False
+    assert d.reason == "max_orders_per_day"
+    assert d.details["today_count"] == 5
+    assert d.details["limit"] == 5
+
+
+@pytest.mark.unit
+def test_max_orders_per_day_zero_disables_check():
+    """max_orders_per_day=0 (default) means unlimited — should not block."""
+    ctx = _ctx(today_trade_count=999,
+               limits=RiskLimits(max_orders_per_day=0,
+                                 require_market_open=False))
+    d = evaluate_pre_trade(ctx)
+    assert d.allowed is True
+
+
+@pytest.mark.unit
+def test_max_orders_under_cap_passes():
+    ctx = _ctx(today_trade_count=4,
+               limits=RiskLimits(max_orders_per_day=5,
+                                 require_market_open=False))
+    d = evaluate_pre_trade(ctx)
+    assert d.allowed is True
+
+
+@pytest.mark.unit
 def test_allows_profit_never_hits_loss_gate():
     ctx = _ctx(today_realized_pnl=5_000.0,
                limits=RiskLimits(daily_loss_limit_pct=2.0,

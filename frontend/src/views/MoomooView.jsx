@@ -149,8 +149,22 @@ export function MoomooView() {
   const [execMsg, setExecMsg] = useState('');
   const [execResult, setExecResult] = useState(null);
 
-  // Order log
+  // Order log — merges in-memory session entries with journal-backed
+  // history so scanner-initiated orders and rejections are visible even
+  // before the user places anything manually.
   const [orderLog, setOrderLog] = useState([]);
+  const [journalOrders, setJournalOrders] = useState([]);
+  const [journalRejections, setJournalRejections] = useState([]);
+
+  const refreshJournalOrders = useCallback(async () => {
+    try {
+      const res = await api.journalOrders('moomoo', 20);
+      setJournalOrders(res?.orders || []);
+      setJournalRejections(res?.rejections || []);
+    } catch {
+      // Ignored — endpoint optional
+    }
+  }, []);
 
   // Probed account list (diagnostic)
   const [probedAccounts, setProbedAccounts] = useState(null);
@@ -460,10 +474,15 @@ const persistConn = useCallback(() => {
     // Always poll journal positions (so user sees what was opened even if
     // they reload before reconnecting).  Account refresh requires connect.
     refreshPositions();
+    refreshJournalOrders();
     if (moomooConnected) refreshAccount();
-    const id = setInterval(() => { refreshAccount(); refreshPositions(); }, 15000);
+    const id = setInterval(() => {
+      refreshAccount();
+      refreshPositions();
+      refreshJournalOrders();
+    }, 15000);
     return () => clearInterval(id);
-  }, [moomooConnected, refreshAccount, refreshPositions]);
+  }, [moomooConnected, refreshAccount, refreshPositions, refreshJournalOrders]);
 
   // Keep UI connection state in sync with backend connection state so
   // Telegram-triggered connects are reflected immediately on screen.
@@ -1179,10 +1198,13 @@ const persistConn = useCallback(() => {
 
         <div className="moomoo-stack">
 
-          {/* ── Order log ── */}
-          <OCard title="Order Log" subtitle="legged execution results">
-            {orderLog.length === 0 ? (
-              <div style={{ fontSize: 12, color: 'var(--text-3)', textAlign: 'center', padding: '20px 0' }}>No orders this session</div>
+          {/* ── Order log (session + journal-backed history) ── */}
+          <OCard
+            title="Order Log"
+            subtitle={`session: ${orderLog.length} · journal: ${journalOrders.length} · rejections: ${journalRejections.length}`}
+          >
+            {orderLog.length === 0 && journalOrders.length === 0 && journalRejections.length === 0 ? (
+              <div style={{ fontSize: 12, color: 'var(--text-3)', textAlign: 'center', padding: '20px 0' }}>No moomoo activity yet</div>
             ) : (
               <table className="tbl" style={{ fontSize: 12 }}>
                 <thead>
@@ -1190,13 +1212,40 @@ const persistConn = useCallback(() => {
                 </thead>
                 <tbody>
                   {orderLog.map((o, i) => (
-                    <tr key={i}>
+                    <tr key={`sess-${i}`}>
                       <td style={{ color: 'var(--text-3)' }}>{o.time}</td>
                       <td className="num">{o.K_long ?? '—'}</td>
                       <td className="num">{o.K_short ?? '—'}</td>
                       <td className="num">{o.contracts ?? 1}</td>
                       <td>
                         <Badge variant={o.status === 'filled' ? 'pos' : 'neg'} dot>{o.status}</Badge>
+                      </td>
+                    </tr>
+                  ))}
+                  {journalOrders.map((o, i) => (
+                    <tr key={`jo-${o.id || i}`}>
+                      <td style={{ color: 'var(--text-3)' }}>{o.submitted_at?.slice(11, 19) || '—'}</td>
+                      <td className="num">{o.K_long ?? '—'}</td>
+                      <td className="num">{o.K_short ?? '—'}</td>
+                      <td className="num">1</td>
+                      <td>
+                        <Badge
+                          variant={o.status === 'filled' ? 'pos' : (o.status === 'cancelled' || o.status === 'rejected' ? 'neg' : 'warn')}
+                          dot
+                        >
+                          {o.kind}:{o.status}
+                        </Badge>
+                      </td>
+                    </tr>
+                  ))}
+                  {journalRejections.map((r, i) => (
+                    <tr key={`rej-${i}`}>
+                      <td style={{ color: 'var(--text-3)' }}>{r.time?.slice(11, 19) || '—'}</td>
+                      <td className="num">{r.K_long ?? '—'}</td>
+                      <td className="num">{r.K_short ?? '—'}</td>
+                      <td className="num">—</td>
+                      <td>
+                        <Badge variant="neg" dot>{r.error || r.kind}: {r.reason || ''}</Badge>
                       </td>
                     </tr>
                   ))}

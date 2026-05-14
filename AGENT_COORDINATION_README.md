@@ -488,3 +488,11 @@ curl -sS -X DELETE http://127.0.0.1:8000/api/paper_trials/rsi2-moomoo
 15. Add a **"Clone to Live" button** on passed paper trials — duplicates the preset with `*-live` suffix and `trd_env=REAL`, behind a confirmation modal.
 16. Show paper-trial **started_at + progress sparkline** in PaperView for visual debugging of slow-cadence trials.
 17. Add an **iron condor topology** to the engine — unlocks range-bound triggers (vol-contraction, neutral RSI bands) and the cleanest path-to-graduation for `ldm_fade_0dte`.
+
+### Strategy vetting — 2026-05-10 — `vwap_reversion` REJECTED
+- 5-min SPY 0DTE debit vertical, session-VWAP ±k·σ band reversion (first generic-intraday-engine strategy in the codebase).
+- 60d sample (yfinance 5m cap). Best across 3 sweeps: k=2.5, width=5, TP/SL=50/50, bull side:
+  - trades=57, win_rate=57.9%, PF=0.69, Sharpe=-2.35, max_dd=-10.3% — below intraday-debit bar on PF and Sharpe.
+  - Bear side consistently worse (PF 0.53), fights SPY drift.
+- Failure mode same as `dabd` / `vix_spike`: small-reversion edge cannot survive linear-delta payoff + $20/trade slippage in debit form. Tighter TP (15-25%) raised WR to ~64% but PF collapsed further.
+- Path to graduation: **credit spread topology** (sell put-spread below lower band / sell call-spread above upper band). Blocks on backlog item #13 (credit-spread engine support).

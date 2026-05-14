@@ -1,128 +1,68 @@
-# Session Checkpoint — 2026-05-10 12:31
+# Session Checkpoint — 2026-05-12 19:52
 
 ## Working Directory
 /Users/gsl0001/Downloads/spy_credit_spread
 
 ## Recent Commits
+b92d974 feat: vet 3 new strategies (monday_spread, fomc_pre, spy_pcs)
+4ffd46e feat: paper trading gate, multi-strategy backtest UI, new strategies
 e5f4357 docs: add multi-strategy plan; update TODO
 026a670 fix: 3 critical bugs in 0DTE order flow bot
 cda2a97 feat: implement native moomoo 0dte order flow engine & safety audit verification
-67499c4 chore(git): stop tracking Claude worktree path; ignore .claude/worktrees
-0a36b81 new moomoo trading
 
 ## Uncommitted Changes
+ M AGENT_COORDINATION_README.md
  M TODO.md
- M brokers/ibkr_trading.py
  M brokers/moomoo_trading.py
  M config/presets.json
- M core/backtest_orb.py
- M core/chain.py
+ M core/broker.py
  M core/journal.py
- M core/monitor.py
  M core/moomoo_reconciler.py
- M core/presets.py
  M core/risk.py
  M core/scanner.py
- M core/telegram_bot.py
- M frontend/TODO.md
- M frontend/src/App.jsx
  M frontend/src/api.js
- M frontend/src/backtestConfig.js
- M frontend/src/chart.jsx
- M frontend/src/index.css
- M frontend/src/primitives.jsx
- M frontend/src/sidebar.jsx
- M frontend/src/statusbar.jsx
- M frontend/src/strategyParamsForm.jsx
- M frontend/src/topbar.jsx
- M frontend/src/useBackendData.jsx
- M frontend/src/views/BacktestView.jsx
- M frontend/src/views/LiveView.jsx
  M frontend/src/views/MoomooView.jsx
- M frontend/src/views/PaperView.jsx
  M main.py
+ M scripts/graphify_update.py
+ M scripts/smoke_moomoo_fixes.py
  M strategies/base.py
- M strategies/combo_spread.py
- M strategies/consecutive_days.py
- M strategies/dryrun.py
- M strategies/orb.py
- M strategies/order_flow_0dte.py
- M tests/test_telegram_bot.py
+ M tests/test_risk.py
 ?? .claude/moomoo_api_reference.md
 ?? .claude/moomoo_gap_analysis.md
 ?? .claude/moomoo_usage_inventory.md
 ?? .claude/skills/
 ?? .codex/
-?? AGENT_COORDINATION_README.md
-?? core/connection_flags.py
-?? core/paper_gate.py
-?? core/yf_safe.py
-?? docs/MOOMOO_REVIEW.md
-?? docs/strategy-vetting/
-?? scripts/smoke_moomoo_fixes.py
-?? strategies/bollinger_b.py
-?? strategies/cci_extreme.py
-?? strategies/connors_3day.py
-?? strategies/cumulative_rsi.py
-?? strategies/dabd.py
-?? strategies/donchian.py
-?? strategies/double7.py
-?? strategies/eod_drift.py
-?? strategies/gap_down_reversal.py
-?? strategies/ibs.py
-?? strategies/ldm_0dte.py
-?? strategies/ldm_fade_0dte.py
-?? strategies/nr7.py
-?? strategies/panic_dip.py
-?? strategies/r3.py
-?? strategies/rsi2.py
-?? strategies/rsi_25_75.py
-?? strategies/rsi_ibs_confluence.py
-?? strategies/streak_ibs.py
-?? strategies/turn_of_month.py
-?? strategies/turnaround_tuesday.py
-?? strategies/vix_spike.py
-?? strategies/williams_r.py
-?? tests/test_backtest_orb_endpoint.py
+?? .env.live
+?? .env.live.template
+?? OVERVIEW.md
+?? PRE_LIVE_TEST_PLAN.md
+?? RECOVERY_PLAYBOOK.md
+?? core/backtest_intraday.py
+?? run-live.sh
+?? scripts/eod_audit.py
+?? scripts/midday_heartbeat.py
+?? scripts/nightly_digest.py
+?? scripts/premarket_check.py
+?? scripts/watchdog.py
+?? strategies/vwap_reversion.py
 
 ## Modified Files (unstaged)
+AGENT_COORDINATION_README.md
 TODO.md
-brokers/ibkr_trading.py
 brokers/moomoo_trading.py
 config/presets.json
-core/backtest_orb.py
-core/chain.py
+core/broker.py
 core/journal.py
-core/monitor.py
 core/moomoo_reconciler.py
-core/presets.py
 core/risk.py
 core/scanner.py
-core/telegram_bot.py
-frontend/TODO.md
-frontend/src/App.jsx
 frontend/src/api.js
-frontend/src/backtestConfig.js
-frontend/src/chart.jsx
-frontend/src/index.css
-frontend/src/primitives.jsx
-frontend/src/sidebar.jsx
-frontend/src/statusbar.jsx
-frontend/src/strategyParamsForm.jsx
-frontend/src/topbar.jsx
-frontend/src/useBackendData.jsx
-frontend/src/views/BacktestView.jsx
-frontend/src/views/LiveView.jsx
 frontend/src/views/MoomooView.jsx
-frontend/src/views/PaperView.jsx
 main.py
+scripts/graphify_update.py
+scripts/smoke_moomoo_fixes.py
 strategies/base.py
-strategies/combo_spread.py
-strategies/consecutive_days.py
-strategies/dryrun.py
-strategies/orb.py
-strategies/order_flow_0dte.py
-tests/test_telegram_bot.py
+tests/test_risk.py
 
 ## Staged Files
 none

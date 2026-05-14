@@ -38,6 +38,7 @@ class RiskLimits:
     max_concurrent_positions: int = 2
     daily_loss_limit_pct: float = 2.0       # % of equity
     daily_loss_limit_abs: float = 0.0       # absolute $ cap (0 = disabled)
+    max_orders_per_day: int = 0             # 0 = unlimited; daily entry cap
     min_minutes_before_close: int = 5       # no new entries inside this window
     blackout_window_before: int = 0
     blackout_window_after: int = 2
@@ -53,6 +54,7 @@ class RiskLimits:
             max_concurrent_positions=risk_settings.max_concurrent_positions,
             daily_loss_limit_pct=risk_settings.daily_loss_limit_pct,
             daily_loss_limit_abs=getattr(risk_settings, "daily_loss_limit_abs", 0.0),
+            max_orders_per_day=getattr(risk_settings, "max_orders_per_day", 0),
         )
 
 
@@ -72,6 +74,7 @@ class RiskContext:
     margin_per_contract: float
     contracts: int
     target_dte: int
+    today_trade_count: int = 0   # number of entries today; for max_orders_per_day
     limits: RiskLimits = field(default_factory=RiskLimits.from_settings)
     today: Optional[date] = None
     events: list = field(default_factory=list)
@@ -108,6 +111,10 @@ def evaluate_pre_trade(ctx: RiskContext) -> Decision:
         })
 
     # 3. Daily loss circuit breaker.
+    # NOTE: today_realized_pnl is CLOSED-only; an open losing position
+    # bleeding all day does not count toward this limit until it closes.
+    # For autonomous live trading, complement this with monitor-side
+    # stop_loss_pct on every preset.
     eq = max(ctx.account.equity, 1.0)
     pct_loss = (-ctx.today_realized_pnl / eq) * 100 if ctx.today_realized_pnl < 0 else 0.0
     if ctx.limits.daily_loss_limit_pct > 0 and pct_loss >= ctx.limits.daily_loss_limit_pct:
@@ -120,6 +127,17 @@ def evaluate_pre_trade(ctx: RiskContext) -> Decision:
         return Decision(False, "daily_loss_limit_abs", {
             "realized_pnl": ctx.today_realized_pnl,
             "limit_abs": ctx.limits.daily_loss_limit_abs,
+        })
+
+    # 3b. Daily entry cap — guardrail against a runaway scanner firing all day.
+    # max_orders_per_day=0 means unlimited (legacy default). For autonomous
+    # live trading set MAX_ORDERS_PER_DAY=N in env. today_trade_count should
+    # be the count of POSITIONS ENTERED today (open + closed), not the closed
+    # subset — callers pass journal.today_entry_count(broker=...).
+    if ctx.limits.max_orders_per_day > 0 and ctx.today_trade_count >= ctx.limits.max_orders_per_day:
+        return Decision(False, "max_orders_per_day", {
+            "today_count": ctx.today_trade_count,
+            "limit": ctx.limits.max_orders_per_day,
         })
 
     # 4. Buying power — debit spread margin = debit; credit spread = width*100.

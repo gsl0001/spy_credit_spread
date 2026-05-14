@@ -40,6 +40,7 @@ export const api = {
   allPositions:   ()     => get('/api/journal/positions?state=all'),
   dailyPnl:       (days = 30) => get(`/api/journal/daily_pnl?days=${days}`),
   events:         (limit = 50) => get(`/api/journal/events?limit=${limit}`),
+  journalOrders:  (broker, limit = 50) => get(`/api/journal/orders?${broker ? `broker=${broker}&` : ''}limit=${limit}`),
   reconciliation: ()     => get('/api/journal/reconciliation'),
 
   // Market data

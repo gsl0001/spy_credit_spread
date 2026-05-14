@@ -66,6 +66,7 @@ def list_strategy_classes() -> dict:
         from strategies.monday_spread import MondaySpreadStrategy
         from strategies.fomc_pre import FomcPreStrategy
         from strategies.spy_pcs import SpyPcsStrategy
+        from strategies.vwap_reversion import VwapReversionStrategy
     except Exception:  # noqa: BLE001
         return {}
     return {
@@ -99,6 +100,7 @@ def list_strategy_classes() -> dict:
         "monday_spread": MondaySpreadStrategy,
         "fomc_pre": FomcPreStrategy,
         "spy_pcs": SpyPcsStrategy,
+        "vwap_reversion": VwapReversionStrategy,
     }
 
 

@@ -393,6 +393,28 @@ class Journal:
             ).fetchall()
         return [_row_to_order(r) for r in rows]
 
+    def list_recent_orders(
+        self,
+        broker: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[Order]:
+        """Recent orders across all statuses, newest first.
+
+        Used by the per-broker view (e.g. MoomooView Order Log) to render
+        scanner-initiated activity that never reaches the in-memory session
+        log. Filters by broker when supplied.
+        """
+        sql = "SELECT * FROM orders"
+        params: list[Any] = []
+        if broker:
+            sql += " WHERE broker = ?"
+            params.append(broker)
+        sql += " ORDER BY submitted_at DESC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_order(r) for r in rows]
+
     def list_orders_by_status(
         self,
         statuses: tuple[str, ...] = ("submitted", "partial"),
@@ -460,6 +482,27 @@ class Journal:
                 "SELECT trades FROM daily_pnl WHERE date = ?", (_today_str(),)
             ).fetchone()
         return int(row["trades"]) if row else 0
+
+    def today_entry_count(self, broker: Optional[str] = None) -> int:
+        """Count positions entered today (open + closed). Used by the
+        ``max_orders_per_day`` risk gate — distinct from today_trade_count
+        which only counts CLOSED positions and therefore lets a runaway
+        scanner open unlimited positions per day if none close.
+        """
+        today = _today_str()
+        with self._lock:
+            if broker:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM positions "
+                    "WHERE entry_time >= ? AND broker = ?",
+                    (today, broker),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM positions WHERE entry_time >= ?",
+                    (today,),
+                ).fetchone()
+        return int(row["n"]) if row else 0
 
     def history_pnl(self, days: int = 30) -> list[dict]:
         with self._lock:

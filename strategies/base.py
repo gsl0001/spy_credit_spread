@@ -21,6 +21,18 @@ class BaseStrategy(ABC):
     BAR_SIZE: str = "1 day"
     HISTORY_PERIOD: str = "1mo"
 
+    # Intraday engine selector. Only consulted when ``BAR_SIZE != "1 day"``.
+    #   "orb"     — opening-range breakout harness (core/backtest_orb.py).
+    #               Use for breakout-touch strategies that need OR window,
+    #               direction inference from breakout side, and ORB-specific
+    #               knobs (or_minutes, offset, min_range_pct).
+    #   "generic" — generic intraday harness (core/backtest_intraday.py).
+    #               Use for any other 1m/5m strategy that drives entries
+    #               and exits through ``check_entry`` / ``check_exit``.
+    # Default "orb" preserves back-compat with the existing intraday
+    # strategies (orb, ldm_0dte, ldm_fade_0dte, order_flow_0dte).
+    INTRADAY_ENGINE: str = "orb"
+
     # Lifecycle state per strategy-vetting skill. Three values:
     #   "pending"  — written but not yet vetted (default for new strategies)
     #   "shipped"  — backtest cleared the skill's topology-aware bar

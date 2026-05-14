@@ -28,7 +28,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time as _time_module
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from core.broker import BrokerNotConnected, LegSpec, SpreadRequest
 
@@ -744,7 +745,10 @@ class MoomooTrader:
 
         # ── 1. Pre-flight quote sanity ────────────────────────────────────
         try:
-            preflight = await self._preflight_spread_quotes(req.long_leg, req.short_leg)
+            preflight = await self._preflight_spread_quotes(
+                req.long_leg, req.short_leg,
+                max_bid_ask_pct=float(getattr(req, "max_bid_ask_pct", 0.50) or 0.50),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("place_spread preflight quote failed: %s", exc)
             preflight = None
@@ -858,19 +862,25 @@ class MoomooTrader:
             "leg2_order_id": short_order_id,
             "leg1_filled_qty": leg1["filled_qty"],
             "leg2_filled_qty": leg2["filled_qty"],
+            "leg1_avg_fill_price": float(leg1.get("avg_fill_price") or 0.0),
+            "leg2_avg_fill_price": float(leg2.get("avg_fill_price") or 0.0),
         }
 
     async def _preflight_spread_quotes(
         self, long_leg: LegSpec, short_leg: LegSpec,
+        max_bid_ask_pct: float = 0.50,
     ) -> dict[str, Any]:
         """Snapshot live NBBO for both legs; refuse if either is unusable.
 
         Refuses on:
           - zero / negative bid or ask on either leg
           - crossed quote (ask < bid)
-          - bid-ask spread wider than 50% of mid on either leg
-            (legs should already pass the higher-level chain-quality gate;
-            this is a last-second safety check)
+          - bid-ask spread wider than ``max_bid_ask_pct`` of mid on either
+            leg. Caller (place_spread) threads this from
+            ``SpreadRequest.max_bid_ask_pct`` which in turn is plumbed from
+            the preset's ``chain_max_bid_ask_pct``. Default 0.50 preserves
+            historical behavior when called from code paths that don't set
+            the field.
         Returns ``{}`` (success) or ``{"error": "...", "reason": "..."}``.
         """
         import moomoo as ft  # local import: keep moomoo optional
@@ -903,7 +913,7 @@ class MoomooTrader:
                         "reason": f"{leg_label}_leg_ask<bid",
                         "bid": bid, "ask": ask}
             mid = (bid + ask) / 2.0
-            if mid > 0 and (ask - bid) / mid > 0.50:
+            if mid > 0 and (ask - bid) / mid > max_bid_ask_pct:
                 return {"error": "spread_too_wide",
                         "reason": f"{leg_label}_leg_{(ask-bid)/mid*100:.0f}pct",
                         "bid": bid, "ask": ask}
@@ -1015,6 +1025,93 @@ class MoomooTrader:
             return await loop.run_in_executor(None, _fetch)
         except Exception as exc:
             logger.warning("get_order_status(%s) failed: %s", order_id, exc)
+            return None
+
+    async def get_recent_fill_for_leg(
+        self,
+        symbol: str,
+        expiry: str,
+        right: str,
+        strike: float,
+        side: str,
+        qty: int,
+        lookback_days: int = 5,
+    ) -> Optional[dict[str, Any]]:
+        """Look up the most recent broker-side fill that matches a leg spec.
+
+        Used by the reconciler to hydrate ``entry_cost`` for orphan positions
+        (V9). Without this, orphans get entry_cost=0 and any realized_pnl on
+        close is meaningless.
+
+        Matches on option code (symbol+expiry+right+strike) and trade side
+        (BUY for long, SELL for short). Returns the most recent match within
+        ``lookback_days``.
+
+        Returns::
+            {"price": float, "qty": int, "time": str, "order_id": str}
+        or None if no match.
+        """
+        if not self.is_alive():
+            return None
+        import moomoo as ft
+        loop = asyncio.get_running_loop()
+
+        code = self._option_code(symbol, expiry, right, float(strike))
+        want_side = "BUY" if side == "long" else "SELL"
+
+        def _fetch():
+            # Try deal_list_query first (today's deals), fall back to
+            # history_deal_list_query for older ones if needed. Both return
+            # the same shape on success.
+            try:
+                ret, data = self._trd_ctx.deal_list_query(
+                    code=code,
+                    trd_env=self._ft_trd_env,
+                    acc_id=self._acc_id,
+                )
+            except Exception:  # noqa: BLE001
+                ret, data = ft.RET_ERROR, None
+            if ret != ft.RET_OK or data is None or data.empty:
+                try:
+                    from datetime import timedelta
+                    start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+                    end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    ret, data = self._trd_ctx.history_deal_list_query(
+                        code=code,
+                        start=start,
+                        end=end,
+                        trd_env=self._ft_trd_env,
+                        acc_id=self._acc_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    return None
+                if ret != ft.RET_OK or data is None or data.empty:
+                    return None
+
+            # Filter to our side, take most recent by create_time.
+            matches = []
+            for _, row in data.iterrows():
+                row_side = str(row.get("trd_side", "")).upper()
+                if row_side != want_side:
+                    continue
+                matches.append({
+                    "price": float(row.get("price", 0) or 0),
+                    "qty": int(float(row.get("qty", 0) or 0)),
+                    "time": str(row.get("create_time", "")),
+                    "order_id": str(row.get("order_id", "")),
+                })
+            if not matches:
+                return None
+            matches.sort(key=lambda m: m["time"], reverse=True)
+            return matches[0]
+
+        try:
+            return await loop.run_in_executor(None, _fetch)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "get_recent_fill_for_leg(%s %s %s) failed: %s",
+                symbol, strike, side, exc,
+            )
             return None
 
     async def get_spread_mid(self, legs: list[dict]) -> float | None:
@@ -1143,6 +1240,7 @@ class MoomooTrader:
         last_status: str | None = None
         last_filled_qty: int = 0
         last_total_qty: int = 0
+        last_avg_price: float = 0.0
 
         terminal_filled = {"FILLED_ALL"}
         terminal_cancelled = {"CANCELLED_ALL", "CANCELLED_PART", "DELETED",
@@ -1159,34 +1257,40 @@ class MoomooTrader:
                     acc_id=self._acc_id,
                 )
                 if ret != ft.RET_OK or data.empty:
-                    return None, 0, 0
+                    return None, 0, 0, 0.0
                 row = data.iloc[0]
                 status = str(row.get("order_status", ""))
                 filled = int(float(row.get("dealt_qty", 0) or 0))
                 total = int(float(row.get("qty", 0) or 0))
-                return status, filled, total
+                avg = float(row.get("dealt_avg_price", 0) or 0)
+                return status, filled, total, avg
 
-            status, filled_qty, total_qty = await loop.run_in_executor(None, _check)
+            status, filled_qty, total_qty, avg_price = await loop.run_in_executor(None, _check)
             if status is not None:
                 last_status = status
                 last_filled_qty = filled_qty
                 last_total_qty = total_qty
+                last_avg_price = avg_price
 
             if status in terminal_filled:
                 return {"outcome": "filled", "status": status,
-                        "filled_qty": filled_qty, "total_qty": total_qty}
+                        "filled_qty": filled_qty, "total_qty": total_qty,
+                        "avg_fill_price": avg_price}
             if status in terminal_cancelled:
                 return {"outcome": "cancelled", "status": status,
-                        "filled_qty": filled_qty, "total_qty": total_qty}
+                        "filled_qty": filled_qty, "total_qty": total_qty,
+                        "avg_fill_price": avg_price}
             if status in terminal_failed:
                 return {"outcome": "failed", "status": status,
-                        "filled_qty": filled_qty, "total_qty": total_qty}
+                        "filled_qty": filled_qty, "total_qty": total_qty,
+                        "avg_fill_price": avg_price}
             # FILLED_PART is non-terminal: keep waiting for FILLED_ALL.
 
         # Deadline expired. If anything filled, surface it as 'partial'.
         outcome = "partial" if last_filled_qty > 0 else "timeout"
         return {"outcome": outcome, "status": last_status,
-                "filled_qty": last_filled_qty, "total_qty": last_total_qty}
+                "filled_qty": last_filled_qty, "total_qty": last_total_qty,
+                "avg_fill_price": last_avg_price}
 
     async def _cancel_order_sync(self, order_id: str) -> dict[str, Any]:
         """Cancel an order, returning a structured outcome.

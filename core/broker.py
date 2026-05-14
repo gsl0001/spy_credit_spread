@@ -29,6 +29,11 @@ class SpreadRequest:
     net_debit_limit: float   # max total debit in dollars
     position_id: str         # for journaling
     client_order_id: str     # idempotency key
+    # Per-leg NBBO width tolerance for the broker-side preflight check.
+    # Mirrors the higher-level chain-quality gate's ``chain_max_bid_ask_pct``
+    # so a preset that opens the gate to 1.0 (moomoo OpenD wide quotes)
+    # isn't silently re-blocked by a hardcoded 0.50 at the broker layer.
+    max_bid_ask_pct: float = 0.50
 
 
 # ── Protocol ──────────────────────────────────────────────────────────────────

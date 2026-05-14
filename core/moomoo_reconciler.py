@@ -182,6 +182,134 @@ async def reconcile_once() -> dict[str, Any]:
     # We use a deterministic claim_key so re-runs of the reconciler don't
     # double-record the same orphan.
     orphans_recorded: list[str] = []
+
+    # Pre-pass: pair opposite-sided orphan legs that obviously form a
+    # vertical spread (same symbol, same expiry, same right, equal qty, one
+    # long + one short). Without this we double-count what is actually a
+    # single spread — e.g. the 2026-05-11 incident where a process restart
+    # mid-place_spread left both legs at the broker, and the reconciler
+    # recorded them as 2 single_leg_orphan positions, immediately tripping
+    # max_concurrent_positions for every subsequent signal.
+    deltas: dict[tuple[str, str, str], list[dict]] = {}
+    for orphan in orphans:
+        if int(orphan.get("delta", 0)) == 0:
+            continue
+        bucket = (orphan["symbol"], orphan["right"], orphan["expiry"])
+        deltas.setdefault(bucket, []).append(orphan)
+
+    paired_keys: set[tuple[str, float, str, str]] = set()
+    spreads_to_record: list[dict] = []
+    for (symbol, right, expiry), bucket in deltas.items():
+        longs = [o for o in bucket if int(o["delta"]) > 0]
+        shorts = [o for o in bucket if int(o["delta"]) < 0]
+        # Greedy pairing on qty match. Real-world case here is 1×1.
+        for lo in list(longs):
+            for sh in list(shorts):
+                if abs(int(lo["delta"])) != abs(int(sh["delta"])):
+                    continue
+                qty = abs(int(lo["delta"]))
+                spreads_to_record.append({
+                    "symbol": symbol, "right": right, "expiry": expiry,
+                    "qty": qty,
+                    "K_long": float(lo["strike"]),
+                    "K_short": float(sh["strike"]),
+                })
+                paired_keys.add((symbol, float(lo["strike"]), right, expiry))
+                paired_keys.add((symbol, float(sh["strike"]), right, expiry))
+                longs.remove(lo)
+                shorts.remove(sh)
+                break
+
+    # Record paired orphans as vertical_spread (one journal row per pair).
+    for sp in spreads_to_record:
+        direction = "bull" if (
+            (sp["right"] == "C" and sp["K_long"] < sp["K_short"]) or
+            (sp["right"] == "P" and sp["K_long"] > sp["K_short"])
+        ) else "bear"
+        claim_key = (
+            f"reconcile_orphan_spread:{sp['symbol']}:"
+            f"{sp['K_long']}:{sp['K_short']}:{sp['right']}:"
+            f"{sp['expiry']}:{sp['qty']}"
+        )
+        if journal.has_event_claim(claim_key, kind="reconcile_orphan_recorded"):
+            continue
+        legs = [
+            {"expiry": sp["expiry"], "strike": sp["K_long"],
+             "right": sp["right"], "side": "long", "qty": sp["qty"]},
+            {"expiry": sp["expiry"], "strike": sp["K_short"],
+             "right": sp["right"], "side": "short", "qty": sp["qty"]},
+        ]
+        # V9: hydrate entry_cost from broker deal history so the orphan
+        # carries a realistic cost basis. Without this, monitor.close ->
+        # realized_pnl = exit - 0 = looks like 100% win. Falls back to 0.0
+        # only when the broker history lookup fails (older deals expired
+        # from history window, network glitch, etc.).
+        long_fill = None
+        short_fill = None
+        try:
+            long_fill = await broker.get_recent_fill_for_leg(
+                sp["symbol"], sp["expiry"], sp["right"], sp["K_long"],
+                "long", sp["qty"],
+            )
+            short_fill = await broker.get_recent_fill_for_leg(
+                sp["symbol"], sp["expiry"], sp["right"], sp["K_short"],
+                "short", sp["qty"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("orphan entry_cost lookup failed for %s: %s", claim_key, exc)
+        if long_fill and short_fill:
+            real_debit = max(float(long_fill["price"]) - float(short_fill["price"]), 0.0)
+            entry_cost = real_debit * 100.0 * sp["qty"]
+            hwm = real_debit * 100.0
+            cost_source = "broker_history"
+        else:
+            entry_cost = 0.0
+            hwm = 0.0
+            cost_source = "unknown"
+        try:
+            pos_id = journal.open_position(Position(
+                id=claim_key,
+                symbol=sp["symbol"],
+                topology="vertical_spread",
+                direction=direction,
+                contracts=sp["qty"],
+                entry_cost=entry_cost,
+                entry_time=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                expiry=sp["expiry"],
+                state="open",
+                legs=tuple(legs),
+                broker="moomoo",
+                high_water_mark=hwm or None,
+                meta={
+                    "broker": "moomoo",
+                    "orphan": True,
+                    "source": "reconciler_paired",
+                    "broker_order_id": "",
+                    "stop_loss_pct": 50.0,
+                    "take_profit_pct": 50.0,
+                    "trailing_stop_pct": 0.0,
+                    "idempotency_key": claim_key,
+                    "entry_cost_source": cost_source,
+                    "leg1_fill_price": (long_fill or {}).get("price"),
+                    "leg2_fill_price": (short_fill or {}).get("price"),
+                },
+            ))
+            journal.log_event(
+                "reconcile_orphan_recorded",
+                subject=pos_id,
+                claim_key=claim_key,
+                payload={"spread": sp, "position_id": pos_id},
+            )
+            orphans_recorded.append(pos_id)
+            logger.info("reconcile: recorded orphan spread %s as %s", sp, pos_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reconcile: record orphan spread %s failed: %s", sp, exc)
+            journal.log_event(
+                "reconcile_orphan_failed", payload={
+                    "spread": sp, "error": str(exc),
+                },
+            )
+
     for orphan in orphans:
         # Skip 'good' deltas: journal already has more than broker (= phantom
         # leg, handled below) or qty matches (delta=0 — shouldn't reach here).
@@ -196,6 +324,9 @@ async def reconcile_once() -> dict[str, Any]:
             orphan["symbol"], float(orphan["strike"]),
             orphan["right"], orphan["expiry"],
         )
+        # Skip legs already consumed by a paired vertical_spread above.
+        if (symbol, strike, right, expiry) in paired_keys:
+            continue
         # Deterministic dedup key: same (symbol,K,right,expiry,side,qty)
         # produces the same key, so successive reconciler ticks see the
         # already-claimed event and skip.
@@ -204,6 +335,26 @@ async def reconcile_once() -> dict[str, Any]:
             continue
         legs = [{"expiry": expiry, "strike": strike, "right": right,
                  "side": side, "qty": qty}]
+        # V9: hydrate entry_cost from broker deal history for single-leg
+        # orphans too. For a long leg, entry_cost = fill_price * 100 * qty.
+        # For a short leg, entry_cost is conventionally the (negative)
+        # credit received, but our journal treats entry_cost as |paid|;
+        # store the signed value in meta and the absolute in the column.
+        leg_fill = None
+        try:
+            leg_fill = await broker.get_recent_fill_for_leg(
+                symbol, expiry, right, strike, side, qty,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("orphan entry_cost lookup failed for %s: %s", claim_key, exc)
+        if leg_fill:
+            entry_cost_s = float(leg_fill["price"]) * 100.0 * qty
+            hwm_s = float(leg_fill["price"]) * 100.0
+            cost_source_s = "broker_history"
+        else:
+            entry_cost_s = 0.0
+            hwm_s = 0.0
+            cost_source_s = "unknown"
         try:
             pos_id = journal.open_position(Position(
                 id=claim_key,
@@ -211,12 +362,13 @@ async def reconcile_once() -> dict[str, Any]:
                 topology="single_leg_orphan",
                 direction="bull" if side == "long" else "bear",
                 contracts=qty,
-                entry_cost=0.0,  # unknown; monitor will MTM via get_spread_mid
+                entry_cost=entry_cost_s,
                 entry_time=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 expiry=expiry,
                 state="open",
                 legs=tuple(legs),
                 broker="moomoo",
+                high_water_mark=hwm_s or None,
                 meta={
                     "broker": "moomoo",
                     "orphan": True,
@@ -226,6 +378,8 @@ async def reconcile_once() -> dict[str, Any]:
                     "take_profit_pct": 50.0,
                     "trailing_stop_pct": 0.0,
                     "idempotency_key": claim_key,
+                    "entry_cost_source": cost_source_s,
+                    "leg_fill_price": (leg_fill or {}).get("price"),
                 },
             ))
             journal.log_event(
