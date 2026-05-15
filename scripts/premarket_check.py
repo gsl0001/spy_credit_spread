@@ -4,7 +4,7 @@ Verifies every link in the chain BEFORE the strategy fires at 09:30 ET:
   - server process alive
   - server NOT running --reload
   - moomoo broker connected
-  - canary preset is the only auto_execute moomoo preset
+  - exactly one moomoo preset is marked auto_execute
   - no stuck pending positions from yesterday
   - critical env vars loaded
   - no leftover orphan positions
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import sqlite3
 import subprocess
 import sys
@@ -32,29 +33,84 @@ def _check(name: str, ok: bool, detail: str = "") -> tuple[str, bool, str]:
     return (name, ok, detail)
 
 
+def _load_env_file(path: Path, *, override: bool = False) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if override or key not in os.environ:
+            os.environ[key] = value
+
+
+def _uvicorn_processes() -> list[dict[str, str]]:
+    """Return uvicorn main:app processes on Unix or Windows."""
+    if platform.system().lower().startswith("win"):
+        ps_cmd = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            (
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.Name -match '^python' -and $_.CommandLine -match 'uvicorn main:app' } | "
+                "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+            ),
+        ]
+        try:
+            raw = subprocess.check_output(ps_cmd, text=True).strip()
+        except Exception:
+            return []
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(data, dict):
+            data = [data]
+        return [
+            {"pid": str(item.get("ProcessId", "")), "cmd": str(item.get("CommandLine", ""))}
+            for item in data
+        ]
+
+    try:
+        out = subprocess.check_output(["pgrep", "-f", "uvicorn main:app"], text=True).strip()
+        pids = [p for p in out.splitlines() if p.strip()]
+    except subprocess.CalledProcessError:
+        pids = []
+    try:
+        ps = subprocess.check_output(["ps", "aux"], text=True)
+    except Exception:
+        ps = ""
+    procs = []
+    for pid in pids:
+        line = next((l for l in ps.splitlines() if pid in l and "uvicorn main:app" in l), "")
+        procs.append({"pid": pid, "cmd": line})
+    return procs
+
+
 def run() -> int:
+    _load_env_file(ROOT / "config" / ".env", override=False)
+    _load_env_file(ROOT / ".env.live", override=True)
+
     results: list[tuple[str, bool, str]] = []
 
     # 1. Server process
-    try:
-        out = subprocess.check_output(
-            ["pgrep", "-f", "uvicorn main:app"], text=True,
-        ).strip()
-        results.append(_check("server process running", bool(out), f"pids: {out}"))
-    except subprocess.CalledProcessError:
-        results.append(_check("server process running", False, "no uvicorn process"))
+    procs = _uvicorn_processes()
+    pids = ",".join(p["pid"] for p in procs if p.get("pid"))
+    results.append(_check("server process running", bool(procs), f"pids: {pids}" if pids else "no uvicorn process"))
 
     # 2. NOT --reload
-    try:
-        ps = subprocess.check_output(["ps", "aux"], text=True)
-        reload_lines = [l for l in ps.splitlines() if "uvicorn main:app" in l and "--reload" in l]
-        results.append(_check(
-            "server NOT in --reload mode",
-            len(reload_lines) == 0,
-            "found --reload in process" if reload_lines else "",
-        ))
-    except Exception as e:  # noqa: BLE001
-        results.append(_check("server NOT in --reload mode", False, str(e)))
+    reload_lines = [p["cmd"] for p in procs if "--reload" in p.get("cmd", "")]
+    results.append(_check(
+        "server NOT in --reload mode",
+        len(reload_lines) == 0,
+        "found --reload in process" if reload_lines else "",
+    ))
 
     # 3. API responding
     try:
@@ -64,18 +120,31 @@ def run() -> int:
     except Exception as e:  # noqa: BLE001
         results.append(_check("API responding", False, str(e)))
 
-    # 4. Canary is the only auto_execute moomoo preset
+    # 3b. moomoo broker connected
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8000/api/moomoo/account", timeout=8) as r:
+            account = json.loads(r.read().decode())
+        err = account.get("error") if isinstance(account, dict) else None
+        results.append(_check(
+            "moomoo broker connected",
+            not err,
+            str(err or "account reachable"),
+        ))
+    except Exception as e:  # noqa: BLE001
+        results.append(_check("moomoo broker connected", False, str(e)))
+
+    # 4. Exactly one moomoo preset is armed for unattended auto_execute
     try:
         with open(ROOT / "config" / "presets.json") as f:
             presets = json.load(f)
         auto = [p["name"] for p in presets if p["broker"] == "moomoo" and p["auto_execute"]]
         results.append(_check(
-            "canary is sole moomoo auto_execute",
-            auto == ["canary-moomoo"],
+            "exactly one moomoo auto_execute preset",
+            len(auto) == 1,
             f"current: {auto}",
         ))
     except Exception as e:  # noqa: BLE001
-        results.append(_check("canary is sole moomoo auto_execute", False, str(e)))
+        results.append(_check("exactly one moomoo auto_execute preset", False, str(e)))
 
     # 5. No stuck pending/open orphan positions from yesterday or earlier
     try:

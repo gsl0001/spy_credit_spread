@@ -15,6 +15,12 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 
 DB = Path(__file__).resolve().parent.parent / "data" / "trades.db"
 

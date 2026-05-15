@@ -8,6 +8,7 @@ import { ScannerView } from './views/ScannerView.jsx';
 import { RiskView } from './views/RiskView.jsx';
 import { BacktestView } from './views/BacktestView.jsx';
 import { PaperView } from './views/PaperView.jsx';
+import { PresetOrganizerView } from './views/PresetOrganizerView.jsx';
 import { MoomooView } from './views/MoomooView.jsx';
 import { Ico } from './icons.jsx';
 import { fmtTimeAgo, Btn } from './primitives.jsx';
@@ -22,6 +23,7 @@ const VIEWS = {
   paper: PaperView,
   moomoo: MoomooView,
   backtest: BacktestView,
+  presets: PresetOrganizerView,
   journal: JournalView,
   risk: RiskView,
   scanner: ScannerView,
@@ -32,6 +34,7 @@ const VIEW_TITLES = {
   paper: { title: 'Paper Trials', sub: 'multi-preset moomoo paper gate · skill Step 10' },
   moomoo: { title: 'Moomoo Trading', sub: 'moomoo OpenD · legged spreads · CA' },
   backtest: { title: 'Backtest Engine', sub: 'historical simulation' },
+  presets: { title: 'Preset Organizer', sub: 'create / edit / delete trading presets' },
   journal: { title: 'Trade Journal', sub: 'orders · fills · events' },
   risk: { title: 'Risk & Guardrails', sub: 'pre-trade gates · sizing · events' },
   scanner: { title: 'Signal Scanner', sub: 'RSI · EMA · regime filters' },

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import subprocess
 import sys
 import urllib.request
@@ -44,6 +45,16 @@ def _alive() -> bool:
 
 
 def run() -> int:
+    env = os.environ.copy()
+    for env_file in (ROOT / "config" / ".env", ROOT / ".env.live"):
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+
     s = _state()
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -88,23 +99,32 @@ def run() -> int:
     # Attempt restart
     print(f"[{now}] server down, attempting restart #{restart_count + 1}")
     try:
-        env = os.environ.copy()
-        env_file = ROOT / ".env.live"
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip()
-        subprocess.Popen(
-            ["./run-live.sh"],
-            cwd=str(ROOT),
-            env=env,
-            stdout=open(ROOT / "logs" / "run-live.out", "a"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        out = open(ROOT / "logs" / "run-live.out", "a")
+        if platform.system().lower().startswith("win"):
+            subprocess.Popen(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(ROOT / "scripts" / "run-live.ps1"),
+                ],
+                cwd=str(ROOT),
+                env=env,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            subprocess.Popen(
+                ["./run-live.sh"],
+                cwd=str(ROOT),
+                env=env,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
     except Exception as e:  # noqa: BLE001
         print(f"  restart failed: {e}")
 

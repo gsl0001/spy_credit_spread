@@ -49,6 +49,7 @@ export function Topbar({ view, mkt, spy, conn, onPanic, leader, onBell, alertCou
     paper:    ['Paper Trading',     'Alpaca · Signal Surrogate'],
     moomoo:   ['Moomoo Trading',    'moomoo OpenD · legged spreads'],
     backtest: ['Backtest',          'Strategy Research & Parameter Sweep'],
+    presets:  ['Preset Organizer',  'Create, edit, clone, and delete presets'],
     journal:  ['Trade Journal',     'Positions, Orders, P&L History'],
     risk:     ['Risk & Guardrails', 'Pre-trade gates, sizing, event blackout'],
     scanner:  ['Scanner',           'Signal Feed with Persistence'],

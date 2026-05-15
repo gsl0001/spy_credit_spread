@@ -6,6 +6,7 @@ export function Sidebar({ view, setView, alertCount }) {
     { id: 'paper',    icon: 'radar',     label: 'Paper Trials' },
     { id: 'moomoo',   icon: 'zap',       label: 'Moomoo',        orange: true },
     { id: 'backtest', icon: 'activity',  label: 'Backtest' },
+    { id: 'presets',  icon: 'book',      label: 'Presets' },
     { id: 'journal',  icon: 'book',      label: 'Journal' },
     { id: 'risk',     icon: 'shield',    label: 'Risk & Guardrails' },
     { id: 'scanner',  icon: 'target',    label: 'Scanner' },

@@ -31,6 +31,7 @@ import numpy as np
 import scipy.stats as si
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
 # Strategy imports
@@ -140,15 +141,15 @@ async def _lifespan(application):
             _startup_log.warning("boot reconcile failed: %s", exc)
     asyncio.create_task(_boot_reconcile_after_delay())
 
-    # Auto-start the canary preset scanner on boot. Without this, every
+    # Auto-start the sole moomoo auto_execute preset scanner on boot. Without this, every
     # server restart silently leaves auto_execute presets idle until someone
     # manually POSTs /api/scanner/preset/start. Discovered 2026-05-12 when
     # the bot ran all day without firing because the scanner was never
     # started after run-live.sh booted the server.
     #
-    # Picks the first moomoo preset with auto_execute=True. For the test week
-    # that's canary-moomoo (and only canary-moomoo by design). After live, set
-    # AUTOSTART_PRESET env var to override.
+    # Safety rule: when AUTOSTART_PRESET is not set, exactly one moomoo preset
+    # may have auto_execute=True. This prevents a stale test preset and a real
+    # strategy preset from both being candidates after config edits.
     async def _autostart_preset_after_delay():
         try:
             await asyncio.sleep(12)  # after reconcile
@@ -158,13 +159,17 @@ async def _lifespan(application):
             if override:
                 target_name = override
             else:
-                from core.presets import PresetStore
-                store = PresetStore()
-                for p in store.list():
-                    if (getattr(p, "broker", "") == "moomoo"
-                            and getattr(p, "auto_execute", False)):
-                        target_name = p.name
-                        break
+                from core.presets import single_moomoo_auto_execute_preset
+                preset_candidate, auto_names = single_moomoo_auto_execute_preset()
+                if not auto_names:
+                    _startup_log.info("autostart_preset: none configured (no moomoo auto_execute)")
+                    return
+                if preset_candidate is None:
+                    log_event(_startup_log, "autostart_preset_blocked",
+                              reason="multiple_moomoo_auto_execute",
+                              presets=auto_names)
+                    return
+                target_name = preset_candidate.name
             if not target_name:
                 _startup_log.info("autostart_preset: none configured (no moomoo auto_execute)")
                 return
@@ -189,6 +194,11 @@ async def _lifespan(application):
 
 
 app = FastAPI(title="SPY Options Backtesting Engine", lifespan=_lifespan)
+
+
+@app.get("/", include_in_schema=False)
+def dashboard_redirect():
+    return RedirectResponse("http://127.0.0.1:5173/")
 
 
 def _safe_json(obj):
@@ -1569,6 +1579,21 @@ _IB_DURATION_MAP = {
 }
 
 
+def _history_period_to_days(period: str) -> int:
+    """Convert yfinance-style periods (``60d``, ``1mo``) to moomoo days."""
+    raw = str(period or "").strip().lower()
+    try:
+        if raw.endswith("d"):
+            return max(1, int(raw[:-1]))
+        if raw.endswith("mo"):
+            return max(1, int(raw[:-2]) * 30)
+        if raw.endswith("y"):
+            return max(1, int(raw[:-1]) * 365)
+    except ValueError:
+        pass
+    return 30
+
+
 def _resolve_bar_spec(preset_or_strategy):
     """Resolve (bar_size, history_period) for a preset OR a bare strategy name.
 
@@ -1675,6 +1700,37 @@ def _preset_bars_fetcher(symbol: str, strategy_name: Optional[str] = None):
                     return df
         except Exception:
             pass
+
+    # ── 2b. Pure-Live mode via moomoo historical bars for moomoo presets ──
+    if p and getattr(p, "fetch_only_live", False) and getattr(p, "broker", "") == "moomoo":
+        try:
+            from core.broker import get_broker
+            mm = get_broker("moomoo")
+            loop = _MAIN_LOOP
+            if mm and mm.is_alive() and loop and loop.is_running():
+                rows = asyncio.run_coroutine_threadsafe(
+                    mm.get_historical_bars(
+                        symbol,
+                        duration_days=_history_period_to_days(yf_period),
+                        bar_size=yf_interval,
+                    ),
+                    loop,
+                ).result(timeout=10)
+                df = pd.DataFrame(rows or [])
+                if df is not None and not df.empty and "Date" in df.columns:
+                    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+                    df = df.dropna(subset=["Date"])
+                    if not df.empty:
+                        if hasattr(df["Date"].dt, "tz") and df["Date"].dt.tz is not None:
+                            if is_intraday:
+                                df["Date"] = df["Date"].dt.tz_convert("America/New_York")
+                            df["Date"] = df["Date"].dt.tz_localize(None)
+                        df.set_index("Date", drop=False, inplace=True)
+                        if live_price and not is_intraday:
+                            df.loc[df.index[-1], "Close"] = live_price
+                        return df
+        except Exception as exc:
+            _startup_log.warning("moomoo historical bars fallback failed: %s", exc)
 
     # ── 3. yfinance fallback (free, no subscription) ──────────────────
     from core.yf_safe import safe_download as _yf_safe_download
@@ -1836,6 +1892,23 @@ def _run_preset_tick():
                         except Exception as _exc:  # pragma: no cover
                             _startup_log.warning(
                                 "paper gate pre-fire check failed: %s", _exc)
+                        try:
+                            from core.broker import get_broker
+                            broker = get_broker("moomoo")
+                            trd_env_int = int(getattr(broker, "_trd_env_int", 1))
+                        except Exception as _exc:  # noqa: BLE001
+                            log_event(_startup_log, "preset_auto_execute_skipped",
+                                      reason="moomoo_broker_not_ready",
+                                      preset=p.name, error=str(_exc))
+                            continue
+                        if (
+                            trd_env_int != 0
+                            and os.environ.get("ALLOW_MOOMOO_REAL_AUTO_EXECUTE", "0") != "1"
+                        ):
+                            log_event(_startup_log, "preset_auto_execute_skipped",
+                                      reason="real_moomoo_auto_execute_blocked",
+                                      preset=p.name, trd_env=trd_env_int)
+                            continue
                         coro = _moomoo_execute_impl(order_req)
                     else:
                         # IBKR path (default)
@@ -4063,6 +4136,7 @@ def paper_validation(req: PaperValidationRequest):
     from datetime import datetime, timedelta, timezone
     from core.journal import get_journal
     from core.presets import PresetStore
+    from dataclasses import replace
 
     store = PresetStore()
     preset = store.get(req.preset_name)
@@ -4197,13 +4271,31 @@ def paper_trial_start(req: PaperTrialStartRequest):
         fast_fail_dd_multiplier=req.fast_fail_dd_multiplier,
     )
     store.upsert(trial)
-    # Ensure preset auto_execute is on so the trial actually accumulates fills
-    if not preset.auto_execute:
-        from dataclasses import replace
+    # Ensure exactly one moomoo preset is armed. Starting a paper trial should
+    # not leave older engine-test or trial presets eligible to auto-fire after
+    # restart.
+    if preset.broker == "moomoo":
+        try:
+            for other in pstore.list():
+                if other.broker == "moomoo" and other.name != preset.name and other.auto_execute:
+                    pstore.save(replace(other, auto_execute=False))
+            if not preset.auto_execute:
+                pstore.save(replace(preset, auto_execute=True))
+        except Exception as exc:
+            return {
+                "error": "preset_auto_execute_update_failed",
+                "preset_name": req.preset_name,
+                "reason": str(exc),
+            }
+    elif not preset.auto_execute:
         try:
             pstore.save(replace(preset, auto_execute=True))
-        except Exception:
-            pass
+        except Exception as exc:
+            return {
+                "error": "preset_auto_execute_update_failed",
+                "preset_name": req.preset_name,
+                "reason": str(exc),
+            }
     return _safe_json({"trial": asdict(trial)})
 
 

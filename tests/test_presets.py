@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from core.presets import PresetStore, ScannerPreset
+from core.presets import (
+    PresetStore,
+    ScannerPreset,
+    moomoo_auto_execute_presets,
+    single_moomoo_auto_execute_preset,
+)
 
 
 @pytest.fixture
@@ -53,3 +58,30 @@ def test_round_trip_persistence(tmp_path: Path) -> None:
     s1.save(ScannerPreset(name="persist-test", ticker="QQQ"))
     s2 = PresetStore(path=path)  # fresh handle, same file
     assert s2.get("persist-test").ticker == "QQQ"
+
+
+def test_moomoo_auto_execute_presets_only_returns_enabled_moomoo(store: PresetStore) -> None:
+    store.save(ScannerPreset(name="paper-live", broker="moomoo", auto_execute=True))
+    store.save(ScannerPreset(name="manual-moomoo", broker="moomoo", auto_execute=False))
+    store.save(ScannerPreset(name="ibkr-auto", broker="ibkr", auto_execute=True))
+
+    presets = moomoo_auto_execute_presets(store.path)
+
+    assert [p.name for p in presets] == ["paper-live"]
+
+
+def test_single_moomoo_auto_execute_preset_requires_exactly_one(store: PresetStore) -> None:
+    preset, names = single_moomoo_auto_execute_preset(store.path)
+    assert preset is None
+    assert names == []
+
+    store.save(ScannerPreset(name="one", broker="moomoo", auto_execute=True))
+    preset, names = single_moomoo_auto_execute_preset(store.path)
+    assert preset is not None
+    assert preset.name == "one"
+    assert names == ["one"]
+
+    store.save(ScannerPreset(name="two", broker="moomoo", auto_execute=True))
+    preset, names = single_moomoo_auto_execute_preset(store.path)
+    assert preset is None
+    assert names == ["one", "two"]

@@ -20,6 +20,7 @@ import time
 import signal
 import webbrowser
 import threading
+import urllib.request
 from pathlib import Path
 
 
@@ -44,6 +45,14 @@ DIM    = "\033[2m"
 
 def log(tag: str, colour: str, msg: str):
     print(f"  {colour}{BOLD}[{tag}]{RESET} {msg}")
+
+
+def http_ready(url: str, timeout: float = 1.0) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return 200 <= response.status < 500
+    except Exception:
+        return False
 
 
 # ── Pre-flight checks ───────────────────────────────────────────────────────
@@ -77,10 +86,13 @@ def preflight():
 
 # ── Process launchers ───────────────────────────────────────────────────────
 def start_backend() -> subprocess.Popen:
+    if http_ready("http://127.0.0.1:8000/docs"):
+        log("BACKEND", GREEN, "FastAPI already running -> http://127.0.0.1:8000")
+        return None
     log("BACKEND", GREEN, f"Starting FastAPI  ->  http://127.0.0.1:8000")
     return subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "main:app",
-         "--host", "127.0.0.1", "--port", "8000", "--reload"],
+         "--host", "127.0.0.1", "--port", "8000"],
         cwd=BASE_DIR,
         # Prefix every backend line with a dim label
         stdout=subprocess.PIPE,
@@ -90,6 +102,9 @@ def start_backend() -> subprocess.Popen:
 
 
 def start_frontend() -> subprocess.Popen:
+    if http_ready("http://127.0.0.1:5173"):
+        log("FRONTEND", CYAN, "React already running -> http://localhost:5173")
+        return None
     log("FRONTEND", CYAN, f"Starting React     ->  http://localhost:5173")
     npm = _resolve_npm()
     return subprocess.Popen(
@@ -103,6 +118,8 @@ def start_frontend() -> subprocess.Popen:
 
 def stream_output(proc: subprocess.Popen, tag: str, colour: str):
     """Read a process's stdout line-by-line and print with a coloured prefix."""
+    if proc is None or proc.stdout is None:
+        return
     for line in proc.stdout:
         line = line.rstrip()
         if line:
@@ -131,12 +148,20 @@ def main():
     preflight()
     print()
 
-    backend  = start_backend()
+    backend = start_backend()
     frontend = start_frontend()
 
+    if backend is None and frontend is None:
+        log("BROWSER", GREEN, "Opening http://localhost:5173")
+        webbrowser.open("http://localhost:5173")
+        log("INFO", GREEN, "Both servers are already running.")
+        return
+
     # Stream both outputs in background threads so they don't block each other
-    threading.Thread(target=stream_output, args=(backend,  "API",  GREEN), daemon=True).start()
-    threading.Thread(target=stream_output, args=(frontend, "UI",   CYAN),  daemon=True).start()
+    if backend is not None:
+        threading.Thread(target=stream_output, args=(backend, "API", GREEN), daemon=True).start()
+    if frontend is not None:
+        threading.Thread(target=stream_output, args=(frontend, "UI", CYAN), daemon=True).start()
 
     open_browser_when_ready("http://localhost:5173", delay=5.0)
 
@@ -149,10 +174,10 @@ def main():
     try:
         while True:
             # If either process dies unexpectedly, exit
-            if backend.poll() is not None:
+            if backend is not None and backend.poll() is not None:
                 log("ERROR", RED, "Backend process exited unexpectedly.")
                 break
-            if frontend.poll() is not None:
+            if frontend is not None and frontend.poll() is not None:
                 log("ERROR", RED, "Frontend process exited unexpectedly.")
                 break
             time.sleep(1)
@@ -161,9 +186,12 @@ def main():
         log("INFO", YELLOW, "Shutting down…")
     finally:
         for proc, name in [(frontend, "Frontend"), (backend, "Backend")]:
-            if proc.poll() is None:
+            if proc is not None and proc.poll() is None:
                 if sys.platform == "win32":
-                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                    try:
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
+                    except ValueError:
+                        proc.terminate()
                 else:
                     proc.terminate()
                 try:

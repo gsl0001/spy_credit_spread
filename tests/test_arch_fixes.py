@@ -109,6 +109,15 @@ def test_fetch_vix_data_decorated_with_ttl():
 
 # ── APScheduler async bridge tests ────────────────────────────────────────────
 
+def test_preset_bars_fetcher_uses_moomoo_for_moomoo_live_presets():
+    """moomoo auto-trading must not depend on yfinance when OpenD is live."""
+    import inspect
+    import main as m
+    src = inspect.getsource(m._preset_bars_fetcher)
+    assert 'get_broker("moomoo")' in src
+    assert "mm.get_historical_bars" in src
+
+
 def test_run_monitor_tick_uses_run_coroutine_threadsafe():
     """_run_monitor_tick must use run_coroutine_threadsafe, not ensure_future."""
     import inspect

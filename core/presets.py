@@ -206,4 +206,29 @@ class PresetStore:
         return True
 
 
-__all__ = ["ScannerPreset", "PresetStore", "DEFAULT_PRESETS_PATH"]
+def moomoo_auto_execute_presets(path: Optional[Path] = None) -> list[ScannerPreset]:
+    """Return moomoo presets currently allowed to auto-fire."""
+    return [
+        p for p in PresetStore(path).list()
+        if p.broker == "moomoo" and p.auto_execute
+    ]
+
+
+def single_moomoo_auto_execute_preset(
+    path: Optional[Path] = None,
+) -> tuple[Optional[ScannerPreset], list[str]]:
+    """Return the sole moomoo auto preset, or names causing the gate to fail."""
+    presets = moomoo_auto_execute_presets(path)
+    names = [p.name for p in presets]
+    if len(presets) != 1:
+        return None, names
+    return presets[0], names
+
+
+__all__ = [
+    "ScannerPreset",
+    "PresetStore",
+    "DEFAULT_PRESETS_PATH",
+    "moomoo_auto_execute_presets",
+    "single_moomoo_auto_execute_preset",
+]

@@ -21,6 +21,30 @@ const EMPTY = {
   trade_list: [], mc: null, wf: [], price_history: [],
 };
 
+function presetToBacktestConfig(preset) {
+  if (!preset) return { ...DEFAULT_CONFIG };
+  const entryFilters = preset.entry_filters || {};
+  const strategyParams = preset.strategy_params || {};
+  const sizingParams = preset.sizing_params || {};
+  const fixedContracts = sizingParams.fixed_contracts;
+  const capitalAllocation = sizingParams.capital_allocation;
+  const maxAllocationCap = sizingParams.max_allocation_cap;
+  return {
+    ...DEFAULT_CONFIG,
+    ...preset,
+    ...entryFilters,
+    ...strategyParams,
+    strategy_id: preset.strategy_id || preset.strategy_name || DEFAULT_CONFIG.strategy_id,
+    contracts_per_trade: Number(fixedContracts ?? preset.contracts_per_trade ?? DEFAULT_CONFIG.contracts_per_trade),
+    capital_allocation: Number(capitalAllocation ?? preset.capital_allocation ?? DEFAULT_CONFIG.capital_allocation),
+    max_trade_cap: Number(maxAllocationCap ?? preset.max_trade_cap ?? DEFAULT_CONFIG.max_trade_cap),
+    risk_percent: Number(sizingParams.risk_percent ?? preset.risk_percent ?? DEFAULT_CONFIG.risk_percent),
+    strategy_params: strategyParams,
+    entry_filters: entryFilters,
+    sizing_params: sizingParams,
+  };
+}
+
 /* ── small primitives ─────────────────────────────────────── */
 
 function Field({ label, children, full }) {
@@ -132,7 +156,7 @@ export function BacktestView() {
 
   const applyPreset = name => {
     setSelectedPreset(name);
-    if (name && allPresets[name]) setConfig({ ...DEFAULT_CONFIG, ...allPresets[name] });
+    if (name && allPresets[name]) setConfig(presetToBacktestConfig(allPresets[name]));
   };
 
   const savePreset = () => {
@@ -167,9 +191,6 @@ export function BacktestView() {
     '1 hour': 730,
   };
   const tfLabel = barSize === '1 day' ? 'Daily' : barSize.replace(' mins', 'm').replace(' min', 'm').replace(' hour', 'h').replace(' day', 'd');
-  const tfHistoryHint = isIntraday
-    ? `${intradayHistoryDays[barSize] || 60} days max (yfinance cap)`
-    : `${config.years_history || 0} years`;
 
   // Auto-adjust years_history when switching to intraday — yfinance won't
   // serve more than the cap above. Convert capped days to fractional years

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paper Trading Ops"
+  short_description: "Diagnose and operate moomoo paper trading"
+  default_prompt: "Use $paper-trading-ops to recheck the moomoo paper-trading system and explain what happened."

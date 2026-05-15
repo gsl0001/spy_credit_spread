@@ -1,0 +1,4 @@
+interface:
+  display_name: "Strategy Optimizer"
+  short_description: "Sweep strategies and create proven presets"
+  default_prompt: "Use $strategy-optimizer to backtest available strategies across parameters and create presets for the winners."
