@@ -3700,9 +3700,9 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
     _now_pre_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     _pending_legs = [
         {"expiry": expiry_ymd, "strike": spread["K_long"], "right": right,
-         "side": "long", "qty": contracts},
+         "side": "long", "qty": contracts, "symbol": req.symbol},
         {"expiry": expiry_ymd, "strike": spread["K_short"], "right": right,
-         "side": "short", "qty": contracts},
+         "side": "short", "qty": contracts, "symbol": req.symbol},
     ]
     _pre_journaled = False
     try:
@@ -3718,7 +3718,7 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
             state="pending",
             legs=tuple(_pending_legs),
             broker="moomoo",
-            high_water_mark=spread["debit_per_contract"] * 100,
+            high_water_mark=spread["debit_per_contract"],
             meta={
                 "broker": "moomoo",
                 "legs": _pending_legs,
@@ -3791,23 +3791,29 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
             from core.journal import Position
             orphan_legs = [
                 {"expiry": expiry_ymd, "strike": spread["K_long"], "right": right,
-                 "side": "long", "qty": contracts},
+                 "side": "long", "qty": contracts, "symbol": req.symbol},
             ]
             try:
                 now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                orphan_unit = float(
+                    order_result.get("leg1_avg_fill_price")
+                    or spread.get("long_bid")
+                    or spread.get("long_ask")
+                    or 0.0
+                )
                 orphan_id = journal.open_position(Position(
                     id=f"{client_id}:orphan",
                     symbol=req.symbol,
                     topology="single_leg_orphan",
                     direction=req.direction,
                     contracts=contracts,
-                    entry_cost=spread["long_bid"] * 100,  # ~mid; refined later
+                    entry_cost=orphan_unit * 100 * contracts,  # refined by reconciler when possible
                     entry_time=now_iso,
                     expiry=expiry_ymd,
                     state="open",
                     legs=tuple(orphan_legs),
                     broker="moomoo",
-                    high_water_mark=spread["long_bid"] * 100,
+                    high_water_mark=orphan_unit,
                     meta={
                         "broker": "moomoo",
                         "orphan": True,
@@ -3837,9 +3843,9 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     legs = [
         {"expiry": expiry_ymd, "strike": spread["K_long"], "right": right,
-         "side": "long", "qty": contracts},
+         "side": "long", "qty": contracts, "symbol": req.symbol},
         {"expiry": expiry_ymd, "strike": spread["K_short"], "right": right,
-         "side": "short", "qty": contracts},
+         "side": "short", "qty": contracts, "symbol": req.symbol},
     ]
     # Use real fill prices from the broker when available (live trading
     # slippage is real and the quoted long_ask/short_bid is what we ASKED,
@@ -3857,7 +3863,7 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
             client_id,
             state="open",
             entry_cost=_real_entry_cost,
-            high_water_mark=_real_debit_per_contract * 100,
+            high_water_mark=_real_debit_per_contract,
         )
         pos_id = client_id
     else:
@@ -3873,7 +3879,7 @@ async def _moomoo_execute_impl(req: MoomooOrderRequest) -> dict:
             state="open",
             legs=tuple(legs),
             broker="moomoo",
-            high_water_mark=spread["debit_per_contract"] * 100,
+            high_water_mark=spread["debit_per_contract"],
             meta={
                 "broker": "moomoo",
                 "legs": legs,

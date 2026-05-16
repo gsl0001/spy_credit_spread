@@ -93,7 +93,12 @@ def _make_trader(ib: MagicMock | None = None):
 
 def _run(coro):
     """Execute an async coroutine synchronously in tests."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
 
 
 # ── 1. Instantiation ───────────────────────────────────────────────────────
@@ -190,7 +195,8 @@ class TestEnsureConnected:
         trader = _make_trader(ib)
         trader.connected = False  # simulate dropped connection
 
-        _run(trader.ensure_connected())
+        with patch("core.connection_flags.is_auto_enabled", return_value=True):
+            _run(trader.ensure_connected())
         ib.connectAsync.assert_called_once()
 
 
@@ -551,6 +557,7 @@ class TestGetIbConnection:
             with (
                 patch("brokers.ibkr_trading.HAS_IBSYNC", True),
                 patch("brokers.ibkr_trading._try_load_ibsync", return_value=True),
+                patch("core.connection_flags.is_auto_enabled", return_value=True),
             ):
                 from brokers.ibkr_trading import get_ib_connection
                 trader, msg = _run(

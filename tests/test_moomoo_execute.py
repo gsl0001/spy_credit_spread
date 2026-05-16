@@ -310,12 +310,11 @@ def test_execute_quality_rejects_zero_bid_chain(isolated_journal, order_request)
 def test_execute_happy_path(isolated_journal, fake_broker, order_request):
     """Happy path: places spread, journals position, returns success+ids."""
     from main import _moomoo_execute_impl
-    res = asyncio.run(_moomoo_execute_impl(order_request))
-    if not res.get("success"):
-        # Pre-trade gate may reject (FOMC/blackout in real events file).
-        # In that case we expect a structured error, not a crash.
-        assert "error" in res
-        return
+    from core.journal import get_journal
+    from core.risk import Decision
+
+    with patch("core.risk.evaluate_pre_trade", return_value=Decision(True, "ok")):
+        res = asyncio.run(_moomoo_execute_impl(order_request))
     assert res["success"] is True
     assert res["leg1_order_id"] == "L1-fake"
     assert res["leg2_order_id"] == "L2-fake"
@@ -328,6 +327,46 @@ def test_execute_happy_path(isolated_journal, fake_broker, order_request):
     assert sr.long_leg.right == "C"
     assert sr.short_leg.right == "C"
     assert sr.short_leg.strike > sr.long_leg.strike  # bull call
+    pos = get_journal().get_position(res["position_id"])
+    assert pos is not None
+    assert pos.high_water_mark == pytest.approx(pos.entry_cost / (pos.contracts * 100))
+    assert pos.high_water_mark < 10
+    assert all(leg["symbol"] == "SPY" for leg in pos.legs)
+
+
+def test_execute_threads_non_spy_symbol_into_order_and_journal(isolated_journal):
+    """Non-SPY presets must not silently place or monitor SPY option codes."""
+    from main import MoomooOrderRequest, _moomoo_execute_impl
+    from core.journal import get_journal
+    from core.risk import Decision
+
+    broker = FakeMoomooBroker(chain=_default_chain().assign(
+        code=lambda df: df["code"].str.replace("US.SPY", "US.QQQ", regex=False),
+    ))
+    register_broker("moomoo", broker)
+    try:
+        req = MoomooOrderRequest(
+            symbol="QQQ",
+            direction="bull_call",
+            contracts=1,
+            strike_width=5,
+            target_dte=0,
+            spread_cost_target=250.0,
+            otm_offset=1.50,
+            position_size_method="fixed",
+            client_order_id="test-client-id-qqq",
+        )
+        with patch("core.risk.evaluate_pre_trade", return_value=Decision(True, "ok")):
+            res = asyncio.run(_moomoo_execute_impl(req))
+    finally:
+        unregister_broker("moomoo")
+
+    assert res["success"] is True
+    assert broker.place_spread_calls[0].symbol == "QQQ"
+    pos = get_journal().get_position(res["position_id"])
+    assert pos is not None
+    assert pos.symbol == "QQQ"
+    assert all(leg["symbol"] == "QQQ" for leg in pos.legs)
 
 
 def test_execute_leg1_timeout_returns_error(isolated_journal, order_request):

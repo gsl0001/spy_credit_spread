@@ -252,7 +252,11 @@ async def test_tick_survives_trader_factory_failure(tmp_path: Path):
     results = await tick(bad_factory, journal=j,
                         defaults={"stop_loss_pct": 50, "take_profit_pct": 50},
                         today=date(2026, 4, 14))
-    assert results == []
+    assert results == [{
+        "position_id": "p-1",
+        "skipped": True,
+        "reason": "ibkr_trader_unavailable",
+    }]
     # An event should be logged so the operator sees this
     events = j.recent_events(10)
     assert any(e["kind"] == "monitor_no_trader" for e in events)

@@ -28,6 +28,34 @@ from core.presets import PresetStore, ScannerPreset
 logger = logging.getLogger(__name__)
 
 
+def _bar_timestamp(df, i: int, fallback: str) -> str:
+    """Return the timestamp of the bar the strategy evaluated.
+
+    Scanner idempotency depends on this being stable for repeated scans of the
+    same bar. Wall-clock scan time changes every interval and can duplicate
+    entries while a daily/intraday signal remains true.
+    """
+    for col in ("Date", "Datetime", "time", "Time", "timestamp", "ts"):
+        try:
+            if col in df.columns:
+                value = df[col].iloc[i]
+                if hasattr(value, "isoformat"):
+                    return value.isoformat()
+                if value is not None:
+                    return str(value)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        idx = df.index[i]
+        if not isinstance(idx, int):
+            if hasattr(idx, "isoformat"):
+                return idx.isoformat()
+            return str(idx)
+    except Exception:  # noqa: BLE001
+        pass
+    return fallback
+
+
 def list_strategy_classes() -> dict:
     """Return ``{strategy_id: cls}`` for every known strategy.
 
@@ -249,6 +277,7 @@ class Scanner:
             logger.warning("scanner.compute_indicators failed: %s", e)
             return out
         i = len(df) - 1
+        bar_ts = _bar_timestamp(df, i, ts)
 
         # ── entry signal ──
         try:
@@ -257,7 +286,7 @@ class Scanner:
             logger.warning("scanner.check_entry failed: %s", e)
             entered = False
         out.append(self._make_signal(
-            ts, preset, df, i, signal_type="entry",
+            bar_ts, preset, df, i, signal_type="entry",
             side="buy", fired=entered,
             reason="strategy_entry" if entered else "no_signal",
         ))
@@ -278,7 +307,7 @@ class Scanner:
                     continue
                 if should_exit:
                     out.append(self._make_signal(
-                        ts, preset, df, i, signal_type="exit",
+                        bar_ts, preset, df, i, signal_type="exit",
                         side="sell", fired=True,
                         reason=f"strategy:{reason or 'signal'}",
                         position_id=pos.id,

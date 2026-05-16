@@ -746,7 +746,7 @@ class MoomooTrader:
         # ── 1. Pre-flight quote sanity ────────────────────────────────────
         try:
             preflight = await self._preflight_spread_quotes(
-                req.long_leg, req.short_leg,
+                req.symbol, req.long_leg, req.short_leg,
                 max_bid_ask_pct=float(getattr(req, "max_bid_ask_pct", 0.50) or 0.50),
             )
         except Exception as exc:  # noqa: BLE001
@@ -762,6 +762,7 @@ class MoomooTrader:
 
         # ── 2. Leg 1 ──────────────────────────────────────────────────────
         long_order_id = await self._place_single_leg(
+            symbol=req.symbol,
             leg=req.long_leg,
             side="buy",
             qty=req.qty,
@@ -782,7 +783,7 @@ class MoomooTrader:
                 flatten_id = None
                 try:
                     flatten_id = await self._marketable_limit_close(
-                        req.long_leg, qty=leg1["filled_qty"], side="sell",
+                        req.symbol, req.long_leg, qty=leg1["filled_qty"], side="sell",
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("partial-leg1 flatten failed: %s", exc)
@@ -808,6 +809,7 @@ class MoomooTrader:
 
         # ── 3. Leg 2 ──────────────────────────────────────────────────────
         short_order_id = await self._place_single_leg(
+            symbol=req.symbol,
             leg=req.short_leg,
             side="sell",
             qty=req.qty,
@@ -831,13 +833,13 @@ class MoomooTrader:
             flatten_reason = "broken_spread"
             try:
                 flatten_id = await self._marketable_limit_close(
-                    req.long_leg, qty=req.qty, side="sell",
+                    req.symbol, req.long_leg, qty=req.qty, side="sell",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("marketable-limit flatten failed: %s — falling back to market", exc)
                 try:
                     flatten_id = await self._place_market_close(
-                        req.long_leg, qty=req.qty, side="sell",
+                        req.symbol, req.long_leg, qty=req.qty, side="sell",
                     )
                 except Exception as exc2:  # noqa: BLE001
                     logger.error("market flatten ALSO failed: %s — leg1 remains open", exc2)
@@ -867,7 +869,7 @@ class MoomooTrader:
         }
 
     async def _preflight_spread_quotes(
-        self, long_leg: LegSpec, short_leg: LegSpec,
+        self, symbol: str, long_leg: LegSpec, short_leg: LegSpec,
         max_bid_ask_pct: float = 0.50,
     ) -> dict[str, Any]:
         """Snapshot live NBBO for both legs; refuse if either is unusable.
@@ -887,8 +889,8 @@ class MoomooTrader:
         loop = asyncio.get_running_loop()
 
         codes = [
-            self._option_code("SPY", long_leg.expiry, long_leg.right, long_leg.strike),
-            self._option_code("SPY", short_leg.expiry, short_leg.right, short_leg.strike),
+            self._option_code(symbol, long_leg.expiry, long_leg.right, long_leg.strike),
+            self._option_code(symbol, short_leg.expiry, short_leg.right, short_leg.strike),
         ]
 
         def _snap():
@@ -920,7 +922,7 @@ class MoomooTrader:
         return {}
 
     async def _marketable_limit_close(
-        self, leg: LegSpec, qty: int, side: str, buffer: float = 0.05,
+        self, symbol: str, leg: LegSpec, qty: int, side: str, buffer: float = 0.05,
     ) -> str:
         """Close ``leg`` with a marketable-limit (NBBO ± buffer) instead of a
         raw market order. Protects against fills at absurd prices when the
@@ -928,7 +930,7 @@ class MoomooTrader:
         """
         import moomoo as ft
         loop = asyncio.get_running_loop()
-        code = self._option_code("SPY", leg.expiry, leg.right, leg.strike)
+        code = self._option_code(symbol, leg.expiry, leg.right, leg.strike)
 
         def _snap_then_place():
             ret, data = self._quote_ctx.get_market_snapshot([code])
@@ -966,7 +968,9 @@ class MoomooTrader:
             # Reverse the original side: long → sell, short → buy
             original_side = leg.get("side", "long")
             close_side = "sell" if original_side == "long" else "buy"
+            symbol = str(leg.get("symbol") or leg.get("underlying") or leg.get("root") or "SPY")
             order_id = await self._place_market_close(
+                symbol,
                 LegSpec(
                     expiry=leg["expiry"],
                     strike=leg["strike"],
@@ -1125,7 +1129,12 @@ class MoomooTrader:
         self._require_connected()
         loop = asyncio.get_running_loop()
         codes = [
-            self._option_code("SPY", leg["expiry"], leg["right"], float(leg["strike"]))
+            self._option_code(
+                str(leg.get("symbol") or leg.get("underlying") or leg.get("root") or "SPY"),
+                leg["expiry"],
+                leg["right"],
+                float(leg["strike"]),
+            )
             for leg in legs
         ]
 
@@ -1184,11 +1193,11 @@ class MoomooTrader:
         return f"US.{symbol}{yy}{mm}{dd}{right}{strike_int}"
 
     async def _place_single_leg(
-        self, leg: LegSpec, side: str, qty: int, client_ref: str
+        self, symbol: str, leg: LegSpec, side: str, qty: int, client_ref: str
     ) -> str:
         import moomoo as ft
         loop = asyncio.get_running_loop()
-        code = self._option_code("SPY", leg.expiry, leg.right, leg.strike)
+        code = self._option_code(symbol, leg.expiry, leg.right, leg.strike)
         trd_side = ft.TrdSide.BUY if side == "buy" else ft.TrdSide.SELL
 
         def _place():
@@ -1333,10 +1342,10 @@ class MoomooTrader:
             return {"ok": False, "order_id": order_id, "reason": reason}
         return {"ok": True, "order_id": order_id}
 
-    async def _place_market_close(self, leg: LegSpec, qty: int, side: str) -> str:
+    async def _place_market_close(self, symbol: str, leg: LegSpec, qty: int, side: str) -> str:
         import moomoo as ft
         loop = asyncio.get_running_loop()
-        code = self._option_code("SPY", leg.expiry, leg.right, leg.strike)
+        code = self._option_code(symbol, leg.expiry, leg.right, leg.strike)
         trd_side = ft.TrdSide.BUY if side == "buy" else ft.TrdSide.SELL
 
         def _place():
@@ -1521,4 +1530,3 @@ async def get_moomoo_connection(
             return None, str(exc)
 
     return trader, "OK"
-

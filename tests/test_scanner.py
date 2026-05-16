@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -45,7 +46,10 @@ def store(tmp_path: Path) -> PresetStore:
 
 
 def _bars() -> pd.DataFrame:
-    return pd.DataFrame({"Close": [100.0, 101.0, 102.0]})
+    return pd.DataFrame({
+        "Date": pd.to_datetime(["2026-04-01", "2026-04-02", "2026-04-03"]),
+        "Close": [100.0, 101.0, 102.0],
+    })
 
 
 def test_tick_without_preset_raises(store) -> None:
@@ -70,6 +74,20 @@ def test_entry_signal_emitted_and_dispatched(store) -> None:
     assert entries[0].ticket["contracts"] == 2
     assert entries[0].ticket["preset_name"] == "test"
     assert received and received[0].fired is True
+
+
+def test_signal_time_uses_evaluated_bar_timestamp(store) -> None:
+    _FakeStrategy.entry_signal = True
+    _FakeStrategy.exit_signal = False
+    sc = Scanner(store=store, bars_fetcher=lambda s: _bars(),
+                 strategy_resolver=lambda n: _FakeStrategy)
+    sc.load_preset("test")
+
+    first = sc.tick(now=datetime(2026, 4, 3, 14, 30, tzinfo=timezone.utc))[0]
+    second = sc.tick(now=datetime(2026, 4, 3, 14, 31, tzinfo=timezone.utc))[0]
+
+    assert first.time == "2026-04-03T00:00:00"
+    assert second.time == first.time
 
 
 def test_exit_signal_per_open_position(store) -> None:
